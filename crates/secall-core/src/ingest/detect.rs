@@ -8,14 +8,18 @@ use super::{
     codex::CodexParser, gemini::GeminiParser, gemini_web::GeminiWebParser,
     opencode::OpenCodeParser, SessionParser,
 };
+use crate::vault::config::IngestConfig;
 
-pub fn detect_parser(path: &Path) -> Result<Box<dyn SessionParser>> {
+pub fn detect_parser(path: &Path, ingest_config: &IngestConfig) -> Result<Box<dyn SessionParser>> {
     let path_str = path.to_string_lossy();
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
+    // Claude-only knob today; other parsers ignore it.
+    let claude = || ClaudeCodeParser::new(ingest_config.tool_output_max_chars);
+
     // Path-based detection (fastest — check before content sniffing)
     if path_str.contains("/.claude/projects/") || path_str.contains("\\.claude\\projects\\") {
-        return Ok(Box::new(ClaudeCodeParser));
+        return Ok(Box::new(claude()));
     }
     if path_str.contains("/.codex/sessions/") || path_str.contains("\\.codex\\sessions\\") {
         return Ok(Box::new(CodexParser));
@@ -80,7 +84,7 @@ pub fn detect_parser(path: &Path) -> Result<Box<dyn SessionParser>> {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&first_line) {
                 // Claude Code: has "sessionId" + "type": "user"
                 if v["sessionId"].is_string() && v["type"].as_str() == Some("user") {
-                    return Ok(Box::new(ClaudeCodeParser));
+                    return Ok(Box::new(claude()));
                 }
                 // Codex: has "type" string + "message" object (adjacently tagged)
                 if v["type"].is_string() && v["message"].is_object() {
@@ -274,7 +278,7 @@ mod tests {
             "session.jsonl",
             &[r#"{"sessionId":"abc","type":"user","message":{"role":"user","content":[]}}"#],
         );
-        let parser = detect_parser(&p).unwrap();
+        let parser = detect_parser(&p, &IngestConfig::default()).unwrap();
         assert_eq!(
             parser.agent_kind(),
             super::super::types::AgentKind::ClaudeCode
@@ -291,7 +295,7 @@ mod tests {
             "rollout-abc.jsonl",
             &[r#"{"type":"user","message":{"role":"user","content":"hello"}}"#],
         );
-        let parser = detect_parser(&p).unwrap();
+        let parser = detect_parser(&p, &IngestConfig::default()).unwrap();
         assert_eq!(parser.agent_kind(), super::super::types::AgentKind::Codex);
     }
 
@@ -321,7 +325,7 @@ mod tests {
         )
         .unwrap();
 
-        let parser = detect_parser(&path).unwrap();
+        let parser = detect_parser(&path, &IngestConfig::default()).unwrap();
         assert_eq!(parser.agent_kind(), super::super::types::AgentKind::ChatGpt);
     }
 
@@ -340,7 +344,7 @@ mod tests {
             ]"#,
         )
         .unwrap();
-        let claude_parser = detect_parser(&claude_path).unwrap();
+        let claude_parser = detect_parser(&claude_path, &IngestConfig::default()).unwrap();
         assert_eq!(
             claude_parser.agent_kind(),
             super::super::types::AgentKind::ClaudeAi
@@ -358,7 +362,7 @@ mod tests {
             ]"#,
         )
         .unwrap();
-        let chatgpt_parser = detect_parser(&chatgpt_path).unwrap();
+        let chatgpt_parser = detect_parser(&chatgpt_path, &IngestConfig::default()).unwrap();
         assert_eq!(
             chatgpt_parser.agent_kind(),
             super::super::types::AgentKind::ChatGpt
@@ -382,7 +386,7 @@ mod tests {
             r#"[{"uuid":"test","name":"","created_at":"2026-01-01T00:00:00Z","chat_messages":[{"uuid":"m1","text":"hi","content":[],"sender":"human","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","attachments":[],"files":[]}]}]"#,
         )
         .unwrap();
-        let parser = detect_parser(&json_path).unwrap();
+        let parser = detect_parser(&json_path, &IngestConfig::default()).unwrap();
         assert_eq!(
             parser.agent_kind(),
             super::super::types::AgentKind::ClaudeAi
@@ -435,7 +439,7 @@ mod tests {
         )
         .unwrap();
 
-        let parser = detect_parser(&path).unwrap();
+        let parser = detect_parser(&path, &IngestConfig::default()).unwrap();
         assert_eq!(
             parser.agent_kind(),
             super::super::types::AgentKind::OpenCode
