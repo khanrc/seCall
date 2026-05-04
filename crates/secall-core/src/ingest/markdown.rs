@@ -55,9 +55,12 @@ pub fn extract_body_text(content: &str) -> String {
         .to_string()
 }
 
-const TOOL_OUTPUT_MAX_CHARS: usize = 500;
-
-/// Render a Session to Obsidian-compatible Markdown string
+/// Render a Session to Obsidian-compatible Markdown string.
+///
+/// Tool output is no longer truncated here — the upstream parser (e.g.
+/// `parse_claude_jsonl`) is the single source of truth for the cap, driven
+/// by `Config::ingest::tool_output_max_chars`. Render dumps what the parser
+/// stored.
 pub fn render_session(session: &Session, tz: chrono_tz::Tz) -> String {
     let mut out = String::new();
 
@@ -208,10 +211,9 @@ pub fn render_session(session: &Session, tz: chrono_tz::Tz) -> String {
                         out.push_str("> ```\n");
                     }
                     if !output_summary.is_empty() {
-                        let truncated = truncate_str(output_summary, TOOL_OUTPUT_MAX_CHARS);
                         out.push_str("> **Output:**\n");
                         out.push_str("> ```\n");
-                        for line in truncated.lines() {
+                        for line in output_summary.lines() {
                             out.push_str(&format!("> {}\n", line));
                         }
                         out.push_str("> ```\n");
@@ -511,8 +513,12 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_output_truncation() {
-        let long_output = "x".repeat(1000);
+    fn test_tool_output_rendered_verbatim() {
+        // Render no longer truncates — the parse stage owns the single
+        // tool_output_max_chars cap (Config::ingest::tool_output_max_chars).
+        // Markdown surfaces whatever the parser stored, so search corpus
+        // and vault file stay aligned.
+        let stored_output = "x".repeat(1000);
         let turns = vec![Turn {
             index: 0,
             role: Role::Assistant,
@@ -521,7 +527,7 @@ mod tests {
             actions: vec![Action::ToolUse {
                 name: "Bash".to_string(),
                 input_summary: "cmd".to_string(),
-                output_summary: long_output,
+                output_summary: stored_output.clone(),
                 tool_use_id: None,
             }],
             tokens: None,
@@ -530,8 +536,11 @@ mod tests {
         }];
         let session = make_session(turns);
         let md = render_session(&session, chrono_tz::Tz::UTC);
-        // Should be truncated to 500+3 (for "...")
-        assert!(md.contains("..."));
+        assert!(md.contains(&stored_output));
+        assert!(
+            !md.contains("..."),
+            "render must not add ellipsis truncation"
+        );
     }
 
     #[test]

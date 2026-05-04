@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::tokenizer::Tokenizer;
-use crate::ingest::Session;
+use crate::ingest::{Action, Session};
 use crate::store::db::Database;
 use crate::store::{SearchRepo, SessionRepo};
 
@@ -90,19 +90,35 @@ impl Bm25Indexer {
         db.insert_session(session)?;
 
         for turn in &session.turns {
-            // Tokenize turn content
-            let tokenized = self.tokenizer.tokenize_for_fts(&turn.content);
-
-            // Also tokenize thinking if present
-            let full_text = if let Some(thinking) = &turn.thinking {
-                format!(
-                    "{} {}",
-                    tokenized,
-                    self.tokenizer.tokenize_for_fts(thinking)
-                )
-            } else {
-                tokenized
-            };
+            // Build the tokenized FTS body. Includes:
+            //   1. turn.content (the assistant/user message body)
+            //   2. turn.thinking (when present)
+            //   3. each Action::ToolUse's input_summary + output_summary
+            //
+            // Without (3), tool-driven content (Edit's new_string, Bash output,
+            // etc.) is invisible to BM25 even though it's the strongest signal
+            // for "what did the agent actually do" recall queries.
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(self.tokenizer.tokenize_for_fts(&turn.content));
+            if let Some(thinking) = &turn.thinking {
+                parts.push(self.tokenizer.tokenize_for_fts(thinking));
+            }
+            for action in &turn.actions {
+                if let Action::ToolUse {
+                    input_summary,
+                    output_summary,
+                    ..
+                } = action
+                {
+                    if !input_summary.is_empty() {
+                        parts.push(self.tokenizer.tokenize_for_fts(input_summary));
+                    }
+                    if !output_summary.is_empty() {
+                        parts.push(self.tokenizer.tokenize_for_fts(output_summary));
+                    }
+                }
+            }
+            let full_text = parts.join(" ");
 
             db.insert_turn(&session.id, turn)?;
             db.insert_fts(&full_text, &session.id, turn.index)?;
@@ -423,5 +439,97 @@ mod tests {
         };
         let results = indexer.search(&db, "rust", 10, &filters).unwrap();
         assert!(results.is_empty(), "빈 allowlist는 결과 없음이어야 함");
+    }
+
+    fn make_session_with_tool_use(
+        id: &str,
+        project: &str,
+        turn_content: &str,
+        tool_name: &str,
+        input_summary: &str,
+        output_summary: &str,
+    ) -> Session {
+        Session {
+            id: id.to_string(),
+            agent: AgentKind::ClaudeCode,
+            model: Some("test-model".to_string()),
+            project: Some(project.to_string()),
+            cwd: None,
+            git_branch: None,
+            host: None,
+            start_time: Utc.with_ymd_and_hms(2026, 4, 5, 0, 0, 0).unwrap(),
+            end_time: None,
+            session_type: "interactive".to_string(),
+            turns: vec![Turn {
+                index: 0,
+                role: Role::Assistant,
+                timestamp: None,
+                content: turn_content.to_string(),
+                actions: vec![Action::ToolUse {
+                    name: tool_name.to_string(),
+                    input_summary: input_summary.to_string(),
+                    output_summary: output_summary.to_string(),
+                    tool_use_id: Some("t1".to_string()),
+                }],
+                tokens: None,
+                thinking: None,
+                is_sidechain: false,
+            }],
+            total_tokens: TokenUsage::default(),
+        }
+    }
+
+    #[test]
+    fn test_index_includes_tool_action_input() {
+        // Without folding Action::ToolUse.input_summary into the FTS body,
+        // a marker only present in an Edit's new_string is invisible to BM25
+        // even after parser captures it.
+        let db = Database::open_memory().unwrap();
+        let tok = LinderaKoTokenizer::new().unwrap();
+        let indexer = Bm25Indexer::new(Box::new(tok));
+
+        let session = make_session_with_tool_use(
+            "s-tool-input",
+            "proj",
+            "wrote helper",
+            "Edit",
+            "lib/foo.py\n--- new ---\ndef widget_marker_qx7():\n    pass",
+            "",
+        );
+        indexer.index_session(&db, &session).unwrap();
+
+        let results = indexer
+            .search(&db, "widget_marker_qx7", 10, &SearchFilters::default())
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "identifier in Edit input_summary must be searchable"
+        );
+        assert_eq!(results[0].session_id, "s-tool-input");
+    }
+
+    #[test]
+    fn test_index_includes_tool_action_output() {
+        let db = Database::open_memory().unwrap();
+        let tok = LinderaKoTokenizer::new().unwrap();
+        let indexer = Bm25Indexer::new(Box::new(tok));
+
+        let session = make_session_with_tool_use(
+            "s-tool-output",
+            "proj",
+            "ran command",
+            "Bash",
+            "git log --oneline",
+            "abc123 fix(parser): unique_log_marker_zz",
+        );
+        indexer.index_session(&db, &session).unwrap();
+
+        let results = indexer
+            .search(&db, "unique_log_marker_zz", 10, &SearchFilters::default())
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "marker in Bash output_summary must be searchable"
+        );
     }
 }

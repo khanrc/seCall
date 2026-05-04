@@ -412,7 +412,7 @@ pub async fn ingest_sessions(
             }
         }
         // detect_parser()를 한 번 호출 — 포맷 탐지와 라우팅을 동시에 결정
-        let parser = match detect_parser(session_path) {
+        let parser = match detect_parser(session_path, &config.ingest) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(path = %session_path.display(), error = %e, "failed to detect session format");
