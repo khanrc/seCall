@@ -6,9 +6,29 @@ use std::time::Instant;
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use secall_core::{
+    ingest::Session,
     store::{get_default_db_path, Database},
     vault::Config,
 };
+
+enum WorkItem {
+    /// Default mode — pre-filter loaded the Session, embed pending chunks.
+    /// Boxed so the enum size doesn't balloon to the Session size for the
+    /// `Rebuild` variant too (clippy `large_enum_variant`).
+    Cached(Box<Session>),
+    /// `--all` mode — only sid; the worker reloads the Session after deleting
+    /// existing vectors for wholesale rebuild.
+    Rebuild(String),
+}
+
+impl WorkItem {
+    fn id(&self) -> &str {
+        match self {
+            Self::Cached(s) => &s.id,
+            Self::Rebuild(sid) => sid,
+        }
+    }
+}
 
 pub async fn run(all: bool, batch_size: Option<usize>, concurrency: usize) -> Result<()> {
     let config = Config::load_or_default();
@@ -26,56 +46,100 @@ pub async fn run(all: bool, batch_size: Option<usize>, concurrency: usize) -> Re
     let batch_size = batch_size.unwrap_or(32);
     let indexer = Arc::new(indexer.with_batch_size(batch_size));
 
-    let session_ids: Vec<String> = if all {
-        db.list_all_session_ids()?
+    let tz = config.timezone();
+    let candidate_ids: Vec<String> = db.list_all_session_ids()?;
+
+    // Pre-filter pass — sessions whose chunks are all already embedded (or
+    // whose every turn is chunker-skip) are dropped, so [i/N] progress reflects
+    // actual work. Loaded Session values are reused by the embed pass to avoid
+    // a second `get_session_for_embedding` round-trip.
+    //
+    // `--all` skips the pre-filter and only carries sids — wholesale rebuild
+    // deletes vectors and reloads inside the worker.
+    let work_items: Vec<WorkItem> = if all {
+        candidate_ids.into_iter().map(WorkItem::Rebuild).collect()
     } else {
-        db.find_sessions_without_vectors()?
+        let scan_start = Instant::now();
+        let total_candidates = candidate_ids.len();
+        eprintln!("Scanning {total_candidates} session(s) for pending chunks...");
+        let mut filtered: Vec<WorkItem> = Vec::new();
+        for sid in &candidate_ids {
+            let session = match db.get_session_for_embedding(sid) {
+                Ok(s) => s,
+                Err(_) => {
+                    // surface failure in the embed pass (worker reload path)
+                    filtered.push(WorkItem::Rebuild(sid.clone()));
+                    continue;
+                }
+            };
+            match indexer.has_pending_chunks(&db, &session, tz) {
+                Ok(true) => filtered.push(WorkItem::Cached(Box::new(session))),
+                Ok(false) => {} // silent skip
+                Err(_) => filtered.push(WorkItem::Rebuild(sid.clone())),
+            }
+        }
+        eprintln!(
+            "  Scan: {} session(s) need embedding, {} skipped no-op (in {:.2}s)",
+            filtered.len(),
+            total_candidates - filtered.len(),
+            scan_start.elapsed().as_secs_f64(),
+        );
+        filtered
     };
 
-    if session_ids.is_empty() {
+    if work_items.is_empty() {
         println!("All sessions already embedded.");
         return Ok(());
     }
 
-    let total = session_ids.len();
+    let total = work_items.len();
     eprintln!(
         "Embedding {} session(s) [batch_size={}, concurrency={}]...",
         total, batch_size, concurrency
     );
-
-    let tz = config.timezone();
     let db_path: Arc<PathBuf> = Arc::new(db_path);
     let counter = Arc::new(AtomicUsize::new(0));
     let total_chunks = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
 
-    stream::iter(session_ids)
-        .map(|sid| {
+    stream::iter(work_items)
+        .map(|item| {
             let indexer = Arc::clone(&indexer);
             let db_path = Arc::clone(&db_path);
             let counter = Arc::clone(&counter);
             let total_chunks = Arc::clone(&total_chunks);
             async move {
+                let sid = item.id().to_string();
+                let short = &sid[..sid.len().min(8)];
                 let db = match Database::open(db_path.as_path()) {
                     Ok(d) => d,
                     Err(e) => {
                         let i = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        eprintln!(
-                            "  [{i}/{total}] {} — db open failed: {e}",
-                            &sid[..sid.len().min(8)]
-                        );
+                        eprintln!("  [{i}/{total}] {short} — db open failed: {e}");
                         return;
                     }
                 };
-                let session = match db.get_session_for_embedding(&sid) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let i = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        eprintln!(
-                            "  [{i}/{total}] {} — load failed: {e}",
-                            &sid[..sid.len().min(8)]
-                        );
-                        return;
+                let session: Session = match item {
+                    WorkItem::Cached(s) => *s,
+                    WorkItem::Rebuild(sid) => {
+                        // --all (또는 pre-filter 로드 실패) — 기존 vector drop 후 reload
+                        if all {
+                            if let Err(e) = db.delete_session_vectors(&sid) {
+                                let i = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                                eprintln!(
+                                    "  [{i}/{total}] {short} — delete-before-rebuild failed: {e}"
+                                );
+                                return;
+                            }
+                        }
+                        match db.get_session_for_embedding(&sid) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let i = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                                eprintln!("  [{i}/{total}] {short} — load failed: {e}");
+                                return;
+                            }
+                        }
                     }
                 };
                 match indexer.index_session(&db, &session, tz).await {
@@ -98,18 +162,14 @@ pub async fn run(all: bool, batch_size: Option<usize>, concurrency: usize) -> Re
                         };
                         let eta_min = (eta_secs / 60.0).ceil() as u64;
                         eprintln!(
-                            "  [{done}/{total}] {} — {} chunks ({:.1} chunks/s, ETA ~{eta_min}m)",
-                            &sid[..sid.len().min(8)],
+                            "  [{done}/{total}] {short} — {} chunks ({:.1} chunks/s, ETA ~{eta_min}m)",
                             stats.chunks_embedded,
                             rate,
                         );
                     }
                     Err(e) => {
                         let i = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        eprintln!(
-                            "  [{i}/{total}] {} — embedding failed: {e}",
-                            &sid[..sid.len().min(8)]
-                        );
+                        eprintln!("  [{i}/{total}] {short} — embedding failed: {e}");
                     }
                 }
             }
