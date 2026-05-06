@@ -4,9 +4,9 @@
 
 # seCall
 
-AI 에이전트와 나눈 모든 대화를 검색하세요.
+AI 에이전트와 나눈 대화를 로컬 위키로 정리하고 검색하세요.
 
-**Search everything you've ever discussed with AI agents.**
+**Your AI agent conversations, as a searchable local wiki.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.75+-f74c00?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![SQLite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
@@ -31,7 +31,7 @@ AI 에이전트와 나눈 모든 대화를 검색하세요.
   - [하이브리드 검색](#하이브리드-검색)
   - [지식 볼트](#지식-볼트)
   - [Knowledge Graph](#knowledge-graph)
-  - [REST API + Obsidian 플러그인](#rest-api--obsidian-플러그인)
+  - [Web UI + REST API + Obsidian 플러그인](#web-ui--rest-api--obsidian-플러그인)
   - [MCP 서버](#mcp-서버)
   - [멀티 기기 볼트 동기화](#멀티-기기-볼트-동기화)
   - [데이터 무결성](#데이터-무결성)
@@ -66,14 +66,12 @@ AI 에이전트와 나눈 모든 대화를 검색하세요.
 
 ## seCall이란?
 
-seCall은 AI 에이전트 세션을 위한 로컬 퍼스트 검색 엔진입니다. **Claude Code**, **Codex CLI**, **Gemini CLI**, **claude.ai**, **ChatGPT**의 대화 로그를 수집하고, BM25 + 벡터 하이브리드 검색으로 인덱싱하며, CLI/MCP 서버/Obsidian 호환 지식 볼트로 제공합니다.
-
-AI와의 대화는 곧 지식 자산입니다. seCall은 그것을 검색 가능하고, 탐색 가능하며, 서로 연결된 형태로 만듭니다.
+seCall은 AI 에이전트 대화를 위한 로컬 퍼스트 도구입니다. **Claude Code**, **Codex CLI**, **Gemini CLI**, **claude.ai**, **ChatGPT** 의 세션 로그를 수집하고, LLM 으로 Obsidian 호환 **위키**를 정리해 두고, BM25 + 벡터 하이브리드 **검색**을 CLI / MCP 서버 / REST API / 내장 웹 UI 로 제공합니다.
 
 ### 왜 필요한가?
 
-- 수백 개의 에이전트 세션에 걸쳐 아키텍처, 디버깅, 설계 결정을 논의했지만 — 불투명한 JSONL 파일에 흩어져 있습니다.
-- seCall은 이 세션들을 **구조화되고 검색 가능한 지식 그래프**로 변환합니다. MCP 호환 AI 에이전트에서 쿼리하거나 Obsidian에서 탐색할 수 있습니다.
+- 아키텍처 결정·디버깅 흔적·설계 메모가 에이전트 JSONL 파일들에 흩어져 있어, "지난번에 그 업스트림 에러 어떻게 패치했더라?" 를 다시 찾는 게 번거롭습니다.
+- seCall 은 원본 transcript 를 그대로 보존하면서 위에 LLM 이 정리한 위키를 얹고, 둘 다 검색합니다 — CLI / 웹 UI / Obsidian / MCP 호환 AI 에이전트 어디서든.
 
 ## 주요 기능
 
@@ -112,7 +110,7 @@ vault/
     └── graph.json   # 노드/엣지 데이터
 ```
 
-- **위키 생성**: pluggable LLM backend 기반 (`secall wiki update --backend claude|codex|ollama|lmstudio`)
+- **위키 생성**: pluggable LLM backend 기반 (`secall wiki update --backend claude|codex|haiku|ollama|lmstudio`)
 - **Obsidian 백링크** (`[[]]`)로 세션 ↔ 위키 페이지 연결
 - Dataview 쿼리를 위한 frontmatter 메타데이터 (`summary` 필드로 세션 내용 즉시 파악)
 
@@ -513,18 +511,15 @@ session_type = "automated"
 # Claude Code로 위키 업데이트 (기본값)
 secall wiki update
 
-# Codex로 위키 업데이트
-secall wiki update --backend codex
-
-# 로컬 LLM 백엔드 사용
-secall wiki update --backend ollama
-secall wiki update --backend lmstudio
-
 # Codex CLI 백엔드
 secall wiki update --backend codex
 
-# Gemini 백엔드
-secall wiki update --backend gemini
+# 로컬 LLM 백엔드
+secall wiki update --backend ollama
+secall wiki update --backend lmstudio
+
+# Anthropic API (haiku — 직접 API 호출)
+secall wiki update --backend haiku
 
 # 특정 세션만 증분 업데이트
 secall wiki update --backend lmstudio --session <id>
@@ -537,7 +532,7 @@ secall wiki status
 
 ```toml
 [wiki]
-default_backend = "lmstudio"   # "claude" | "codex" | "ollama" | "lmstudio" | "gemini"
+default_backend = "lmstudio"   # "claude" | "codex" | "haiku" | "ollama" | "lmstudio"
 
 [wiki.backends.lmstudio]
 api_url = "http://localhost:1234"
@@ -614,7 +609,7 @@ secall config path
 | `ingest.classification.skip_embed_types` | 임베딩을 스킵할 session_type 목록 | `[]` |
 | `graph.semantic_backend` | 시맨틱 엣지 추출 백엔드 (`gemini` / `ollama` / `lmstudio` / `none`) | `none` |
 | `graph.gemini_model` | Gemini 모델 이름 | `gemini-2.5-flash` |
-| `wiki.default_backend` | 위키 생성 백엔드 (`claude` / `codex` / `ollama` / `lmstudio` / `gemini`) | `claude` |
+| `wiki.default_backend` | 위키 생성 백엔드 (`claude` / `codex` / `haiku` / `ollama` / `lmstudio`) | `claude` |
 | `wiki.backends.<name>.api_url` | 백엔드 API 엔드포인트 | (기본값 사용) |
 | `wiki.backends.<name>.model` | 백엔드 모델 이름 | (기본값 사용) |
 | `wiki.backends.<name>.max_tokens` | 최대 생성 토큰 수 | `4096` |

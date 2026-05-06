@@ -4,9 +4,9 @@
 
 # seCall
 
-AI 에이전트와 나눈 모든 대화를 검색하세요.
+AI 에이전트와 나눈 대화를 로컬 위키로 정리하고 검색하세요.
 
-**Search everything you've ever discussed with AI agents.**
+**Your AI agent conversations, as a searchable local wiki.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.75+-f74c00?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![SQLite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
@@ -36,7 +36,7 @@ AI 에이전트와 나눈 모든 대화를 검색하세요.
   - [Hybrid Search](#hybrid-search)
   - [Knowledge Vault](#knowledge-vault)
   - [Knowledge Graph](#knowledge-graph)
-  - [REST API + Obsidian Plugin](#rest-api--obsidian-plugin)
+  - [Web UI + REST API + Obsidian Plugin](#web-ui--rest-api--obsidian-plugin)
   - [MCP Server](#mcp-server)
   - [Multi-Device Vault Sync](#multi-device-vault-sync)
   - [Data Integrity](#data-integrity)
@@ -67,14 +67,12 @@ AI 에이전트와 나눈 모든 대화를 검색하세요.
 
 ## What is seCall?
 
-seCall is a local-first search engine for AI agent sessions. It ingests conversation logs from **Claude Code**, **Codex CLI**, **Gemini CLI**, **claude.ai**, and **ChatGPT**, indexes them with hybrid BM25 + vector search, and exposes them via CLI, MCP server, and an Obsidian-compatible knowledge vault.
-
-Your AI conversations are a knowledge base. seCall makes them searchable, browsable, and interconnected.
+seCall is a local-first tool for AI agent conversations. It ingests session logs from **Claude Code**, **Codex CLI**, **Gemini CLI**, **claude.ai**, and **ChatGPT**, has an LLM curate them into an Obsidian-compatible **wiki**, and exposes hybrid BM25 + vector **search** through CLI, MCP server, REST API, and a built-in web UI.
 
 ### Why?
 
-- You've discussed architecture, debugging steps, and design decisions across hundreds of agent sessions — but they're scattered in opaque JSONL files.
-- seCall turns those sessions into a **structured, searchable knowledge graph** you can query from any MCP-compatible AI agent or browse in Obsidian.
+- Architecture, debugging notes, and design decisions get scattered across opaque agent JSONL files. Re-finding "how did we patch that upstream error last month?" is painful.
+- seCall keeps the raw transcripts immutable, builds an LLM-curated wiki on top, and lets you search both — from CLI, the web UI, your Obsidian vault, or any MCP-compatible AI agent.
 
 ## Features
 
@@ -113,7 +111,7 @@ vault/
     └── graph.json   # Node/edge data
 ```
 
-- **Wiki generation** via pluggable LLM backends (`secall wiki update --backend claude|codex|ollama|lmstudio`)
+- **Wiki generation** via pluggable LLM backends (`secall wiki update --backend claude|codex|haiku|ollama|lmstudio`)
 - **Obsidian backlinks** (`[[]]`) connecting sessions ↔ wiki pages
 - Frontmatter metadata for Dataview queries (`summary` field for at-a-glance session identification)
 
@@ -510,18 +508,15 @@ session_type = "automated"
 # Use Claude Code (default)
 secall wiki update
 
-# Use Codex
-secall wiki update --backend codex
-
-# Use a local LLM backend
-secall wiki update --backend ollama
-secall wiki update --backend lmstudio
-
 # Codex CLI backend
 secall wiki update --backend codex
 
-# Gemini backend
-secall wiki update --backend gemini
+# Local LLM backends
+secall wiki update --backend ollama
+secall wiki update --backend lmstudio
+
+# Anthropic API (haiku — direct API call)
+secall wiki update --backend haiku
 
 # Incremental update for one session
 secall wiki update --backend lmstudio --session <id>
@@ -559,7 +554,7 @@ Configure the default backend in `config.toml`:
 
 ```toml
 [wiki]
-default_backend = "lmstudio"   # "claude" | "codex" | "ollama" | "lmstudio" | "gemini"
+default_backend = "lmstudio"   # "claude" | "codex" | "haiku" | "ollama" | "lmstudio"
 
 [wiki.backends.lmstudio]
 api_url = "http://localhost:1234"
@@ -633,7 +628,7 @@ secall config path
 | `ingest.classification.skip_embed_types` | Session types to skip vector embedding | `[]` |
 | `graph.semantic_backend` | Semantic edge extraction backend (`gemini` / `ollama` / `none`) | `none` |
 | `graph.gemini_model` | Gemini model name | `gemini-2.5-flash` |
-| `wiki.default_backend` | Wiki generation backend (`claude` / `codex` / `ollama` / `lmstudio` / `gemini`) | `claude` |
+| `wiki.default_backend` | Wiki generation backend (`claude` / `codex` / `haiku` / `ollama` / `lmstudio`) | `claude` |
 | `wiki.backends.<name>.api_url` | Backend API endpoint | (default) |
 | `wiki.backends.<name>.model` | Model name for the backend | (default) |
 | `wiki.backends.<name>.max_tokens` | Max tokens to generate | `4096` |
