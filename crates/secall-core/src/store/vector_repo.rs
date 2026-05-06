@@ -37,6 +37,7 @@ impl VectorRepo for Database {
                 embedding   BLOB NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_vectors_session ON turn_vectors(session_id);
+            CREATE INDEX IF NOT EXISTS idx_vectors_session_turn ON turn_vectors(session_id, turn_index);
         ",
         )?;
         Ok(())
