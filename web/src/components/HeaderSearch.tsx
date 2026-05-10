@@ -1,60 +1,57 @@
 import { useEffect, useRef, useState } from "react";
 import { Search, X } from "lucide-react";
-import type { SearchMode } from "@/lib/types";
+import { useUi, type GlobalSearchMode } from "@/lib/store";
 
 /**
- * 검색 입력 + keyword/semantic 모드 토글 — Calm/Editorial 톤 (Stage 2c).
+ * TopNav 중앙 슬롯 — 전역 검색 입력 + mode 토글.
  *
- * - 디바운스 300ms (외부 onChange 발화는 입력 멈춘 뒤).
- * - clear (X) 버튼 / 우측에 `/` 단축키 hint kbd.
- * - segmented 모드 토글 (양쪽 둥근 inline border).
- * - 모든 시각은 design tokens (web/src/lib/design-tokens.md) 사용.
+ * - 검색 state 는 `useUi` store 에 lift (route 간 유지).
+ * - 디바운스 200ms (입력 후 멈추면 store 갱신).
+ * - mode 후보는 props 로 받음 — sessions: ["keyword","semantic"], wiki: ["keyword","semantic","hybrid"].
+ * - prototype layout.jsx 의 HeaderSearch (hsb) 패턴.
  */
 interface Props {
-  value: string;
-  onChange: (next: string) => void;
-  mode?: SearchMode;
-  onModeChange?: (next: SearchMode) => void;
+  modes: readonly GlobalSearchMode[];
   placeholder?: string;
-  debounceMs?: number;
 }
 
-export function SearchBar({
-  value,
-  onChange,
-  mode = "keyword",
-  onModeChange,
-  placeholder,
-  debounceMs = 300,
-}: Props) {
-  const [local, setLocal] = useState(value);
+export function HeaderSearch({ modes, placeholder }: Props) {
+  const query = useUi((s) => s.query);
+  const setQuery = useUi((s) => s.setQuery);
+  const mode = useUi((s) => s.searchMode);
+  const setMode = useUi((s) => s.setSearchMode);
+
+  const [local, setLocal] = useState(query);
   const [focus, setFocus] = useState(false);
   const timerRef = useRef<number | null>(null);
 
+  // 외부 변경(다른 라우트 진입 등) → local 동기화
   useEffect(() => {
-    setLocal(value);
-  }, [value]);
+    setLocal(query);
+  }, [query]);
 
+  // 라우트 변경 등으로 mode 가 현재 modes 에 없으면 첫 모드로 폴백
   useEffect(() => {
-    if (local === value) return;
+    if (!modes.includes(mode)) setMode(modes[0]);
+  }, [modes, mode, setMode]);
+
+  // 디바운스 200ms
+  useEffect(() => {
+    if (local === query) return;
     if (timerRef.current) window.clearTimeout(timerRef.current);
-    timerRef.current = window.setTimeout(() => onChange(local), debounceMs);
+    timerRef.current = window.setTimeout(() => setQuery(local), 200);
     return () => {
       if (timerRef.current) window.clearTimeout(timerRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [local, debounceMs]);
-
-  const clear = () => {
-    setLocal("");
-    onChange("");
-  };
+  }, [local]);
 
   const ph =
-    placeholder ?? (mode === "semantic" ? "의미로 검색…" : "세션 검색…");
+    placeholder ??
+    (mode === "semantic" ? "의미로 검색…" : mode === "hybrid" ? "전체 검색…" : "검색…");
 
   return (
-    <div className="flex items-center gap-ds-2">
+    <div className="flex items-center gap-ds-2 w-full max-w-[480px]">
       <div
         className={[
           "flex-1 flex items-center h-8 rounded-md border bg-[var(--surface)] transition-colors duration-fast ease-ds",
@@ -78,7 +75,10 @@ export function SearchBar({
           {local ? (
             <button
               type="button"
-              onClick={clear}
+              onClick={() => {
+                setLocal("");
+                setQuery("");
+              }}
               aria-label="검색어 지우기"
               className="inline-flex items-center justify-center size-4 rounded-sm hover:text-text"
             >
@@ -90,22 +90,28 @@ export function SearchBar({
         </span>
       </div>
 
-      {onModeChange && (
-        <div className="flex rounded-md border border-border-soft overflow-hidden bg-[var(--surface)]">
-          {(["keyword", "semantic"] as const).map((m) => (
+      {modes.length > 1 && (
+        <div className="flex rounded-md border border-border-soft overflow-hidden bg-[var(--surface)] shrink-0">
+          {modes.map((m) => (
             <button
               key={m}
               type="button"
-              onClick={() => onModeChange(m)}
-              title={m === "keyword" ? "키워드 (BM25)" : "시맨틱 (벡터)"}
+              onClick={() => setMode(m)}
+              title={
+                m === "keyword"
+                  ? "키워드 (BM25)"
+                  : m === "semantic"
+                    ? "시맨틱 (벡터)"
+                    : "하이브리드 (RRF)"
+              }
               className={[
-                "px-ds-3 h-8 text-t-meta transition-colors duration-fast ease-ds",
+                "px-ds-2 h-8 text-t-meta transition-colors duration-fast ease-ds",
                 mode === m
                   ? "bg-surface-2 text-text font-medium"
                   : "text-text-3 hover:text-text hover:bg-surface-2",
               ].join(" ")}
             >
-              {m === "keyword" ? "키워드" : "시맨틱"}
+              {m[0].toUpperCase() + m.slice(1)}
             </button>
           ))}
         </div>
