@@ -9,9 +9,29 @@ use serde_json::Value;
 use super::types::{Action, AgentKind, Role, Session, TokenUsage, Turn};
 use super::SessionParser;
 
-const TOOL_OUTPUT_MAX_CHARS: usize = 1000;
+/// Parser for Claude Code session jsonl files.
+///
+/// `tool_output_max_chars` caps the per-action `input_summary` and
+/// `output_summary` strings stored on `Action::ToolUse`. Driven by
+/// `Config::ingest::tool_output_max_chars` at construction time.
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeParser {
+    pub tool_output_max_chars: usize,
+}
 
-pub struct ClaudeCodeParser;
+impl ClaudeCodeParser {
+    pub fn new(tool_output_max_chars: usize) -> Self {
+        Self {
+            tool_output_max_chars,
+        }
+    }
+}
+
+impl Default for ClaudeCodeParser {
+    fn default() -> Self {
+        Self::new(500)
+    }
+}
 
 impl SessionParser for ClaudeCodeParser {
     fn can_parse(&self, path: &Path) -> bool {
@@ -22,9 +42,11 @@ impl SessionParser for ClaudeCodeParser {
     }
 
     fn parse(&self, path: &Path) -> crate::error::Result<Session> {
-        parse_claude_jsonl(path).map_err(|e| crate::error::SecallError::Parse {
-            path: path.to_string_lossy().into_owned(),
-            source: e,
+        parse_claude_jsonl(path, self.tool_output_max_chars).map_err(|e| {
+            crate::error::SecallError::Parse {
+                path: path.to_string_lossy().into_owned(),
+                source: e,
+            }
         })
     }
 
@@ -33,7 +55,7 @@ impl SessionParser for ClaudeCodeParser {
     }
 }
 
-pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
+pub fn parse_claude_jsonl(path: &Path, tool_output_max_chars: usize) -> Result<Session> {
     let file = std::fs::File::open(path)?;
     let reader = BufReader::new(file);
 
@@ -117,7 +139,7 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
                                 let tool_use_id =
                                     item["tool_use_id"].as_str().unwrap_or("").to_string();
                                 let output = extract_tool_result_content(&item["content"]);
-                                let truncated = truncate_str(&output, TOOL_OUTPUT_MAX_CHARS);
+                                let truncated = truncate_str(&output, tool_output_max_chars);
 
                                 // Find the corresponding action in the last assistant turn
                                 if let Some(&action_idx) = pending_tool_uses.get(&tool_use_id) {
@@ -204,7 +226,11 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
                             Some("tool_use") => {
                                 let name = item["name"].as_str().unwrap_or("unknown").to_string();
                                 let tool_use_id = item["id"].as_str().unwrap_or("").to_string();
-                                let input_summary = summarize_tool_input(&name, &item["input"]);
+                                let input_summary = summarize_tool_input(
+                                    &name,
+                                    &item["input"],
+                                    tool_output_max_chars,
+                                );
 
                                 let action_idx = actions.len();
                                 if !tool_use_id.is_empty() {
@@ -328,12 +354,51 @@ fn extract_tool_result_content(content: &Value) -> String {
     String::new()
 }
 
-fn summarize_tool_input(tool_name: &str, input: &Value) -> String {
+fn summarize_tool_input(tool_name: &str, input: &Value, max_chars: usize) -> String {
     match tool_name {
-        "Bash" | "bash" => input["command"].as_str().unwrap_or("").to_string(),
+        "Bash" | "bash" => truncate_str(input["command"].as_str().unwrap_or(""), max_chars),
         "Read" | "read" => input["file_path"].as_str().unwrap_or("").to_string(),
-        "Edit" | "edit" | "MultiEdit" => input["file_path"].as_str().unwrap_or("").to_string(),
-        "Write" | "write" => input["file_path"].as_str().unwrap_or("").to_string(),
+        "Edit" | "edit" => {
+            // Capture the actual edit body so search corpus can match identifiers
+            // a coding agent wrote/replaced. Without this, recall on a function
+            // name newly introduced via Edit returns nothing.
+            let path = input["file_path"].as_str().unwrap_or("");
+            let old_str = input["old_string"].as_str().unwrap_or("");
+            let new_str = input["new_string"].as_str().unwrap_or("");
+            let body = if !old_str.is_empty() || !new_str.is_empty() {
+                format!("{path}\n--- old ---\n{old_str}\n--- new ---\n{new_str}")
+            } else {
+                path.to_string()
+            };
+            truncate_str(&body, max_chars)
+        }
+        "MultiEdit" => {
+            let path = input["file_path"].as_str().unwrap_or("");
+            let edits = input["edits"].as_array();
+            if let Some(edits) = edits {
+                let mut buf = String::from(path);
+                for (i, edit) in edits.iter().enumerate() {
+                    let old_str = edit["old_string"].as_str().unwrap_or("");
+                    let new_str = edit["new_string"].as_str().unwrap_or("");
+                    buf.push_str(&format!(
+                        "\n--- edit {i} old ---\n{old_str}\n--- edit {i} new ---\n{new_str}"
+                    ));
+                }
+                truncate_str(&buf, max_chars)
+            } else {
+                path.to_string()
+            }
+        }
+        "Write" | "write" => {
+            let path = input["file_path"].as_str().unwrap_or("");
+            let content = input["content"].as_str().unwrap_or("");
+            let body = if content.is_empty() {
+                path.to_string()
+            } else {
+                format!("{path}\n--- content ---\n{content}")
+            };
+            truncate_str(&body, max_chars)
+        }
         "Grep" | "grep" => {
             let pattern = input["pattern"].as_str().unwrap_or("");
             let path = input["path"].as_str().unwrap_or("");
@@ -341,9 +406,8 @@ fn summarize_tool_input(tool_name: &str, input: &Value) -> String {
         }
         "Glob" | "glob" => input["pattern"].as_str().unwrap_or("").to_string(),
         _ => {
-            // Generic: show first 200 chars of JSON
-            let s = input.to_string();
-            truncate_str(&s, 200)
+            // Generic: cap full JSON at max_chars (was hardcoded 200 — superseded by config)
+            truncate_str(&input.to_string(), max_chars)
         }
     }
 }
@@ -386,7 +450,7 @@ mod tests {
             r#"{"type":"assistant","message":{"role":"assistant","id":"msg_1","model":"claude-opus-4-6","content":[{"type":"text","text":"Hello! How can I help?"}],"usage":{"input_tokens":5,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-04-05T10:00:01Z"}"#,
         ];
         let f = write_jsonl(lines);
-        let session = parse_claude_jsonl(f.path()).unwrap();
+        let session = parse_claude_jsonl(f.path(), 500).unwrap();
         assert_eq!(session.id, "test-session-123");
         assert_eq!(session.turns.len(), 2);
         assert_eq!(session.turns[0].role, Role::User);
@@ -402,7 +466,7 @@ mod tests {
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file1.txt\nfile2.txt","is_error":false}]},"timestamp":"2026-04-05T10:00:02Z"}"#,
         ];
         let f = write_jsonl(lines);
-        let session = parse_claude_jsonl(f.path()).unwrap();
+        let session = parse_claude_jsonl(f.path(), 500).unwrap();
         // user + assistant (tool_result doesn't create new turn)
         assert_eq!(session.turns.len(), 2);
         assert_eq!(session.turns[1].actions.len(), 1);
@@ -424,7 +488,7 @@ mod tests {
             r#"{"type":"assistant","message":{"role":"assistant","id":"msg_1","model":"claude","content":[{"type":"thinking","thinking":"Let me reason..."},{"type":"text","text":"Here is my answer"}],"usage":{"input_tokens":5,"output_tokens":8}},"timestamp":"2026-04-05T10:00:01Z"}"#,
         ];
         let f = write_jsonl(lines);
-        let session = parse_claude_jsonl(f.path()).unwrap();
+        let session = parse_claude_jsonl(f.path(), 500).unwrap();
         assert_eq!(
             session.turns[1].thinking.as_deref(),
             Some("Let me reason...")
@@ -440,14 +504,14 @@ mod tests {
             r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-04-05T10:00:01Z"}"#,
         ];
         let f = write_jsonl(lines);
-        let session = parse_claude_jsonl(f.path()).unwrap();
+        let session = parse_claude_jsonl(f.path(), 500).unwrap();
         assert_eq!(session.turns.len(), 1); // Only the valid user turn
     }
 
     #[test]
     fn test_empty_file_returns_err() {
         let f = write_jsonl(&[]);
-        let result = parse_claude_jsonl(f.path());
+        let result = parse_claude_jsonl(f.path(), 500);
         assert!(result.is_err());
     }
 
@@ -458,9 +522,89 @@ mod tests {
             r#"{"type":"assistant","message":{"role":"assistant","id":"m1","model":"claude","content":[{"type":"text","text":"A1"}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":200}},"timestamp":"2026-04-05T10:00:01Z"}"#,
         ];
         let f = write_jsonl(lines);
-        let session = parse_claude_jsonl(f.path()).unwrap();
+        let session = parse_claude_jsonl(f.path(), 500).unwrap();
         assert_eq!(session.total_tokens.input, 100);
         assert_eq!(session.total_tokens.output, 50);
         assert_eq!(session.total_tokens.cached, 200);
+    }
+
+    #[test]
+    fn test_parse_edit_captures_old_and_new_string() {
+        // Edit's new_string is the strongest signal for "what did the agent
+        // write?" recall queries. Without this, an identifier introduced via
+        // Edit is invisible to BM25 — the markdown shows only file_path.
+        let lines = &[
+            r#"{"type":"user","message":{"role":"user","content":"edit foo"},"timestamp":"2026-04-05T10:00:00Z","sessionId":"s-edit","cwd":"/tmp","gitBranch":"main","version":"1.0"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"m1","model":"claude","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"foo.py","old_string":"def old_func()","new_string":"def secret_marker_xyz()"}}],"usage":{"input_tokens":5,"output_tokens":3}},"timestamp":"2026-04-05T10:00:01Z"}"#,
+        ];
+        let f = write_jsonl(lines);
+        let session = parse_claude_jsonl(f.path(), 500).unwrap();
+        if let Action::ToolUse { input_summary, .. } = &session.turns[1].actions[0] {
+            assert!(input_summary.contains("foo.py"));
+            assert!(
+                input_summary.contains("def secret_marker_xyz()"),
+                "Edit's new_string must be captured: {input_summary}"
+            );
+            assert!(input_summary.contains("def old_func()"));
+        } else {
+            panic!("expected Edit ToolUse");
+        }
+    }
+
+    #[test]
+    fn test_parse_write_captures_content() {
+        let lines = &[
+            r#"{"type":"user","message":{"role":"user","content":"write a file"},"timestamp":"2026-04-05T10:00:00Z","sessionId":"s-write","cwd":"/tmp","gitBranch":"main","version":"1.0"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"m1","model":"claude","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"bar.py","content":"unique_payload_marker_abc"}}],"usage":{"input_tokens":5,"output_tokens":3}},"timestamp":"2026-04-05T10:00:01Z"}"#,
+        ];
+        let f = write_jsonl(lines);
+        let session = parse_claude_jsonl(f.path(), 500).unwrap();
+        if let Action::ToolUse { input_summary, .. } = &session.turns[1].actions[0] {
+            assert!(input_summary.contains("bar.py"));
+            assert!(input_summary.contains("unique_payload_marker_abc"));
+        } else {
+            panic!("expected Write ToolUse");
+        }
+    }
+
+    #[test]
+    fn test_parse_multiedit_captures_each_edit() {
+        let lines = &[
+            r#"{"type":"user","message":{"role":"user","content":"multiedit"},"timestamp":"2026-04-05T10:00:00Z","sessionId":"s-multi","cwd":"/tmp","gitBranch":"main","version":"1.0"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"m1","model":"claude","content":[{"type":"tool_use","id":"t1","name":"MultiEdit","input":{"file_path":"baz.py","edits":[{"old_string":"alpha","new_string":"beta_marker"},{"old_string":"gamma","new_string":"delta_marker"}]}}],"usage":{"input_tokens":5,"output_tokens":3}},"timestamp":"2026-04-05T10:00:01Z"}"#,
+        ];
+        let f = write_jsonl(lines);
+        let session = parse_claude_jsonl(f.path(), 500).unwrap();
+        if let Action::ToolUse { input_summary, .. } = &session.turns[1].actions[0] {
+            assert!(input_summary.contains("baz.py"));
+            assert!(input_summary.contains("beta_marker"));
+            assert!(input_summary.contains("delta_marker"));
+            assert!(input_summary.contains("alpha"));
+            assert!(input_summary.contains("gamma"));
+        } else {
+            panic!("expected MultiEdit ToolUse");
+        }
+    }
+
+    #[test]
+    fn test_tool_output_max_chars_caps_input_summary() {
+        let big = "x".repeat(2000);
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","id":"m1","model":"claude","content":[{{"type":"tool_use","id":"t1","name":"Write","input":{{"file_path":"f.py","content":"{big}"}}}}],"usage":{{"input_tokens":5,"output_tokens":3}}}},"timestamp":"2026-04-05T10:00:01Z"}}"#
+        );
+        let user = r#"{"type":"user","message":{"role":"user","content":"go"},"timestamp":"2026-04-05T10:00:00Z","sessionId":"s-cap","cwd":"/tmp","gitBranch":"main","version":"1.0"}"#;
+        let f = write_jsonl(&[user, &line]);
+        let session = parse_claude_jsonl(f.path(), 256).unwrap();
+        if let Action::ToolUse { input_summary, .. } = &session.turns[1].actions[0] {
+            // Cap=256 + "..." suffix when truncated. Hard guard: never exceed
+            // a generous upper bound (256 chars + a few ellipsis chars).
+            assert!(
+                input_summary.chars().count() <= 260,
+                "input_summary must respect tool_output_max_chars=256, got {} chars",
+                input_summary.chars().count()
+            );
+        } else {
+            panic!("expected Write ToolUse");
+        }
     }
 }
