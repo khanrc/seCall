@@ -37,23 +37,25 @@ Agents: {agents}
 Vector search: {vector_status}
 
 ## Usage Tips
-- Use `recall` with keyword type for exact term matches (BM25)
-- Use `recall` with semantic type for conceptual search (requires embeddings)
-- Combine keyword + semantic queries for best results
-- Use `get` with session_id:N to read a specific turn
-- Filter by project or agent when searching across many sessions
+- `recall` defaults to hybrid mode (BM25 + vector, merged via RRF). Omit `type` for the default — it's the right choice for most paraphrase / conceptual queries.
+- Use `type: "keyword"` only when the query is a strong-IDF identifier (function name, ticket ID, file path) where vector search adds no signal.
+- Use `type: "semantic"` only when the query is pure paraphrase and you want to skip BM25 ranking.
+- Pair `type: "temporal"` (e.g. "yesterday", "since 2026-05-01") with another item to filter by date window.
+- Use `get` with session_id:N to read a specific turn.
+- Filter by project or agent when searching across many sessions.
 
 ## Tools
-- `recall` — search session turns (keyword / semantic / temporal)
+- `recall` — search session turns (hybrid by default; keyword / semantic / temporal as overrides)
 - `get` — retrieve a specific session or turn by ID
 - `status` — show index health
 - `wiki_search` — search wiki knowledge pages by query; optional `category` filter (projects/topics/decisions){graph_tool_line}
 
 ## Example Queries
-- Keyword: {{"queries": [{{"type": "keyword", "query": "SQLite FTS5"}}]}}
-- Semantic: {{"queries": [{{"type": "semantic", "query": "how to design database schema"}}]}}
-- Combined: {{"queries": [{{"type": "keyword", "query": "kiwi-rs"}}, {{"type": "semantic", "query": "Korean tokenizer comparison"}}]}}
-- Temporal: {{"queries": [{{"type": "temporal", "query": "yesterday"}}, {{"type": "keyword", "query": "bugfix"}}]}}
+- Hybrid (default — recommended): {{"queries": [{{"query": "Korean tokenizer comparison"}}]}}
+- Keyword only (identifier): {{"queries": [{{"type": "keyword", "query": "SQLite FTS5"}}]}}
+- Semantic only (paraphrase): {{"queries": [{{"type": "semantic", "query": "how to design database schema"}}]}}
+- Multiple hybrid queries: {{"queries": [{{"query": "RRF fusion ranking"}}, {{"query": "vector similarity merge"}}]}}
+- Temporal filter: {{"queries": [{{"type": "temporal", "query": "yesterday"}}, {{"query": "bugfix"}}]}}
 - Wiki: {{"query": "tunadish", "category": "projects", "limit": 3}}
 {graph_section}"#,
         session_count = session_count,

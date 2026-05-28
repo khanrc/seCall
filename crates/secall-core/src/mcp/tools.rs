@@ -1,21 +1,24 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum QueryType {
-    /// BM25 exact match search
+    /// BM25 + vector via reciprocal rank fusion (default — best for natural language paraphrase queries).
+    #[default]
+    Hybrid,
+    /// BM25 exact match only — use for strong-IDF identifier queries (function names, ticket IDs, file paths).
     Keyword,
-    /// Vector similarity search (requires embeddings)
+    /// Vector similarity only — use when the query is a paraphrase with no expected exact-token match.
     Semantic,
-    /// Date filter: today, yesterday, last week, since YYYY-MM-DD
+    /// Date filter: today, yesterday, last week, since YYYY-MM-DD. Does not dispatch a search by itself; pair with another type.
     Temporal,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryItem {
-    /// keyword: BM25 exact match. semantic: vector similarity. temporal: date filter
-    #[serde(rename = "type")]
+    /// Search mode. Omit (or use "hybrid") for default RRF fusion. Use "keyword" / "semantic" only when you specifically want a single-modal lookup. "temporal" sets a date filter.
+    #[serde(rename = "type", default)]
     pub query_type: QueryType,
     /// The search query string
     pub query: String,
@@ -23,7 +26,7 @@ pub struct QueryItem {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RecallParams {
-    /// Search queries array — combine keyword, semantic, temporal for best results
+    /// Search queries array. Each item defaults to "hybrid" mode (BM25 + vector merged via RRF). Mix types only when you need a specific backend or a temporal filter alongside.
     pub queries: Vec<QueryItem>,
     /// Filter by project name
     pub project: Option<String>,
