@@ -7,7 +7,7 @@ use super::vector::VectorIndexer;
 use crate::ingest::Session;
 use crate::store::db::Database;
 
-const RRF_K: f64 = 60.0;
+pub const RRF_K: f64 = 60.0;
 
 pub fn reciprocal_rank_fusion(
     bm25_results: &[SearchResult],
