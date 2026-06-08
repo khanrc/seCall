@@ -7,7 +7,7 @@ use super::vector::VectorIndexer;
 use crate::ingest::Session;
 use crate::store::db::Database;
 
-const RRF_K: f64 = 60.0;
+pub const RRF_K: f64 = 60.0;
 
 /// P89 (#100): 이 turn 수 미만 세션은 관찰/요약성 노이즈로 보고 랭킹 강등.
 const OBSERVER_TURN_THRESHOLD: i64 = 3;

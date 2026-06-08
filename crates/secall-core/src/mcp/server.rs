@@ -13,7 +13,9 @@ use super::tools::{
     WikiSearchParams,
 };
 use crate::search::bm25::{SearchFilters, SearchResult};
-use crate::search::hybrid::{diversify_by_session, parse_temporal_filter, SearchEngine};
+use crate::search::hybrid::{
+    diversify_by_session, parse_temporal_filter, reciprocal_rank_fusion, SearchEngine, RRF_K,
+};
 use crate::search::{Embedder, OllamaEmbedder};
 use crate::store::db::Database;
 use crate::store::{SessionRepo, WikiVectorRepo};
@@ -99,23 +101,39 @@ impl SeCallMcpServer {
             }
         }
 
-        let mut all_results: Vec<SearchResult> = Vec::new();
+        // Collect BM25 and vector results into separate streams so the BM25
+        // raw score (5-30) and the vector similarity score (0-1) do not get
+        // compared directly. They are merged below via reciprocal rank fusion,
+        // matching the CLI `SearchEngine::search` path in hybrid.rs.
+        let mut bm25_results: Vec<SearchResult> = Vec::new();
+        let mut vector_results: Vec<SearchResult> = Vec::new();
+
+        // Per-stream candidate pool. Mirrors `candidate_limit = limit * 3`
+        // in hybrid.rs::search so RRF has enough rank signal to work with.
+        let candidate_limit = limit.saturating_mul(3).max(limit);
 
         for item in &params.queries {
-            match item.query_type {
-                QueryType::Temporal => {}
-                QueryType::Keyword => {
-                    let results = {
-                        let db = self
-                            .db
-                            .lock()
-                            .map_err(|e| anyhow::anyhow!("DB lock: {e}"))?;
-                        self.search
-                            .search_bm25(&db, &item.query, &base_filters, limit)?
-                    };
-                    all_results.extend(results);
-                }
-                QueryType::Semantic => match self.search.embed_query(&item.query).await {
+            let (do_bm25, do_vector) = match item.query_type {
+                QueryType::Temporal => (false, false),
+                QueryType::Keyword => (true, false),
+                QueryType::Semantic => (false, true),
+                QueryType::Hybrid => (true, true),
+            };
+
+            if do_bm25 {
+                let results = {
+                    let db = self
+                        .db
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("DB lock: {e}"))?;
+                    self.search
+                        .search_bm25(&db, &item.query, &base_filters, candidate_limit)?
+                };
+                bm25_results.extend(results);
+            }
+
+            if do_vector {
+                match self.search.embed_query(&item.query).await {
                     Ok(Some(embedding)) => {
                         let results = {
                             let db = self
@@ -125,11 +143,11 @@ impl SeCallMcpServer {
                             self.search.search_with_embedding(
                                 &db,
                                 &embedding,
-                                limit,
+                                candidate_limit,
                                 &base_filters,
                             )?
                         };
-                        all_results.extend(results);
+                        vector_results.extend(results);
                     }
                     Ok(None) => {
                         tracing::info!("vector search disabled (Ollama not available)");
@@ -137,26 +155,36 @@ impl SeCallMcpServer {
                     Err(e) => {
                         return Err(anyhow::anyhow!("embedding failed: {e}"));
                     }
-                },
+                }
             }
         }
 
-        let has_keyword = params
-            .queries
-            .iter()
-            .any(|q| matches!(q.query_type, QueryType::Keyword));
-
-        if !has_keyword && all_results.is_empty() {
+        // Short-circuit when only Temporal items were sent (no search dispatched).
+        let has_search_query = params.queries.iter().any(|q| {
+            matches!(
+                q.query_type,
+                QueryType::Keyword | QueryType::Semantic | QueryType::Hybrid
+            )
+        });
+        if !has_search_query && bm25_results.is_empty() && vector_results.is_empty() {
             return Ok(serde_json::json!({ "results": [], "count": 0 }));
         }
 
-        all_results.sort_by(|a, b| {
+        // Re-rank each per-query stream by score before fusion so RRF sees a
+        // sensible rank ordering (extend() preserves insertion order across
+        // multiple queries of the same type).
+        bm25_results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let mut seen = std::collections::HashSet::new();
-        all_results.retain(|r| seen.insert((r.session_id.clone(), r.turn_index)));
+        vector_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut all_results = reciprocal_rank_fusion(&bm25_results, &vector_results, RRF_K);
 
         let max_per = base_filters.max_per_session.unwrap_or(2);
         all_results = diversify_by_session(all_results, max_per);
@@ -1428,6 +1456,94 @@ mod tests {
         };
         let result = server.recall(Parameters(params)).await;
         assert!(result.is_ok());
+    }
+
+    /// Mixed keyword+semantic queries must not error when no vector indexer
+    /// is wired (semantic branch silently no-ops via Ok(None) in embed_query).
+    /// Without RRF fusion this would still pass, but the test also acts as a
+    /// shape guard: do_recall must accept Semantic items without panicking
+    /// even when keyword candidates are the only ones returned.
+    #[tokio::test]
+    async fn test_recall_mixed_keyword_semantic_no_vector() {
+        let server = make_server();
+        let params = RecallParams {
+            queries: vec![
+                QueryItem {
+                    query_type: QueryType::Keyword,
+                    query: "이슈 정리".to_string(),
+                },
+                QueryItem {
+                    query_type: QueryType::Semantic,
+                    query: "GitHub 이슈 백로그 훑어서 정리 후보와 작업 후보 분류".to_string(),
+                },
+            ],
+            project: None,
+            agent: None,
+            limit: Some(5),
+        };
+        let result = server.recall(Parameters(params)).await;
+        assert!(result.is_ok(), "recall returned error: {result:?}");
+    }
+
+    /// QueryType::default() is Hybrid — verifies the API contract that omitting
+    /// `type` in the wire payload resolves to hybrid mode.
+    #[test]
+    fn test_query_type_default_is_hybrid() {
+        assert_eq!(QueryType::default(), QueryType::Hybrid);
+    }
+
+    /// Omitted `type` field in JSON deserializes to Hybrid via
+    /// `#[serde(default)]` on QueryItem.query_type. This is the load-bearing
+    /// behavior that turns "send a single query string" into hybrid recall.
+    #[test]
+    fn test_query_item_type_omitted_defaults_to_hybrid() {
+        let payload = r#"{"query": "test"}"#;
+        let item: QueryItem = serde_json::from_str(payload).expect("deserialize");
+        assert_eq!(item.query_type, QueryType::Hybrid);
+        assert_eq!(item.query, "test");
+    }
+
+    /// Explicit `type: "hybrid"` deserializes correctly.
+    #[test]
+    fn test_query_item_explicit_hybrid() {
+        let payload = r#"{"type": "hybrid", "query": "test"}"#;
+        let item: QueryItem = serde_json::from_str(payload).expect("deserialize");
+        assert_eq!(item.query_type, QueryType::Hybrid);
+    }
+
+    /// Hybrid mode triggers both BM25 and vector dispatch paths inside
+    /// do_recall. Without a vector indexer the semantic branch is a no-op
+    /// (Ok(None)), so the call must complete successfully — same shape guard
+    /// as the mixed-modal test, applied to a single hybrid item.
+    #[tokio::test]
+    async fn test_recall_hybrid_query_no_vector() {
+        let server = make_server();
+        let params = RecallParams {
+            queries: vec![QueryItem {
+                query_type: QueryType::Hybrid,
+                query: "GitHub 이슈 정리 후보".to_string(),
+            }],
+            project: None,
+            agent: None,
+            limit: Some(5),
+        };
+        let result = server.recall(Parameters(params)).await;
+        assert!(result.is_ok(), "hybrid recall errored: {result:?}");
+    }
+
+    /// Omitting `type` at the wire level — same dispatch path as Hybrid —
+    /// reaches do_recall successfully via serde(default).
+    #[tokio::test]
+    async fn test_recall_type_omitted_payload() {
+        let server = make_server();
+        let payload = serde_json::json!({
+            "queries": [{"query": "이슈 정리 후보 작업 후보 분류"}],
+            "limit": 5,
+        });
+        let params: RecallParams = serde_json::from_value(payload).expect("deserialize");
+        assert_eq!(params.queries[0].query_type, QueryType::Hybrid);
+        let result = server.recall(Parameters(params)).await;
+        assert!(result.is_ok(), "type-omitted recall errored: {result:?}");
     }
 
     #[test]
