@@ -523,6 +523,34 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
             Ok(()) => indexed += 1,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "reindex failed");
+                continue;
+            }
+        }
+
+        // #1021: vault-pulled md only got `sessions` + `turns_fts` before this.
+        // Reverse-parse the body into turns so the session gains `turns` rows;
+        // the hourly `secall embed` pass then backfills `turn_vectors`.
+        // No inline embedding here — the pod runs `secall sync --no-embed`.
+        let parsed_turns =
+            secall_core::ingest::parse_turns_from_body(&body, &fm.date);
+        // Cross-check against frontmatter `turns:` count; log on mismatch but
+        // still insert what parsed (best-effort, never block the sync).
+        if let Some(expected) = fm.turns {
+            if parsed_turns.len() as u32 != expected {
+                tracing::warn!(
+                    session_id = %fm.session_id,
+                    expected, parsed = parsed_turns.len(),
+                    "vault reparse turn-count mismatch"
+                );
+            }
+        }
+        for turn in &parsed_turns {
+            if let Err(e) = db.insert_turn(&fm.session_id, turn) {
+                tracing::warn!(
+                    session_id = %fm.session_id,
+                    error = %e,
+                    "insert_turn failed"
+                );
             }
         }
     }
