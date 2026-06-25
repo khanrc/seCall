@@ -499,17 +499,13 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
             continue;
         }
 
-        match db.session_exists(&fm.session_id) {
-            Ok(true) => {
-                skipped += 1;
-                continue;
-            }
-            Ok(false) => {}
+        let session_already_exists = match db.session_exists(&fm.session_id) {
+            Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "DB check failed");
                 continue;
             }
-        }
+        };
 
         let vault_path = path
             .strip_prefix(&config.vault.path)
@@ -519,10 +515,66 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
 
         let body = extract_body_text(&content);
 
-        match db.insert_session_from_vault(&fm, &body, &vault_path) {
-            Ok(()) => indexed += 1,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "reindex failed");
+        if session_already_exists {
+            // Session row exists. Check whether turns are missing or incomplete
+            // so we can backfill them idempotently. `insert_turn` uses
+            // INSERT OR IGNORE and `turns` has UNIQUE(session_id, turn_index),
+            // so re-running the loop for already-present turns is safe.
+            let db_turn_count = match db.count_turns_for_session(&fm.session_id) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(session_id = %fm.session_id, error = %e, "count_turns_for_session failed");
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let expected_turns = fm.turns.unwrap_or(0) as usize;
+            if db_turn_count >= expected_turns && expected_turns > 0 {
+                // Turns are already complete — fast path.
+                skipped += 1;
+                continue;
+            }
+            // Falls through to the turns-insertion loop below (no session insert needed).
+        } else {
+            match db.insert_session_from_vault(&fm, &body, &vault_path) {
+                Ok(()) => indexed += 1,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "reindex failed");
+                    continue;
+                }
+            }
+        }
+
+        // #1021: vault-pulled md only got `sessions` + `turns_fts` before this.
+        // Reverse-parse the body into turns so the session gains `turns` rows;
+        // the hourly `secall embed` pass then backfills `turn_vectors`.
+        // No inline embedding here — the pod runs `secall sync --no-embed`.
+        //
+        // Re-entry is safe: INSERT OR IGNORE on UNIQUE(session_id, turn_index)
+        // skips already-present turns, so a previously interrupted sync or a
+        // session backfilled from a pre-fix index will self-heal here.
+        let parsed_turns =
+            secall_core::ingest::parse_turns_from_body(&body, &fm.date);
+        // Cross-check against frontmatter `turns:` count; log on mismatch but
+        // still insert what parsed (best-effort, never block the sync).
+        if let Some(expected) = fm.turns {
+            if parsed_turns.len() as u32 != expected {
+                tracing::warn!(
+                    session_id = %fm.session_id,
+                    expected, parsed = parsed_turns.len(),
+                    "vault reparse turn-count mismatch"
+                );
+            }
+        }
+        for turn in &parsed_turns {
+            if let Err(e) = db.insert_turn(&fm.session_id, turn) {
+                // Warn and continue — re-entry heals partial state on the next
+                // sync run, so a single failed insert does not corrupt the session.
+                tracing::warn!(
+                    session_id = %fm.session_id,
+                    error = %e,
+                    "insert_turn failed"
+                );
             }
         }
     }

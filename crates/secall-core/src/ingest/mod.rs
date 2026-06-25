@@ -9,6 +9,8 @@ pub mod gemini;
 pub mod gemini_web;
 pub mod lint;
 pub mod markdown;
+pub mod markdown_reparse;
+pub use markdown_reparse::parse_turns_from_body;
 pub mod opencode;
 pub mod types;
 
