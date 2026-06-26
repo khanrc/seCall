@@ -531,3 +531,23 @@ fn count_sessions_reflects_inserts() {
     insert_minimal_session(&db, "s-2", "p", 1);
     assert_eq!(db.count_sessions().unwrap(), 2);
 }
+
+#[test]
+fn source_meta_round_trips() {
+    // get/set_source_meta + v11 마이그레이션 컬럼 회귀 (#13).
+    let db = make_db();
+    insert_minimal_session(&db, "s-1", "p", 0);
+
+    // 스냅샷 기록 전: None
+    assert_eq!(db.get_source_meta("s-1").unwrap(), None);
+
+    db.set_source_meta("s-1", 1234, 99).unwrap();
+    assert_eq!(db.get_source_meta("s-1").unwrap(), Some((1234, 99)));
+
+    // 갱신
+    db.set_source_meta("s-1", 5678, 100).unwrap();
+    assert_eq!(db.get_source_meta("s-1").unwrap(), Some((5678, 100)));
+
+    // 존재하지 않는 세션: None
+    assert_eq!(db.get_source_meta("missing").unwrap(), None);
+}

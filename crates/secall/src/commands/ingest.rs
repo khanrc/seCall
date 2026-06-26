@@ -522,6 +522,28 @@ fn compile_classification_rules(config: &Config) -> Result<Vec<CompiledRule>> {
         .collect()
 }
 
+/// 소스 파일의 `(size, mtime_secs)` 스냅샷. stat 실패 시 `None` (#13).
+fn source_file_meta(path: &Path) -> Option<(i64, i64)> {
+    let m = std::fs::metadata(path).ok()?;
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some((m.len() as i64, mtime))
+}
+
+/// 마지막 ingest 스냅샷(`stored`) 대비 현재 파일(`current`)이 바뀌었으면 true (#13).
+/// 스냅샷이 없거나(최초/legacy row) 지금 stat 불가면 재인제스트(true)로 본다.
+/// CC jsonl 은 append-only 라 size 단조증가 → size 비교만으로 robust.
+fn source_changed(stored: Option<(i64, i64)>, current: Option<(i64, i64)>) -> bool {
+    match (stored, current) {
+        (Some(a), Some(b)) => a != b,
+        _ => true,
+    }
+}
+
 /// 단일 경로의 detect/parse/ingest_single_session 처리.
 ///
 /// ClaudeAi/ChatGpt 는 `parse_all()` 1:N 경로, 그 외는 filename-stem 힌트로
@@ -608,6 +630,9 @@ fn ingest_path(
         return;
     }
 
+    // 소스 파일 (size, mtime) 스냅샷 — 변경 감지(재인제스트 판정) + ingest 후 기록 (#13).
+    let file_meta = source_file_meta(session_path);
+
     // 1:1 파서: filename-stem 힌트로 빠른 중복 체크 (--force 시 스킵)
     if !force {
         let session_id_hint = session_path
@@ -617,30 +642,25 @@ fn ingest_path(
 
         match db.session_exists(session_id_hint) {
             Ok(true) => {
-                // 오픈 세션(end_time IS NULL)이면 파일이 변경됐을 수 있으므로 재인제스트
-                match db.is_session_open(session_id_hint) {
-                    Ok(true) => {
-                        // 기존 레코드 삭제 후 재인제스트
-                        if let Err(e) = db.delete_session_full(session_id_hint) {
-                            tracing::warn!(
-                                session = session_id_hint,
-                                "failed to delete open session: {}",
-                                e
-                            );
-                            *skipped += 1;
-                            return;
-                        }
-                        tracing::debug!(session = session_id_hint, "re-ingesting open session");
-                    }
-                    Ok(false) => {
+                // 소스 파일이 마지막 ingest 이후 변경됐으면(size/mtime) 재인제스트.
+                // 기존 end_time-IS-NULL 휴리스틱은 sweep 간격보다 긴 CC 세션을
+                // 영구히 truncate 했다 — CC 파서가 end_time 을 항상 박아 "closed"
+                // 로 보였기 때문 (#13).
+                let stored = db.get_source_meta(session_id_hint).unwrap_or(None);
+                if source_changed(stored, file_meta) {
+                    if let Err(e) = db.delete_session_full(session_id_hint) {
+                        tracing::warn!(
+                            session = session_id_hint,
+                            "failed to delete changed session: {}",
+                            e
+                        );
                         *skipped += 1;
                         return;
                     }
-                    Err(e) => {
-                        tracing::warn!(session = session_id_hint, "open check failed: {}", e);
-                        *skipped += 1;
-                        return;
-                    }
+                    tracing::debug!(session = session_id_hint, "re-ingesting changed session");
+                } else {
+                    *skipped += 1;
+                    return;
                 }
             }
             Ok(false) => {}
@@ -660,6 +680,7 @@ fn ingest_path(
 
     match parser.parse(session_path) {
         Ok(session) => {
+            let sid = session.id.clone();
             ingest_single_session(
                 config,
                 compiled_rules,
@@ -679,6 +700,13 @@ fn ingest_path(
                 error_details,
                 hook_failures,
             );
+            // 변경 감지 기준 갱신 (#13). 세션이 min_turns/noise 로 skip 되면
+            // 해당 row 가 없어 UPDATE 는 0 rows — 무해.
+            if let Some((size, mtime)) = file_meta {
+                if let Err(e) = db.set_source_meta(&sid, size, mtime) {
+                    tracing::warn!(session = %sid, "failed to record source meta: {}", e);
+                }
+            }
         }
         Err(e) => {
             tracing::warn!(path = %session_path.display(), error = %e, "failed to parse session file");
@@ -1199,6 +1227,20 @@ fn find_session_by_id(id: &str) -> Result<Vec<PathBuf>> {
 mod tests {
     use super::*;
     use regex::Regex;
+
+    #[test]
+    fn source_changed_detects_growth_and_skips_unchanged() {
+        // 최초/legacy row (스냅샷 없음) → 재인제스트
+        assert!(source_changed(None, Some((100, 10))));
+        // 동일 (size, mtime) → skip
+        assert!(!source_changed(Some((100, 10)), Some((100, 10))));
+        // CC append-only: size 증가 → 재인제스트 (truncation 버그 케이스)
+        assert!(source_changed(Some((100, 10)), Some((250, 10))));
+        // 같은 size 라도 mtime 변경 → 재인제스트
+        assert!(source_changed(Some((100, 10)), Some((100, 20))));
+        // 지금 stat 불가 → 보수적으로 재인제스트
+        assert!(source_changed(Some((100, 10)), None));
+    }
 
     fn pattern_rules(patterns: &[(&str, &str)]) -> Vec<CompiledRule> {
         patterns

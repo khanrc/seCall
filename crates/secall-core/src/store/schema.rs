@@ -1,4 +1,4 @@
-pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_SCHEMA_VERSION: u32 = 11;
 
 pub const CREATE_SESSIONS: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -25,7 +25,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     notes         TEXT,
     semantic_extracted_at INTEGER,
     is_archived   INTEGER NOT NULL DEFAULT 0,
-    archived_at   TEXT
+    archived_at   TEXT,
+    source_size   INTEGER,
+    source_mtime  INTEGER
 );
 ";
 
