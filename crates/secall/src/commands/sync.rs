@@ -62,7 +62,15 @@ pub async fn run(
         no_graph,
         no_embed,
     };
-    let _outcome = run_with_progress(args, &super::NoopSink).await?;
+    let outcome = run_with_progress(args, &super::NoopSink).await?;
+    // 원격 phase(pull/push) 실패는 로컬 인덱싱이 끝나도록 파이프라인 안에선 non-fatal
+    // partial 로 기록되지만, CLI 는 non-zero exit 로 알려야 한다 — 안 그러면 wedge 된
+    // push(stale lock·auth·non-ff 등)가 `secall sync` 를 shell-out 하는 스케줄러에
+    // 보이지 않는다(#1555). exit code 가 진실을 말하고, "1회 transient 는 안 알림"
+    // 같은 dedup 정책은 호출자(봇 스케줄러)가 소유한다.
+    if let Some(reason) = outcome.partial_failure {
+        anyhow::bail!("sync completed local work but a remote phase failed: {reason}");
+    }
     Ok(())
 }
 

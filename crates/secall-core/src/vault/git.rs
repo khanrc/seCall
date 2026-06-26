@@ -62,6 +62,45 @@ impl<'a> VaultGit<'a> {
         None
     }
 
+    /// 버려진 `index.lock` 으로 판정하는 age 임계값. 정상 `git add`/`commit`/rebase 는
+    /// 1초 안에 끝나므로, 이보다 오래된 lock 은 중단된 git op(예: 봇이 commit 중간에
+    /// SIGTERM)이 남긴 것이다. vault 는 single-writer 라 살아있는 동시 op 가 이만큼
+    /// lock 을 쥐고 있을 수 없으므로 제거가 안전하다.
+    const STALE_LOCK_SECS: u64 = 60;
+
+    /// 버려진 `.git/index.lock` 을 제거해 다음 git op 가 진행되게 한다.
+    ///
+    /// 중단된 `git add`/`commit` 이 남긴 stale lock 은 이후 모든 index 변경 git 명령을
+    /// "Unable to create '.git/index.lock': File exists" 로 실패시킨다 — 이게 vault
+    /// sync 를 몇 주간 silent 하게 wedge 시켰다(#1555). stale lock 을 제거했으면 `true`.
+    pub fn clear_stale_lock(&self) -> crate::error::Result<bool> {
+        if !self.is_git_repo() {
+            return Ok(false);
+        }
+        let lock = self.vault_path.join(".git").join("index.lock");
+        let meta = match std::fs::metadata(&lock) {
+            Ok(meta) => meta,
+            // lock 없음(정상) 또는 stat 불가 → 할 일 없음.
+            Err(_) => return Ok(false),
+        };
+        // mtime 을 못 읽거나 미래 시각(clock skew)이면 age=0 으로 보수적 처리 → 살려둔다.
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .unwrap_or_default();
+        if age < std::time::Duration::from_secs(Self::STALE_LOCK_SECS) {
+            // 살아있는 in-flight op 일 수 있으므로 건드리지 않는다.
+            return Ok(false);
+        }
+        tracing::warn!(
+            age_secs = age.as_secs(),
+            "removing stale .git/index.lock left by an interrupted git op before vault git op"
+        );
+        std::fs::remove_file(&lock)?;
+        Ok(true)
+    }
+
     /// git init + remote 설정 + .gitignore 생성
     pub fn init(&self, remote: &str) -> crate::error::Result<()> {
         if self.is_git_repo() {
@@ -103,6 +142,7 @@ impl<'a> VaultGit<'a> {
             });
         }
 
+        self.clear_stale_lock()?;
         let output = self.run_git(&["pull", "--rebase", "origin", &self.branch])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -199,6 +239,7 @@ impl<'a> VaultGit<'a> {
             return Ok(false);
         }
 
+        self.clear_stale_lock()?;
         let status = self.run_git(&["status", "--porcelain"])?;
         let changes = String::from_utf8_lossy(&status.stdout);
         if changes.trim().is_empty() {
@@ -228,6 +269,7 @@ impl<'a> VaultGit<'a> {
             });
         }
 
+        self.clear_stale_lock()?;
         let status = self.run_git(&["status", "--porcelain"])?;
         let changes = String::from_utf8_lossy(&status.stdout);
         let committed = if changes.trim().is_empty() {

@@ -307,7 +307,11 @@ fn test_push_flushes_ahead_commit_with_clean_tree() {
     let wp = work.path();
 
     // ahead 커밋을 push() 밖에서 미리 만든다 — tree 는 다시 깨끗해진다.
-    write(wp, "clients/host/heartbeat.json", "{\"last_seen\":\"t1\"}\n");
+    write(
+        wp,
+        "clients/host/heartbeat.json",
+        "{\"last_seen\":\"t1\"}\n",
+    );
     run(wp, &["add", "-A"]);
     run(wp, &["commit", "-m", "auto: uncommitted vault changes"]);
     assert!(
@@ -328,6 +332,87 @@ fn test_push_flushes_ahead_commit_with_clean_tree() {
     assert!(
         contains_exact_path(&remote_files, "clients/host/heartbeat.json"),
         "ahead heartbeat commit not flushed to remote: {remote_files}"
+    );
+}
+
+// ─── stale index.lock self-heal (#1555) ──────────────────────────────────────
+
+/// Backdate a file's mtime past the stale threshold via `touch -t` (POSIX form,
+/// works on both GNU and BSD touch). `202001010000` = 2020-01-01 00:00.
+fn backdate(path: &Path) {
+    let output = Command::new("touch")
+        .args(["-t", "202001010000", path.to_str().expect("utf8")])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run touch: {e}"));
+    assert!(
+        output.status.success(),
+        "touch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_clear_stale_lock_removes_old_lock() {
+    let dir = init_repo_with_initial_commit();
+    let path = dir.path();
+    let lock = path.join(".git").join("index.lock");
+    std::fs::write(&lock, "").expect("write lock");
+    backdate(&lock);
+
+    let git = VaultGit::new(path, "main");
+    let cleared = git.clear_stale_lock().expect("clear_stale_lock");
+    assert!(cleared, "an old lock should be reported cleared");
+    assert!(!lock.exists(), "stale lock should be removed");
+}
+
+#[test]
+fn test_clear_stale_lock_keeps_fresh_lock() {
+    let dir = init_repo_with_initial_commit();
+    let path = dir.path();
+    let lock = path.join(".git").join("index.lock");
+    std::fs::write(&lock, "").expect("write lock");
+    // freshly created → within the threshold → a possibly-live op, leave it.
+
+    let git = VaultGit::new(path, "main");
+    let cleared = git.clear_stale_lock().expect("clear_stale_lock");
+    assert!(!cleared, "a fresh lock must not be cleared");
+    assert!(lock.exists(), "fresh lock must remain");
+}
+
+#[test]
+fn test_clear_stale_lock_no_lock_returns_false() {
+    let dir = init_repo_with_initial_commit();
+    let git = VaultGit::new(dir.path(), "main");
+    assert!(!git.clear_stale_lock().expect("clear_stale_lock"));
+}
+
+#[test]
+fn test_push_unwedges_after_stale_lock() {
+    // 핵심 회귀(#1555): stale index.lock 이 있으면 push() 의 `git add -A` 가 실패해
+    // sync 가 silent 하게 wedge 됐다. clear_stale_lock 이 진입부에서 자가치유하므로
+    // 같은 상황에서 push 가 성공해야 한다.
+    let branch = "main";
+    let (work, remote) = init_repo_with_bare_remote(branch);
+    let wp = work.path();
+
+    write(wp, "raw/.sessions/2026-01-01/foo.md", "session\n");
+    let lock = wp.join(".git").join("index.lock");
+    std::fs::write(&lock, "").expect("write lock");
+    backdate(&lock);
+
+    let git = VaultGit::new(wp, branch);
+    let result = git.push("regression: stale lock self-heal").expect("push");
+    assert!(
+        result.committed > 0,
+        "push should commit after clearing lock"
+    );
+    assert!(!lock.exists(), "lock should be gone");
+    assert!(porcelain(wp).trim().is_empty(), "tree clean after push");
+
+    let remote_files = remote_head_files(remote.path(), branch);
+    assert!(
+        contains_exact_path(&remote_files, "raw/.sessions/2026-01-01/foo.md"),
+        "session not pushed after lock self-heal: {remote_files}"
     );
 }
 
