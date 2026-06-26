@@ -428,6 +428,10 @@ pub async fn run_with_progress(args: SyncArgs, sink: &dyn ProgressSink) -> Resul
                     sink.message(&format!("-> {} files pushed.", result.committed))
                         .await;
                     outcome.pushed = Some(format!("{} files", result.committed));
+                } else if result.pushed {
+                    eprintln!("  -> flushed pending commits to remote.");
+                    sink.message("-> flushed pending commits to remote.").await;
+                    outcome.pushed = Some("pending commits".to_string());
                 } else {
                     eprintln!("  No changes to push.");
                     sink.message("No changes to push.").await;

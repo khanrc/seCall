@@ -293,6 +293,42 @@ fn test_push_no_changes_returns_committed_zero() {
     let git = VaultGit::new(work.path(), branch);
     let result = git.push("noop").expect("push");
     assert_eq!(result.committed, 0, "clean repo should report 0 committed");
+    assert!(!result.pushed, "nothing ahead of origin → no push");
+}
+
+#[test]
+fn test_push_flushes_ahead_commit_with_clean_tree() {
+    // 핵심 회귀: working tree 가 깨끗해도 origin 보다 앞선 로컬 커밋이 있으면 push()
+    // 가 flush 해야 한다. 예전엔 status --porcelain 이 비면 push 자체를 건너뛰어,
+    // 별도 경로(device sweep 의 Phase 0 auto_commit)로 먼저 커밋된 heartbeat 가
+    // remote 에 영영 안 나갔다 → pod staleness 오탐.
+    let branch = "main";
+    let (work, remote) = init_repo_with_bare_remote(branch);
+    let wp = work.path();
+
+    // ahead 커밋을 push() 밖에서 미리 만든다 — tree 는 다시 깨끗해진다.
+    write(wp, "clients/host/heartbeat.json", "{\"last_seen\":\"t1\"}\n");
+    run(wp, &["add", "-A"]);
+    run(wp, &["commit", "-m", "auto: uncommitted vault changes"]);
+    assert!(
+        porcelain(wp).trim().is_empty(),
+        "tree must be clean after the pre-commit"
+    );
+
+    let git = VaultGit::new(wp, branch);
+    let result = git.push("sync: 0 new sessions").expect("push");
+
+    assert_eq!(result.committed, 0, "no new files committed by this call");
+    assert!(
+        result.pushed,
+        "ahead commit must be flushed even with a clean tree"
+    );
+
+    let remote_files = remote_head_files(remote.path(), branch);
+    assert!(
+        contains_exact_path(&remote_files, "clients/host/heartbeat.json"),
+        "ahead heartbeat commit not flushed to remote: {remote_files}"
+    );
 }
 
 #[test]
