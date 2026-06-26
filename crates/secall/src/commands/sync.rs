@@ -167,7 +167,7 @@ pub async fn run_with_progress(args: SyncArgs, sink: &dyn ProgressSink) -> Resul
 
     if dry_run {
         // dry-run 경로: 나머지 phase는 안내만 출력하고 종료
-        let sessions_dir = config.vault.path.join("raw").join("sessions");
+        let sessions_dir = config.vault.path.join(secall_core::vault::sessions_reldir());
         let md_count = if sessions_dir.exists() {
             walkdir::WalkDir::new(&sessions_dir)
                 .into_iter()
@@ -466,7 +466,7 @@ struct ReindexResult {
 
 /// vault/raw/sessions/ 스캔 -> DB에 없는 MD를 인덱싱
 fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
-    let sessions_dir = config.vault.path.join("raw").join("sessions");
+    let sessions_dir = config.vault.path.join(secall_core::vault::sessions_reldir());
     if !sessions_dir.exists() {
         return Ok(ReindexResult {
             indexed: 0,

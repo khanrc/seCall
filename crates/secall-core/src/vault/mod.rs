@@ -16,6 +16,18 @@ use crate::ingest::{
     Session,
 };
 
+/// Vault-relative directory holding session markdown (`raw/.sessions`).
+///
+/// The `.sessions` dot-prefix makes Obsidian's core indexer ignore the tree,
+/// avoiding a vault freeze when 1000+ session md land at once (P49). This is
+/// the single source of truth for that layout: the writer
+/// (`session_vault_path`) and every reader (reindex / sync / status / graph /
+/// migrate / session_exists) route through here so the write and read
+/// directories can never silently diverge again.
+pub fn sessions_reldir() -> PathBuf {
+    PathBuf::from("raw").join(".sessions")
+}
+
 pub struct Vault {
     path: PathBuf,
 }
@@ -85,7 +97,7 @@ impl Vault {
     /// Check if a session has already been ingested (by ID)
     pub fn session_exists(&self, session_id: &str) -> bool {
         // Walk raw/.sessions/ looking for a file containing the session ID
-        let sessions_dir = self.path.join("raw").join(".sessions");
+        let sessions_dir = self.path.join(sessions_reldir());
         if !sessions_dir.exists() {
             return false;
         }
