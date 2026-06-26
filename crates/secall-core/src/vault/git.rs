@@ -117,12 +117,14 @@ impl<'a> VaultGit<'a> {
         ])?;
         self.run_git(&["remote", "add", "origin", remote])?;
 
-        // .gitignore — DB, 캐시, Obsidian 설정 제외
+        // .gitignore — DB, 캐시, Obsidian 설정 + 로컬 전용 집계 파일 제외.
+        // index.md/log.md 는 디바이스마다 동시 기록되던 공유 git 파일이라
+        // rebase 충돌 + .git churn 의 원인이었다 → 로컬 전용으로 전환 (#14).
         let gitignore = self.vault_path.join(".gitignore");
         if !gitignore.exists() {
             std::fs::write(
                 &gitignore,
-                "*.db\n*.db-wal\n*.db-shm\n*.usearch\n.DS_Store\n.obsidian/\n",
+                "*.db\n*.db-wal\n*.db-shm\n*.usearch\n.DS_Store\n.obsidian/\n/index.md\n/log.md\n",
             )?;
         }
 
