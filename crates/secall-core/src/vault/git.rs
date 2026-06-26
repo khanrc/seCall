@@ -218,28 +218,62 @@ impl<'a> VaultGit<'a> {
         Ok(true)
     }
 
-    /// 변경된 파일을 commit + push
+    /// 변경된 파일을 commit + push. working tree 가 깨끗해도 origin 보다 앞선
+    /// 로컬 커밋(예: Phase 0 `auto_commit` 이 만든 heartbeat 커밋)이 있으면 push 한다.
     pub fn push(&self, message: &str) -> crate::error::Result<PushResult> {
         if !self.is_git_repo() {
-            return Ok(PushResult { committed: 0 });
+            return Ok(PushResult {
+                committed: 0,
+                pushed: false,
+            });
         }
 
         let status = self.run_git(&["status", "--porcelain"])?;
         let changes = String::from_utf8_lossy(&status.stdout);
-        if changes.trim().is_empty() {
-            return Ok(PushResult { committed: 0 });
+        let committed = if changes.trim().is_empty() {
+            0
+        } else {
+            let count = changes.lines().count();
+            // vault 디렉터리 안의 모든 변경을 stage (auto_commit 과 동일 패턴).
+            // 신규 dir (graph/, log/) 및 파일 (SCHEMA.md) 도 누락 없이 포착. .gitignore 안전망.
+            self.run_git(&["add", "-A"])?;
+            self.run_git(&["commit", "-m", message])?;
+            count
+        };
+
+        // working tree 가 깨끗해도 origin 보다 앞선 커밋이 있으면 push 한다. Phase 0
+        // `auto_commit` 이 heartbeat 를 이미 커밋해 두면 여기서 tree 는 깨끗하지만 그
+        // 커밋은 아직 remote 에 없다 — push 를 건너뛰면 heartbeat 가 영영 remote 에
+        // 안 나가 device staleness 오탐이 난다.
+        let pushed = if committed > 0 || self.has_unpushed_commits()? {
+            self.run_git(&["push", "origin", &self.branch])?;
+            tracing::info!(committed, "vault changes pushed");
+            true
+        } else {
+            false
+        };
+
+        Ok(PushResult { committed, pushed })
+    }
+
+    /// `origin/<branch>` 보다 앞선 로컬 커밋이 있는지. remote-tracking ref 가 아직
+    /// 없으면(최초 push 전) 모든 커밋이 unpushed 이므로 true.
+    fn has_unpushed_commits(&self) -> crate::error::Result<bool> {
+        let remote_ref = format!("origin/{}", self.branch);
+        // run_git 은 비정상 exit 시 에러를 내므로, ref 부재(최초 push) 판정은 직접.
+        let verify = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &remote_ref])
+            .current_dir(self.vault_path)
+            .output()?;
+        if !verify.status.success() {
+            return Ok(true);
         }
-
-        let committed = changes.lines().count();
-
-        // vault 디렉터리 안의 모든 변경을 stage (auto_commit 과 동일 패턴).
-        // 신규 dir (graph/, log/) 및 파일 (SCHEMA.md) 도 누락 없이 포착. .gitignore 안전망.
-        self.run_git(&["add", "-A"])?;
-        self.run_git(&["commit", "-m", message])?;
-        self.run_git(&["push", "origin", &self.branch])?;
-
-        tracing::info!(committed, "vault changes pushed");
-        Ok(PushResult { committed })
+        let out = self.run_git(&["rev-list", "--count", &format!("{remote_ref}..HEAD")])?;
+        let count: usize = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        Ok(count > 0)
     }
 
     fn run_git(&self, args: &[&str]) -> crate::error::Result<std::process::Output> {
@@ -268,6 +302,9 @@ pub struct PullResult {
 
 pub struct PushResult {
     pub committed: usize,
+    /// `git push` 가 실제로 실행됐는지. `committed == 0` 이어도 origin 보다 앞선
+    /// 커밋을 flush 한 경우 true.
+    pub pushed: bool,
 }
 
 /// git diff --stat 출력에서 raw/.sessions/ 경로가 포함된 라인 수를 카운트.
