@@ -143,6 +143,20 @@ impl Database {
                  ON sessions(is_archived) WHERE is_archived = 1;",
             )?;
         }
+        if current < 11 {
+            // Source-file change tracking for incremental re-ingest (#13).
+            // Replaces the end_time-IS-NULL re-ingest heuristic, which
+            // permanently truncated Claude Code sessions longer than the
+            // sweep interval.
+            if !self.column_exists("sessions", "source_size")? {
+                self.conn
+                    .execute("ALTER TABLE sessions ADD COLUMN source_size INTEGER", [])?;
+            }
+            if !self.column_exists("sessions", "source_mtime")? {
+                self.conn
+                    .execute("ALTER TABLE sessions ADD COLUMN source_mtime INTEGER", [])?;
+            }
+        }
         if current < CURRENT_SCHEMA_VERSION {
             self.conn.execute(
                 "INSERT OR REPLACE INTO config(key, value) VALUES ('schema_version', ?1)",

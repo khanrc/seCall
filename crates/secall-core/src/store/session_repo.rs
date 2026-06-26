@@ -356,6 +356,32 @@ impl Database {
         Ok(())
     }
 
+    /// 마지막 ingest 시점에 기록한 소스 파일 `(size, mtime)` 스냅샷을 조회 (#13).
+    /// 둘 중 하나라도 NULL 이거나 row 가 없으면 `None` — 스냅샷 없음으로 보고
+    /// 재인제스트 대상이 된다.
+    pub fn get_source_meta(&self, session_id: &str) -> Result<Option<(i64, i64)>> {
+        let row = self.conn().query_row(
+            "SELECT source_size, source_mtime FROM sessions WHERE id = ?1",
+            rusqlite::params![session_id],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+        );
+        match row {
+            Ok((Some(size), Some(mtime))) => Ok(Some((size, mtime))),
+            Ok(_) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 소스 파일 `(size, mtime)` 스냅샷을 기록 — 다음 sweep 의 변경 감지 기준 (#13).
+    pub fn set_source_meta(&self, session_id: &str, size: i64, mtime: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE sessions SET source_size = ?1, source_mtime = ?2 WHERE id = ?3",
+            rusqlite::params![size, mtime, session_id],
+        )?;
+        Ok(())
+    }
+
     /// 세션의 모든 벡터를 삭제. 부분 임베딩 정리 및 재임베딩 전 DELETE-first에 사용.
     pub fn delete_session_vectors(&self, session_id: &str) -> Result<usize> {
         // turn_vectors 테이블이 없으면 0 반환 (정상)
