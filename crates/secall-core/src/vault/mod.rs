@@ -6,7 +6,6 @@ pub mod config;
 pub mod git;
 pub mod index;
 pub mod init;
-pub mod log;
 
 pub use config::Config;
 pub use init::init_vault;
@@ -65,9 +64,12 @@ impl Vault {
         std::fs::write(&tmp_path, &md_content)?;
         std::fs::rename(&tmp_path, &abs_path)?;
 
-        // Update index and log
+        // Local, git-ignored Obsidian browsing index. Not part of the recall
+        // substrate (that's the DB + per-session md) and intentionally kept out
+        // of git: it was a concurrent-write conflict magnet and the dominant
+        // .git churn source across devices (#14). log.md is dropped entirely —
+        // the git commit log + per-session md already are the ingest journal.
         index::update_index(&self.path, session, &rel_path, tz)?;
-        log::append_log(&self.path, session, &rel_path, tz)?;
 
         Ok(rel_path)
     }
@@ -214,7 +216,8 @@ mod tests {
         init_vault(dir.path()).unwrap();
         assert!(dir.path().join("SCHEMA.md").exists());
         assert!(dir.path().join("index.md").exists());
-        assert!(dir.path().join("log.md").exists());
+        // log.md is no longer created — dropped in #14.
+        assert!(!dir.path().join("log.md").exists());
     }
 
     #[test]
@@ -310,14 +313,14 @@ mod tests {
     }
 
     #[test]
-    fn test_write_session_appends_log() {
+    fn test_write_session_does_not_create_log() {
+        // log.md is dropped (#14) — write_session must not recreate it.
         let dir = TempDir::new().unwrap();
         let vault = Vault::new(dir.path().to_path_buf());
         vault.init().unwrap();
         let session = make_session();
         vault.write_session(&session, chrono_tz::Tz::UTC).unwrap();
-        let log = std::fs::read_to_string(dir.path().join("log.md")).unwrap();
-        assert!(log.contains("ingest | claude-code seCall"));
+        assert!(!dir.path().join("log.md").exists());
     }
 
     #[test]
@@ -456,9 +459,10 @@ pub mod integration {
 
         let index = std::fs::read_to_string(dir.path().join("index.md")).unwrap();
         assert!(index.contains("Sessions"));
+        assert_eq!(index.matches("claude-code_testproject").count(), 3);
 
-        let log = std::fs::read_to_string(dir.path().join("log.md")).unwrap();
-        assert_eq!(log.matches("ingest | claude-code testproject").count(), 3);
+        // log.md dropped (#14).
+        assert!(!dir.path().join("log.md").exists());
     }
 
     // ─── split_frontmatter cross-platform line ending 회귀 테스트 ──────────
