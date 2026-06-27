@@ -4,7 +4,6 @@ use anyhow::Result;
 
 pub mod config;
 pub mod git;
-pub mod index;
 pub mod init;
 
 pub use config::Config;
@@ -44,7 +43,7 @@ impl Vault {
         init_vault(&self.path)
     }
 
-    /// Write session markdown to vault and update index/log
+    /// Write the per-session markdown to the vault.
     /// Returns the relative path of the written file (relative to vault root)
     pub fn write_session(&self, session: &Session, tz: chrono_tz::Tz) -> Result<PathBuf> {
         // Render markdown
@@ -59,17 +58,15 @@ impl Vault {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Atomic write: write to temp then rename
+        // Atomic write: write to temp then rename. The per-session md (this
+        // file) + the DB are the whole recall substrate. The old vault-root
+        // aggregates (index.md, log.md) are not written at all (#14): they were
+        // concurrent-write conflict magnets across devices and the dominant
+        // .git churn, while adding nothing recall reads. Browse via Obsidian's
+        // file tree / search, or rebuild a catalog from the DB on demand.
         let tmp_path = abs_path.with_extension("md.tmp");
         std::fs::write(&tmp_path, &md_content)?;
         std::fs::rename(&tmp_path, &abs_path)?;
-
-        // Local, git-ignored Obsidian browsing index. Not part of the recall
-        // substrate (that's the DB + per-session md) and intentionally kept out
-        // of git: it was a concurrent-write conflict magnet and the dominant
-        // .git churn source across devices (#14). log.md is dropped entirely —
-        // the git commit log + per-session md already are the ingest journal.
-        index::update_index(&self.path, session, &rel_path, tz)?;
 
         Ok(rel_path)
     }
@@ -215,8 +212,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         init_vault(dir.path()).unwrap();
         assert!(dir.path().join("SCHEMA.md").exists());
-        assert!(dir.path().join("index.md").exists());
-        // log.md is no longer created — dropped in #14.
+        // index.md / log.md are no longer created — dropped in #14.
+        assert!(!dir.path().join("index.md").exists());
         assert!(!dir.path().join("log.md").exists());
     }
 
@@ -224,11 +221,11 @@ mod tests {
     fn test_init_vault_does_not_overwrite() {
         let dir = TempDir::new().unwrap();
         init_vault(dir.path()).unwrap();
-        // Write custom content
-        std::fs::write(dir.path().join("index.md"), "custom content").unwrap();
+        // Write custom content to a file init creates
+        std::fs::write(dir.path().join("SCHEMA.md"), "custom content").unwrap();
         // Re-init
         init_vault(dir.path()).unwrap();
-        let content = std::fs::read_to_string(dir.path().join("index.md")).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("SCHEMA.md")).unwrap();
         assert_eq!(content, "custom content");
     }
 
@@ -302,24 +299,15 @@ mod tests {
     }
 
     #[test]
-    fn test_write_session_updates_index() {
+    fn test_write_session_does_not_create_aggregates() {
+        // index.md / log.md are dropped (#14) — write_session writes only the
+        // per-session md, never the vault-root aggregates.
         let dir = TempDir::new().unwrap();
         let vault = Vault::new(dir.path().to_path_buf());
         vault.init().unwrap();
         let session = make_session();
         vault.write_session(&session, chrono_tz::Tz::UTC).unwrap();
-        let index = std::fs::read_to_string(dir.path().join("index.md")).unwrap();
-        assert!(index.contains("claude-code_seCall_a1b2c3d"));
-    }
-
-    #[test]
-    fn test_write_session_does_not_create_log() {
-        // log.md is dropped (#14) — write_session must not recreate it.
-        let dir = TempDir::new().unwrap();
-        let vault = Vault::new(dir.path().to_path_buf());
-        vault.init().unwrap();
-        let session = make_session();
-        vault.write_session(&session, chrono_tz::Tz::UTC).unwrap();
+        assert!(!dir.path().join("index.md").exists());
         assert!(!dir.path().join("log.md").exists());
     }
 
@@ -457,11 +445,14 @@ pub mod integration {
             vault.write_session(session, chrono_tz::Tz::UTC).unwrap();
         }
 
-        let index = std::fs::read_to_string(dir.path().join("index.md")).unwrap();
-        assert!(index.contains("Sessions"));
-        assert_eq!(index.matches("claude-code_testproject").count(), 3);
-
-        // log.md dropped (#14).
+        // Each session lands as its own md under raw/.sessions/; no aggregates.
+        let md_count = walkdir::WalkDir::new(dir.path().join(sessions_reldir()))
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+            .count();
+        assert_eq!(md_count, 3);
+        assert!(!dir.path().join("index.md").exists());
         assert!(!dir.path().join("log.md").exists());
     }
 

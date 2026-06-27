@@ -22,12 +22,6 @@ pub fn init_vault(vault_path: &Path) -> Result<()> {
         std::fs::write(&overview_path, overview_md())?;
     }
 
-    // index.md (only if not exists) — local, git-ignored Obsidian index (#14).
-    let index_path = vault_path.join("index.md");
-    if !index_path.exists() {
-        std::fs::write(&index_path, index_md())?;
-    }
-
     Ok(())
 }
 
@@ -104,21 +98,5 @@ updated: {today}
 <!-- 메타에이전트가 자동 갱신 -->
 "#,
         today = chrono::Utc::now().format("%Y-%m-%d")
-    )
-}
-
-fn index_md() -> String {
-    format!(
-        r#"---
-type: index
-updated_at: {}
----
-
-# seCall Index
-
-## Sessions
-
-"#,
-        chrono::Utc::now().format("%Y-%m-%d")
     )
 }
