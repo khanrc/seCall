@@ -335,6 +335,64 @@ fn test_push_flushes_ahead_commit_with_clean_tree() {
     );
 }
 
+// ─── non-fast-forward contention → inline rebase+retry ───────────────────────
+
+/// Clone the bare remote into a fresh working dir, land a commit, and push it —
+/// simulating a concurrent writer that advances origin between our last pull and
+/// our push, so our subsequent push is rejected non-fast-forward.
+fn land_concurrent_commit(remote: &Path, branch: &str, rel: &str) -> TempDir {
+    let other = TempDir::new().expect("other tempdir");
+    let url = remote.to_str().expect("remote utf8");
+    run(other.path(), &["clone", url, "."]);
+    run(other.path(), &["config", "user.email", "other@example.com"]);
+    run(other.path(), &["config", "user.name", "Other"]);
+    run(other.path(), &["config", "commit.gpgsign", "false"]);
+    run(other.path(), &["checkout", branch]);
+    write(other.path(), rel, "concurrent\n");
+    run(other.path(), &["add", "-A"]);
+    run(other.path(), &["commit", "-m", "concurrent writer"]);
+    run(other.path(), &["push", "origin", branch]);
+    other
+}
+
+#[test]
+fn test_push_resolves_non_ff_contention_via_rebase() {
+    // 핵심: non-ff 는 실패가 아니라 contention. push() 가 인라인으로 pull --rebase 후
+    // 재push 하여 결정론적으로 수렴해야 하며, 동시 writer 의 커밋도 보존돼야 한다.
+    let branch = "main";
+    let (work, remote) = init_repo_with_bare_remote(branch);
+    let wp = work.path();
+
+    // 우리 로컬 변경 — 아직 push 전.
+    write(wp, "raw/.sessions/2026-01-01/ours.md", "ours\n");
+
+    // 동시 writer 가 우리 push 직전에 origin 을 선점 → 우리 push 는 non-ff 로 거부될 상황.
+    let _other =
+        land_concurrent_commit(remote.path(), branch, "raw/.sessions/2026-01-01/theirs.md");
+
+    let git = VaultGit::new(wp, branch);
+    let result = git
+        .push("sync: ours")
+        .expect("push must resolve non-ff contention inline");
+    assert!(result.committed > 0, "our change should be committed");
+    assert!(
+        result.pushed,
+        "push should succeed after rebase-onto-remote"
+    );
+    assert!(porcelain(wp).trim().is_empty(), "tree clean after push");
+
+    // 두 커밋이 remote 에 공존해야 한다 — rebase 가 동시 writer 의 커밋을 보존.
+    let remote_files = remote_head_files(remote.path(), branch);
+    assert!(
+        contains_exact_path(&remote_files, "raw/.sessions/2026-01-01/ours.md"),
+        "ours missing after rebase-retry: {remote_files}"
+    );
+    assert!(
+        contains_exact_path(&remote_files, "raw/.sessions/2026-01-01/theirs.md"),
+        "concurrent writer's commit clobbered: {remote_files}"
+    );
+}
+
 // ─── stale index.lock self-heal (#1555) ──────────────────────────────────────
 
 /// Backdate a file's mtime past the stale threshold via `touch -t` (POSIX form,
