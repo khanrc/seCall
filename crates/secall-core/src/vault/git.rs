@@ -290,7 +290,7 @@ impl<'a> VaultGit<'a> {
         // 커밋은 아직 remote 에 없다 — push 를 건너뛰면 heartbeat 가 영영 remote 에
         // 안 나가 device staleness 오탐이 난다.
         let pushed = if committed > 0 || self.has_unpushed_commits()? {
-            self.run_git(&["push", "origin", &self.branch])?;
+            self.push_with_rebase_retry()?;
             tracing::info!(committed, "vault changes pushed");
             true
         } else {
@@ -298,6 +298,48 @@ impl<'a> VaultGit<'a> {
         };
 
         Ok(PushResult { committed, pushed })
+    }
+
+    /// push origin/<branch>, resolving non-fast-forward contention inline.
+    ///
+    /// On a multi-writer vault another writer can land a push between our pull
+    /// and ours, rejecting this push non-fast-forward. That is contention, not
+    /// failure — its deterministic resolution is to rebase our commit onto the
+    /// concurrent ones (`pull --rebase`, reusing [`Self::pull`]) and re-push.
+    /// Retry up to `PUSH_RETRY_ATTEMPTS` (a live-lock bound, not the mechanism).
+    /// Surface the error only after retries are exhausted — that residual is a
+    /// real problem worth a non-zero exit (#1555 honest-exit preserved). Any
+    /// non-contention push error (auth, network) propagates on the first try.
+    fn push_with_rebase_retry(&self) -> crate::error::Result<()> {
+        const PUSH_RETRY_ATTEMPTS: usize = 3;
+
+        let mut last_stderr = String::new();
+        for attempt in 1..=PUSH_RETRY_ATTEMPTS {
+            let output = Command::new("git")
+                .args(["push", "origin", &self.branch])
+                .current_dir(self.vault_path)
+                .output()?;
+            if output.status.success() {
+                return Ok(());
+            }
+            last_stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+            // Only contention is retryable; rebase onto the concurrent commits.
+            if attempt < PUSH_RETRY_ATTEMPTS && is_non_fast_forward(&last_stderr) {
+                tracing::warn!(
+                    attempt,
+                    "vault push rejected non-fast-forward; rebasing onto remote and retrying"
+                );
+                self.pull()?;
+                continue;
+            }
+            break;
+        }
+
+        Err(crate::SecallError::Config(format!(
+            "git push origin {} failed: {}",
+            self.branch, last_stderr
+        )))
     }
 
     /// `origin/<branch>` 보다 앞선 로컬 커밋이 있는지. remote-tracking ref 가 아직
@@ -349,6 +391,16 @@ pub struct PushResult {
     /// `git push` 가 실제로 실행됐는지. `committed == 0` 이어도 origin 보다 앞선
     /// 커밋을 flush 한 경우 true.
     pub pushed: bool,
+}
+
+/// `git push` stderr 가 non-fast-forward 거부(=contention)인지 판정. git 은 버전/
+/// 상황에 따라 `[rejected]`, `(non-fast-forward)`, `(fetch first)`, `Updates were
+/// rejected` 등 여러 표현을 쓰므로 부분 문자열을 폭넓게 매칭한다.
+pub(crate) fn is_non_fast_forward(stderr: &str) -> bool {
+    stderr.contains("non-fast-forward")
+        || stderr.contains("[rejected]")
+        || stderr.contains("fetch first")
+        || stderr.contains("Updates were rejected")
 }
 
 /// git diff --stat 출력에서 raw/.sessions/ 경로가 포함된 라인 수를 카운트.
@@ -423,6 +475,29 @@ mod tests {
     fn test_count_summary_not_counted() {
         let output = " raw/.sessions/x.md | 1 +\n 1 file changed, 1 insertion(+)";
         assert_eq!(count_new_session_files(output), 1);
+    }
+
+    #[test]
+    fn test_is_non_fast_forward_detects_git_rejection() {
+        // git push 가 실제로 내는 non-ff stderr 형태들.
+        let rejected = " ! [rejected]        main -> main (non-fast-forward)\n\
+                         error: failed to push some refs to 'origin'";
+        assert!(is_non_fast_forward(rejected));
+        let fetch_first = " ! [rejected]        main -> main (fetch first)\n\
+                            hint: Updates were rejected because the remote contains work";
+        assert!(is_non_fast_forward(fetch_first));
+    }
+
+    #[test]
+    fn test_is_non_fast_forward_ignores_other_errors() {
+        // 인증/네트워크 실패는 contention 이 아니므로 재시도 대상이 아니다.
+        assert!(!is_non_fast_forward(
+            "fatal: Authentication failed for 'origin'"
+        ));
+        assert!(!is_non_fast_forward(
+            "fatal: unable to access 'origin': Could not resolve host"
+        ));
+        assert!(!is_non_fast_forward(""));
     }
 
     #[test]
