@@ -149,6 +149,20 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                             continue;
                         }
 
+                        // Codex injects the repo's AGENTS.md as the first *user*
+                        // message (not a developer/system turn), so it lands as
+                        // turn 1 and shadows the real task for every consumer
+                        // keyed on the first user turn — classification, session
+                        // summary, recall first-content. Skip it like the
+                        // developer turn: it's injected environment context, not
+                        // a user utterance. Brittle to codex renaming the header,
+                        // but benign — falls back to prior behaviour.
+                        if role == Role::User
+                            && content.trim_start().starts_with("# AGENTS.md instructions")
+                        {
+                            continue;
+                        }
+
                         // 턴 타임스탬프: 래퍼의 timestamp 필드
                         let ts = jl
                             .timestamp
@@ -309,6 +323,34 @@ mod tests {
         assert_eq!(session.turns[1].role, Role::Assistant);
         assert!(session.turns[0].content.contains("검색"));
         assert_eq!(session.agent, AgentKind::Codex);
+    }
+
+    #[test]
+    fn test_codex_skips_agents_md_injection_turn() {
+        // Codex sends the repo AGENTS.md as the first user message and the real
+        // task as the second. The injection turn must be dropped so the first
+        // user turn is the task (what classification / summary / recall key on).
+        let f = make_codex_file(&[
+            r#"{"type":"session_meta","payload":{"id":"test-uuid","timestamp":"2026-04-05T10:00:00Z","cwd":"/proj"}}"#,
+            r##"{"timestamp":"2026-04-05T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /proj\n<INSTRUCTIONS>repo conventions</INSTRUCTIONS>"}]}}"##,
+            r#"{"timestamp":"2026-04-05T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Review the code changes against the base branch 'main'."}]}}"#,
+            r#"{"timestamp":"2026-04-05T10:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}"#,
+        ]);
+        let session = parse_codex_jsonl(f.path()).unwrap();
+        let first_user = session
+            .turns
+            .iter()
+            .find(|t| t.role == Role::User)
+            .expect("a user turn");
+        assert!(
+            first_user.content.starts_with("Review the code changes"),
+            "first user turn should be the task, got: {:?}",
+            &first_user.content[..first_user.content.len().min(40)]
+        );
+        assert!(
+            !session.turns.iter().any(|t| t.content.starts_with("# AGENTS.md")),
+            "AGENTS.md injection turn must be dropped"
+        );
     }
 
     #[test]
