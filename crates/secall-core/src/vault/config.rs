@@ -88,12 +88,13 @@ pub struct EmbeddingConfig {
     pub cloud_model: Option<String>,
     /// Ollama Cloud API key — managed via env OLLAMA_CLOUD_API_KEY, not stored in config
     pub cloud_api_key: Option<String>,
-    /// Prefix prepended to search text before embedding. e5 models
-    /// (dragonkue) require "query: "; bge-m3 wants none. Empty when unset.
-    pub query_prefix: Option<String>,
-    /// Prefix prepended to indexed chunk text before embedding. e5 models
-    /// (dragonkue) require "passage: "; bge-m3 wants none. Empty when unset.
-    pub passage_prefix: Option<String>,
+    /// Optional override for the per-chunk token budget. Normally derived from
+    /// the model's own max_seq (see chunker) — set this only to tune. e5 prefixes
+    /// are NOT configurable here: they are a model property, bound to the model
+    /// in model_manager so they can't drift out of sync.
+    pub max_chunk_tokens: Option<usize>,
+    /// Optional override for token overlap between adjacent chunks.
+    pub overlap_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -366,8 +367,8 @@ impl Default for EmbeddingConfig {
             cloud_host: None,
             cloud_model: None,
             cloud_api_key: None,
-            query_prefix: None,
-            passage_prefix: None,
+            max_chunk_tokens: None,
+            overlap_tokens: None,
         }
     }
 }

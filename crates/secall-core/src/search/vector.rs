@@ -56,9 +56,9 @@ impl VectorIndexer {
     }
 
     /// Set the e5 query/passage prefixes. Empty strings are a no-op (bge-m3).
-    pub fn with_prefixes(mut self, query_prefix: String, passage_prefix: String) -> Self {
-        self.query_prefix = query_prefix;
-        self.passage_prefix = passage_prefix;
+    pub fn with_prefixes(mut self, query_prefix: impl Into<String>, passage_prefix: impl Into<String>) -> Self {
+        self.query_prefix = query_prefix.into();
+        self.passage_prefix = passage_prefix.into();
         self
     }
 
@@ -453,22 +453,12 @@ fn resolve_pool_size(config: &crate::vault::config::Config) -> usize {
     }
 }
 
-/// Create a VectorIndexer for the configured backend, with the e5 query/passage
-/// prefixes applied to *every* resolution path (primary and all fallbacks). The
-/// inner builder has several early returns; applying prefixes here — at the one
-/// exit — keeps a future backend arm from silently dropping them.
-pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
-    build_vector_indexer_inner(config).await.map(|vi| {
-        vi.with_prefixes(
-            config.embedding.query_prefix.clone().unwrap_or_default(),
-            config.embedding.passage_prefix.clone().unwrap_or_default(),
-        )
-    })
-}
-
-/// Resolve the backend and build the indexer (no prefixes — see the wrapper).
+/// Create a VectorIndexer for the configured backend. The e5 query/passage
+/// prefixes are bound to the ORT model (model_manager::model_prefixes) and
+/// applied only on the ORT paths — they are a property of that model, not a
+/// user setting, so a non-e5 backend (ollama/openai) never carries them.
 /// Falls back to Ollama if ort fails; returns None if neither is available.
-async fn build_vector_indexer_inner(config: &Config) -> Option<VectorIndexer> {
+pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
     let indexer = match config.embedding.backend.as_str() {
         "ort" => {
             let model_dir = config
@@ -494,7 +484,8 @@ async fn build_vector_indexer_inner(config: &Config) -> Option<VectorIndexer> {
                         pool_size = pool,
                         "ort ONNX loaded, local vector search enabled"
                     );
-                    VectorIndexer::new(Box::new(e))
+                    let (qp, pp) = super::model_manager::model_prefixes();
+                    VectorIndexer::new(Box::new(e)).with_prefixes(qp, pp)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "ort load failed, trying Ollama fallback");
@@ -524,7 +515,9 @@ async fn build_vector_indexer_inner(config: &Config) -> Option<VectorIndexer> {
             match crate::search::embedding::OpenVinoEmbedder::new(&model_dir, device, ov_dir) {
                 Ok(e) => {
                     tracing::info!(device = %e.device, "OpenVINO loaded, NPU vector search enabled");
-                    VectorIndexer::new(Box::new(e))
+                    // Same model as the ORT path → same e5 prefixes.
+                    let (qp, pp) = super::model_manager::model_prefixes();
+                    VectorIndexer::new(Box::new(e)).with_prefixes(qp, pp)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "OpenVINO load failed, trying ORT CPU fallback");
@@ -598,7 +591,8 @@ async fn try_ort_cpu_fallback(config: &Config) -> Option<VectorIndexer> {
                 pool_size = pool,
                 "ORT CPU fallback loaded, vector search enabled"
             );
-            let indexer = VectorIndexer::new(Box::new(e));
+            let (qp, pp) = super::model_manager::model_prefixes();
+            let indexer = VectorIndexer::new(Box::new(e)).with_prefixes(qp, pp);
             #[cfg(not(target_os = "windows"))]
             let indexer = attach_ann_index(indexer);
             Some(indexer)

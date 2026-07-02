@@ -132,17 +132,6 @@ impl Embedder for OllamaEmbedder {
 
 // ─── OrtEmbedder ─────────────────────────────────────────────────────────────
 
-/// Read `model_max_length` from tokenizer_config.json, if it is a sane bound.
-/// Returns None when the file/field is absent or holds the "effectively
-/// unlimited" sentinel some tokenizers ship (~1e30), leaving tokenization
-/// uncapped in that case.
-fn read_model_max_length(model_dir: &Path) -> Option<usize> {
-    let raw = std::fs::read_to_string(model_dir.join("tokenizer_config.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let n = v.get("model_max_length")?.as_u64()?;
-    (1..=100_000).contains(&n).then_some(n as usize)
-}
-
 /// Local ONNX-based embedder using ort + tokenizers.
 /// Requires model files at `model_dir/model.onnx` and `model_dir/tokenizer.json`.
 pub struct OrtEmbedder {
@@ -172,7 +161,7 @@ impl OrtEmbedder {
         // rather than an ORT position-index error that drops the chunk. Read
         // per-model from tokenizer_config.json (e5→512, bge-m3→8192) — never a
         // hardcoded cap, which would silently truncate a large-context model.
-        if let Some(max_len) = read_model_max_length(model_dir) {
+        if let Some(max_len) = super::model_manager::read_model_max_length(model_dir) {
             let _ = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
                 max_length: max_len,
                 ..Default::default()
@@ -196,7 +185,11 @@ impl OrtEmbedder {
             .commit_from_file(model_dir.join("model.onnx"))
             .map_err(|e| anyhow!("load model: {e}"))?;
 
-        let dim = Self::probe_dim(&mut first_session, &tokenizer).unwrap_or(1024);
+        // Probe the true output dim from the model; erroring beats guessing a
+        // stale default (the old 1024 fallback was a bge-m3 relic that would
+        // mis-dimension a 384d model's index if the probe ever failed).
+        let dim = Self::probe_dim(&mut first_session, &tokenizer)
+            .map_err(|e| anyhow!("could not probe embedding dimension from model: {e}"))?;
 
         let mut sessions = Vec::with_capacity(pool_size);
         sessions.push(Arc::new(Mutex::new(first_session)));

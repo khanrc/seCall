@@ -2,15 +2,17 @@ use std::sync::OnceLock;
 
 use crate::ingest::Session;
 
-// dragonkue/multilingual-e5-small (xlm-roberta) has max_seq_length 512. We split
-// on the model tokenizer so a chunk never overflows and gets silently truncated
-// (the char-based 3600 cap did exactly that for Korean — ~2 chars/token — losing
-// the tail of long turns). The embedded sequence is `<e5 prefix> + chunk + 2
-// special tokens`, so the chunk budget must reserve room for both: 500 leaves
-// ~12 tokens for the "query: "/"passage: " prefix (~4) and specials (2) with
-// margin, keeping the real input ≤512. Overlap is ~15%.
-const MAX_CHUNK_TOKENS: usize = 500;
-const OVERLAP_TOKENS: usize = 75;
+// We split on the model tokenizer so a chunk never overflows the model's
+// max_seq and gets silently truncated (the char-based 3600 cap did exactly that
+// for Korean — ~2 chars/token — losing the tail of long turns). The budget is
+// derived from the model's own model_max_length minus RESERVE_TOKENS, since the
+// embedded sequence is `<e5 prefix> + chunk + 2 special tokens`: ~4 prefix + 2
+// specials + margin. So an e5 512-model → 500, bge-m3 8192 → 8180, automatically.
+// `embedding.max_chunk_tokens` overrides; DEFAULT is the last-resort fallback
+// when model_max_length can't be read. Overlap is ~15%, overridable too.
+const RESERVE_TOKENS: usize = 12;
+const DEFAULT_MAX_CHUNK_TOKENS: usize = 500;
+const DEFAULT_OVERLAP_TOKENS: usize = 75;
 
 // Fallback char budget when the model tokenizer isn't on disk (unit tests, or
 // before the model is downloaded). Conservative: 1000 chars stays under 510
@@ -65,33 +67,61 @@ pub fn chunk_session(session: &Session, tz: chrono_tz::Tz) -> Vec<Chunk> {
 /// token budget. Uses the model tokenizer when available (token-precise, the
 /// dragonkue/e5 path); falls back to a conservative char split otherwise.
 fn split_turn_text(text: &str) -> Vec<String> {
-    if let Some(tok) = model_tokenizer() {
-        return split_by_tokens(text, tok, MAX_CHUNK_TOKENS, OVERLAP_TOKENS);
+    let cfg = chunker_config();
+    if let Some(tok) = &cfg.tokenizer {
+        return split_by_tokens(text, tok, cfg.max_tokens, cfg.overlap);
     }
     split_into_chunks(text, FALLBACK_MAX_CHUNK_CHARS, FALLBACK_OVERLAP_CHARS)
 }
 
-/// Lazily load the embedding model's tokenizer so token counts match what the
-/// embedder actually feeds the model. Resolves the same path the embedder does
-/// (`config.embedding.model_path`, else the default) — not a hardcoded default —
-/// so a custom model dir keeps chunker and embedder in sync. Truncation is
-/// forced off: we rely on our own windowing for the budget, and a tokenizer that
-/// shipped a truncation setting would otherwise silently cap `encode`, hiding
-/// the very tail-loss this chunker exists to prevent. `None` (→ char fallback)
-/// when the model isn't on disk (tests, fresh install).
-fn model_tokenizer() -> Option<&'static tokenizers::Tokenizer> {
-    static TOKENIZER: OnceLock<Option<tokenizers::Tokenizer>> = OnceLock::new();
-    TOKENIZER
-        .get_or_init(|| {
-            let model_dir = crate::vault::Config::load_or_default()
-                .embedding
-                .model_path
-                .unwrap_or_else(crate::search::model_manager::default_model_path);
-            let mut tok = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).ok()?;
-            tok.with_truncation(None).ok();
-            Some(tok)
-        })
-        .as_ref()
+struct ChunkerConfig {
+    /// The embedding model's tokenizer (`None` → char fallback: model not on
+    /// disk, e.g. tests / fresh install).
+    tokenizer: Option<tokenizers::Tokenizer>,
+    max_tokens: usize,
+    overlap: usize,
+}
+
+/// Lazily resolve the chunker's config once. The tokenizer is loaded from the
+/// same path the embedder uses (`config.embedding.model_path`, else default) so
+/// token counts match what the model is actually fed; truncation is forced off
+/// so a tokenizer that shipped a truncation setting can't silently cap `encode`
+/// and hide the tail-loss this chunker exists to prevent. The token budget /
+/// overlap come from config (`embedding.max_chunk_tokens` / `overlap_tokens`),
+/// defaulting to the e5-512-safe values.
+fn chunker_config() -> &'static ChunkerConfig {
+    static CFG: OnceLock<ChunkerConfig> = OnceLock::new();
+    CFG.get_or_init(|| {
+        let cfg = crate::vault::Config::load_or_default();
+        let model_dir = cfg
+            .embedding
+            .model_path
+            .clone()
+            .unwrap_or_else(crate::search::model_manager::default_model_path);
+        let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
+            .ok()
+            .map(|mut t| {
+                t.with_truncation(None).ok();
+                t
+            });
+        // Budget: explicit override → else model_max_length − reserve → else the
+        // fallback default. Keeps the chunk within the model's real limit
+        // automatically, no per-model hardcoding.
+        let max_tokens = cfg
+            .embedding
+            .max_chunk_tokens
+            .or_else(|| {
+                crate::search::model_manager::read_model_max_length(&model_dir)
+                    .map(|m| m.saturating_sub(RESERVE_TOKENS))
+            })
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_MAX_CHUNK_TOKENS);
+        ChunkerConfig {
+            tokenizer,
+            max_tokens,
+            overlap: cfg.embedding.overlap_tokens.unwrap_or(DEFAULT_OVERLAP_TOKENS),
+        }
+    })
 }
 
 /// Token-precise windowing. Encodes without special tokens, then slices the

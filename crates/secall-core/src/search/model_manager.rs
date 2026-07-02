@@ -18,6 +18,31 @@ const TOKENIZER_URL: &str =
 const TOKENIZER_CONFIG_URL: &str = "https://huggingface.co/logan-cha/multilingual-e5-small-ko-v2-onnx/resolve/main/tokenizer_config.json";
 const HF_API_URL: &str = "https://huggingface.co/api/models/logan-cha/multilingual-e5-small-ko-v2-onnx";
 
+// The e5 family requires these instruction prefixes on inputs; retrieval quality
+// silently degrades without them. They are a property of THIS model, not a user
+// setting — kept beside the model definition and selected by the ort backend so
+// they can't drift out of sync with the model (they would corrupt a non-e5
+// index if applied to one). Empty strings mean "no prefix".
+const MODEL_QUERY_PREFIX: &str = "query: ";
+const MODEL_PASSAGE_PREFIX: &str = "passage: ";
+
+/// The query/passage prefixes the configured ORT model requires (e5 → set;
+/// a non-prefix model would define these as empty).
+pub fn model_prefixes() -> (&'static str, &'static str) {
+    (MODEL_QUERY_PREFIX, MODEL_PASSAGE_PREFIX)
+}
+
+/// Read `model_max_length` from a model dir's tokenizer_config.json, if it is a
+/// sane bound. `None` when absent or the "effectively unlimited" sentinel some
+/// tokenizers ship (~1e30). Shared by the embedder (truncation cap) and the
+/// chunker (token budget) so both derive the limit from the same source.
+pub fn read_model_max_length(model_dir: &std::path::Path) -> Option<usize> {
+    let raw = std::fs::read_to_string(model_dir.join("tokenizer_config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let n = v.get("model_max_length")?.as_u64()?;
+    (1..=100_000).contains(&n).then_some(n as usize)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionInfo {
     pub model: String,
@@ -313,6 +338,13 @@ mod tests {
     fn test_default_model_path() {
         let path = default_model_path();
         assert!(path.to_str().unwrap().contains("dragonkue-e5-onnx"));
+    }
+
+    #[test]
+    fn test_model_prefixes_are_e5() {
+        let (q, p) = model_prefixes();
+        assert_eq!(q, "query: ");
+        assert_eq!(p, "passage: ");
     }
 
     #[test]
