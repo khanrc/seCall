@@ -143,6 +143,9 @@ pub struct OrtEmbedder {
     next_session: std::sync::atomic::AtomicUsize,
     tokenizer: Arc<tokenizers::Tokenizer>,
     dim: usize,
+    /// Model dir basename — tags stored vectors and the ANN index so they
+    /// track the actual model (dragonkue-e5-onnx), not a hardcoded name.
+    model_name: String,
 }
 
 impl OrtEmbedder {
@@ -225,11 +228,17 @@ impl OrtEmbedder {
             "ORT session pool created"
         );
 
+        let model_name = model_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "ort".to_string());
+
         Ok(Self {
             sessions,
             next_session: std::sync::atomic::AtomicUsize::new(0),
             tokenizer: Arc::new(tokenizer),
             dim,
+            model_name,
         })
     }
 
@@ -493,7 +502,7 @@ impl Embedder for OrtEmbedder {
     }
 
     fn model_name(&self) -> &str {
-        "bge-m3-onnx"
+        &self.model_name
     }
 }
 
@@ -502,6 +511,14 @@ impl Embedder for OrtEmbedder {
 /// Local ONNX-based embedder using openvino-rs crate directly (not ORT EP).
 /// Uses a dedicated worker thread since openvino types are !Send/!Sync.
 /// Requires OpenVINO runtime installed on the system.
+///
+/// Only feeds `input_ids` + `attention_mask` and applies no max-length
+/// truncation. A model that requires `token_type_ids` (xlm-roberta/e5, e.g.
+/// dragonkue) therefore fails the init dimension probe below, so `new()` errors
+/// and the factory falls back to the ORT backend (which handles token_type_ids,
+/// truncation, and prefixes). This is intentional — OpenVINO here targets
+/// simpler 2-input models; e5 support lives on the ORT path. Not built in the
+/// default feature set.
 #[cfg(feature = "openvino")]
 pub struct OpenVinoEmbedder {
     tx: std::sync::Mutex<std::sync::mpsc::Sender<OpenVinoWork>>,

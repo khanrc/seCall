@@ -104,22 +104,28 @@ fn chunker_config() -> &'static ChunkerConfig {
                 t.with_truncation(None).ok();
                 t
             });
-        // Budget: explicit override → else model_max_length − reserve → else the
-        // fallback default. Keeps the chunk within the model's real limit
-        // automatically, no per-model hardcoding.
-        let max_tokens = cfg
+        // Budget derives from the model's real limit; an explicit override is
+        // still clamped to it (a chunk larger than the model can never help —
+        // it would just get truncated). Everything stays ≥1. When the model
+        // limit is unknown we trust the override, else the fallback default.
+        let model_budget = crate::search::model_manager::read_model_max_length(&model_dir)
+            .map(|m| m.saturating_sub(RESERVE_TOKENS).max(1));
+        let max_tokens = match (cfg.embedding.max_chunk_tokens, model_budget) {
+            (Some(ovr), Some(limit)) => ovr.clamp(1, limit),
+            (Some(ovr), None) => ovr.max(1),
+            (None, Some(limit)) => limit,
+            (None, None) => DEFAULT_MAX_CHUNK_TOKENS,
+        };
+        // Overlap must leave a positive stride, or windowing can't advance.
+        let overlap = cfg
             .embedding
-            .max_chunk_tokens
-            .or_else(|| {
-                crate::search::model_manager::read_model_max_length(&model_dir)
-                    .map(|m| m.saturating_sub(RESERVE_TOKENS))
-            })
-            .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_MAX_CHUNK_TOKENS);
+            .overlap_tokens
+            .unwrap_or(DEFAULT_OVERLAP_TOKENS)
+            .min(max_tokens.saturating_sub(1));
         ChunkerConfig {
             tokenizer,
             max_tokens,
-            overlap: cfg.embedding.overlap_tokens.unwrap_or(DEFAULT_OVERLAP_TOKENS),
+            overlap,
         }
     })
 }
@@ -133,6 +139,10 @@ fn split_by_tokens(
     max_tokens: usize,
     overlap: usize,
 ) -> Vec<String> {
+    // Guarantee a positive stride so the window always advances (overlap ==
+    // max_tokens would otherwise loop forever). Defensive at the boundary.
+    let max_tokens = max_tokens.max(1);
+    let overlap = overlap.min(max_tokens - 1);
     let encoding = match tokenizer.encode(text, false) {
         Ok(e) => e,
         Err(_) => return split_into_chunks(text, FALLBACK_MAX_CHUNK_CHARS, FALLBACK_OVERLAP_CHARS),

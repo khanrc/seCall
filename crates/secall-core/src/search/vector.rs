@@ -484,7 +484,7 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                         pool_size = pool,
                         "ort ONNX loaded, local vector search enabled"
                     );
-                    let (qp, pp) = super::model_manager::model_prefixes();
+                    let (qp, pp) = super::model_manager::installed_prefixes(&model_dir);
                     VectorIndexer::new(Box::new(e)).with_prefixes(qp, pp)
                 }
                 Err(e) => {
@@ -516,7 +516,7 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                 Ok(e) => {
                     tracing::info!(device = %e.device, "OpenVINO loaded, NPU vector search enabled");
                     // Same model as the ORT path → same e5 prefixes.
-                    let (qp, pp) = super::model_manager::model_prefixes();
+                    let (qp, pp) = super::model_manager::installed_prefixes(&model_dir);
                     VectorIndexer::new(Box::new(e)).with_prefixes(qp, pp)
                 }
                 Err(e) => {
@@ -591,7 +591,7 @@ async fn try_ort_cpu_fallback(config: &Config) -> Option<VectorIndexer> {
                 pool_size = pool,
                 "ORT CPU fallback loaded, vector search enabled"
             );
-            let (qp, pp) = super::model_manager::model_prefixes();
+            let (qp, pp) = super::model_manager::installed_prefixes(&model_dir);
             let indexer = VectorIndexer::new(Box::new(e)).with_prefixes(qp, pp);
             #[cfg(not(target_os = "windows"))]
             let indexer = attach_ann_index(indexer);

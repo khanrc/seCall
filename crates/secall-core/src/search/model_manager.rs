@@ -19,17 +19,25 @@ const TOKENIZER_CONFIG_URL: &str = "https://huggingface.co/logan-cha/multilingua
 const HF_API_URL: &str = "https://huggingface.co/api/models/logan-cha/multilingual-e5-small-ko-v2-onnx";
 
 // The e5 family requires these instruction prefixes on inputs; retrieval quality
-// silently degrades without them. They are a property of THIS model, not a user
-// setting — kept beside the model definition and selected by the ort backend so
-// they can't drift out of sync with the model (they would corrupt a non-e5
-// index if applied to one). Empty strings mean "no prefix".
+// silently degrades without them. They are a property of THIS model, stamped into
+// version.json at download so the prefix is bound to the artifact (read back by
+// `installed_prefixes`), not to the backend — a different model in the dir can't
+// inherit e5's prefix.
 const MODEL_QUERY_PREFIX: &str = "query: ";
 const MODEL_PASSAGE_PREFIX: &str = "passage: ";
 
-/// The query/passage prefixes the configured ORT model requires (e5 → set;
-/// a non-prefix model would define these as empty).
-pub fn model_prefixes() -> (&'static str, &'static str) {
-    (MODEL_QUERY_PREFIX, MODEL_PASSAGE_PREFIX)
+/// The query/passage prefixes recorded in a model dir's version.json. Empty
+/// (no prefix) when there's no version.json or it predates the field — the safe
+/// default for a manually-placed or non-e5 model.
+pub fn installed_prefixes(model_dir: &std::path::Path) -> (String, String) {
+    let raw = match std::fs::read_to_string(model_dir.join("version.json")) {
+        Ok(r) => r,
+        Err(_) => return (String::new(), String::new()),
+    };
+    match serde_json::from_str::<VersionInfo>(&raw) {
+        Ok(v) => (v.query_prefix, v.passage_prefix),
+        Err(_) => (String::new(), String::new()),
+    }
 }
 
 /// Read `model_max_length` from a model dir's tokenizer_config.json, if it is a
@@ -52,6 +60,14 @@ pub struct VersionInfo {
     pub sha256_model_data: Option<String>,
     pub sha256_tokenizer: String,
     pub source_revision: String,
+    /// e5 instruction prefixes this model requires, stamped at download so the
+    /// prefix travels with the artifact — a model dir without version.json (a
+    /// manually-placed / non-e5 model) yields no prefix rather than wrongly
+    /// inheriting e5's.
+    #[serde(default)]
+    pub query_prefix: String,
+    #[serde(default)]
+    pub passage_prefix: String,
 }
 
 #[derive(Debug)]
@@ -149,6 +165,8 @@ impl ModelManager {
             sha256_model_data: model_data_sha,
             sha256_tokenizer: tokenizer_sha,
             source_revision: "main".to_string(),
+            query_prefix: MODEL_QUERY_PREFIX.to_string(),
+            passage_prefix: MODEL_PASSAGE_PREFIX.to_string(),
         };
         let version_path = self.model_dir.join("version.json");
         std::fs::write(&version_path, serde_json::to_string_pretty(&version)?)
@@ -327,6 +345,8 @@ mod tests {
             sha256_model_data: Some("ghi789".to_string()),
             sha256_tokenizer: "def456".to_string(),
             source_revision: "main".to_string(),
+            query_prefix: String::new(),
+            passage_prefix: String::new(),
         };
         let json = serde_json::to_string(&v).unwrap();
         let v2: VersionInfo = serde_json::from_str(&json).unwrap();
@@ -341,10 +361,23 @@ mod tests {
     }
 
     #[test]
-    fn test_model_prefixes_are_e5() {
-        let (q, p) = model_prefixes();
-        assert_eq!(q, "query: ");
-        assert_eq!(p, "passage: ");
+    fn test_installed_prefixes_from_version_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No version.json → no prefix (safe default for a non-e5 / manual dir).
+        assert_eq!(
+            installed_prefixes(tmp.path()),
+            (String::new(), String::new())
+        );
+        // With version.json carrying prefixes → read them back.
+        std::fs::write(
+            tmp.path().join("version.json"),
+            r#"{"model":"m","downloaded_at":"t","sha256_model":"a","sha256_tokenizer":"b","source_revision":"main","query_prefix":"query: ","passage_prefix":"passage: "}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            installed_prefixes(tmp.path()),
+            ("query: ".to_string(), "passage: ".to_string())
+        );
     }
 
     #[test]
