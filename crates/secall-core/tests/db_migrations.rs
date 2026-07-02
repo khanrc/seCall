@@ -48,3 +48,41 @@ fn migrate_v8_to_v9() {
     );
     assert_eq!(wiki_vectors_exists, 1);
 }
+
+#[test]
+fn migrate_adds_actions_json_to_turns() {
+    // A pre-v12 DB with a turns table (no actions_json) gains the column so the
+    // deferred embed path can restore tool actions (#1585 WS1).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("migration.sqlite");
+
+    let conn = Connection::open(&db_path).expect("open sqlite");
+    conn.execute_batch(
+        "
+        CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO config(key, value) VALUES ('schema_version', '11');
+        CREATE TABLE sessions (id TEXT PRIMARY KEY);
+        CREATE TABLE turns (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT NOT NULL,
+            turn_index  INTEGER NOT NULL,
+            role        TEXT NOT NULL,
+            content     TEXT NOT NULL,
+            has_tool    INTEGER DEFAULT 0
+        );
+        ",
+    )
+    .expect("seed v11 schema with turns");
+    drop(conn);
+
+    let db = Database::open(&db_path).expect("migrate to current");
+    let has_actions_json: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('turns') WHERE name = 'actions_json'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("pragma");
+    assert_eq!(has_actions_json, 1, "v12 migration adds turns.actions_json");
+}

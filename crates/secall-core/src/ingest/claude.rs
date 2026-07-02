@@ -49,6 +49,11 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
     // Pending tool_use entries keyed by tool_use_id waiting for tool_result
     let mut pending_tool_uses: HashMap<String, usize> = HashMap::new(); // tool_use_id -> action index in last assistant turn
 
+    // message.id of the last assistant turn, to merge Claude Code's split
+    // streaming events (thinking / text / tool_use of one message arrive as
+    // separate events sharing an id) into a single Turn (#1585 WS2).
+    let mut last_asst_msg_id: Option<String> = None;
+
     let mut line_count = 0;
 
     for line in reader.lines() {
@@ -223,8 +228,6 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
                     }
                 }
 
-                pending_tool_uses = new_pending;
-
                 let content = text_parts.join("\n\n");
                 let thinking = if thinking_parts.is_empty() {
                     None
@@ -232,17 +235,60 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
                     Some(thinking_parts.join("\n\n"))
                 };
 
-                let turn = Turn {
-                    index: turns.len() as u32,
-                    role: Role::Assistant,
-                    timestamp: ts,
-                    content,
-                    actions,
-                    tokens,
-                    thinking,
-                    is_sidechain,
-                };
-                turns.push(turn);
+                // Merge into the previous turn when it is the same assistant
+                // message split across events; otherwise start a new turn. The
+                // role check guards against merging across an intervening user
+                // turn (message ids are unique per message anyway).
+                let msg_id = message["id"].as_str().map(|s| s.to_string());
+                let merge = msg_id.is_some()
+                    && msg_id == last_asst_msg_id
+                    && turns.last().map(|t| t.role == Role::Assistant).unwrap_or(false);
+
+                if merge {
+                    let last = turns.last_mut().unwrap();
+                    let action_base = last.actions.len();
+                    if !content.is_empty() {
+                        if last.content.is_empty() {
+                            last.content = content;
+                        } else {
+                            last.content.push_str("\n\n");
+                            last.content.push_str(&content);
+                        }
+                    }
+                    if let Some(tk) = thinking {
+                        match last.thinking.as_mut() {
+                            Some(existing) => {
+                                existing.push_str("\n\n");
+                                existing.push_str(&tk);
+                            }
+                            None => last.thinking = Some(tk),
+                        }
+                    }
+                    last.actions.extend(actions);
+                    // usage repeats across a message's events; keep the latest.
+                    if tokens.is_some() {
+                        last.tokens = tokens;
+                    }
+                    // new tool_uses land after the pre-merge actions — offset
+                    // their pending indices so tool_result attaches correctly.
+                    for (k, v) in new_pending {
+                        pending_tool_uses.insert(k, v + action_base);
+                    }
+                } else {
+                    let turn = Turn {
+                        index: turns.len() as u32,
+                        role: Role::Assistant,
+                        timestamp: ts,
+                        content,
+                        actions,
+                        tokens,
+                        thinking,
+                        is_sidechain,
+                    };
+                    turns.push(turn);
+                    pending_tool_uses = new_pending;
+                }
+                last_asst_msg_id = msg_id;
             }
 
             // Skip non-conversation message types
@@ -394,6 +440,49 @@ mod tests {
         assert_eq!(session.turns[0].role, Role::User);
         assert_eq!(session.turns[1].role, Role::Assistant);
         assert_eq!(session.model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn test_merge_split_assistant_message() {
+        // Claude Code streams one assistant message's blocks (thinking / text /
+        // tool_use) as separate events sharing a message.id; they must collapse
+        // into one turn, preserving thinking and attaching the tool_result to
+        // the merged turn's action (#1585 WS2).
+        let lines = &[
+            r#"{"type":"user","message":{"role":"user","content":"run ls"},"timestamp":"2026-04-05T10:00:00Z","sessionId":"s1","cwd":"/p","gitBranch":"main"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"msg_A","model":"claude","content":[{"type":"thinking","thinking":"let me think"}],"usage":{"output_tokens":3}},"timestamp":"2026-04-05T10:00:01Z"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"msg_A","content":[{"type":"text","text":"Listing now"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-04-05T10:00:02Z"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"file1\nfile2"}]},"timestamp":"2026-04-05T10:00:03Z"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"msg_B","content":[{"type":"text","text":"Done"}]},"timestamp":"2026-04-05T10:00:04Z"}"#,
+        ];
+        let f = write_jsonl(lines);
+        let session = parse_claude_jsonl(f.path()).unwrap();
+
+        // user, merged assistant (msg_A), separate assistant (msg_B)
+        assert_eq!(session.turns.len(), 3);
+        let a = &session.turns[1];
+        assert_eq!(a.role, Role::Assistant);
+        assert_eq!(a.thinking.as_deref(), Some("let me think"));
+        assert_eq!(a.content, "Listing now");
+        assert_eq!(a.actions.len(), 1);
+        match &a.actions[0] {
+            Action::ToolUse {
+                name,
+                output_summary,
+                ..
+            } => {
+                assert_eq!(name, "Bash");
+                assert!(
+                    output_summary.contains("file1"),
+                    "tool_result must attach to the merged turn's action"
+                );
+            }
+            _ => panic!("expected ToolUse action"),
+        }
+        // tool text is folded into the indexed text so the turn stays searchable
+        assert!(a.index_text().contains("[Tool: Bash]"));
+        // a different message.id starts a new turn
+        assert_eq!(session.turns[2].content, "Done");
     }
 
     #[test]
