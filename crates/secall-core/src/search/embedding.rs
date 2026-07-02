@@ -283,10 +283,28 @@ impl OrtEmbedder {
         let mask_ref = TensorRef::<i64>::from_array_view(attention_mask.view())
             .map_err(|e| anyhow!("tensor mask: {e}"))?;
 
-        let outputs = session.run(ort::inputs![
-            "input_ids" => ids_ref,
-            "attention_mask" => mask_ref,
-        ])?;
+        // xlm-roberta exports (dragonkue/e5) declare token_type_ids as a required
+        // input; bge-m3's export omits it. Supply zeros only when the model asks
+        // for it — ort errors if the input set doesn't match exactly.
+        let needs_token_type = session
+            .inputs
+            .iter()
+            .any(|i| i.name == "token_type_ids");
+        let token_type_ids = Array2::<i64>::zeros((batch_size, max_len));
+        let outputs = if needs_token_type {
+            let tt_ref = TensorRef::<i64>::from_array_view(token_type_ids.view())
+                .map_err(|e| anyhow!("tensor token_type: {e}"))?;
+            session.run(ort::inputs![
+                "input_ids" => ids_ref,
+                "attention_mask" => mask_ref,
+                "token_type_ids" => tt_ref,
+            ])?
+        } else {
+            session.run(ort::inputs![
+                "input_ids" => ids_ref,
+                "attention_mask" => mask_ref,
+            ])?
+        };
 
         // bge-m3 ONNX exports token-level embeddings as "token_embeddings";
         // fall back to "last_hidden_state" for standard BERT-style models.
@@ -361,10 +379,27 @@ impl OrtEmbedder {
         let mask_ref = TensorRef::<i64>::from_array_view(mask_arr.view())
             .map_err(|e| anyhow!("tensor mask: {e}"))?;
 
-        let outputs = session.run(ort::inputs![
-            "input_ids" => ids_ref,
-            "attention_mask" => mask_ref,
-        ])?;
+        // See run_inference_batch: supply token_type_ids zeros only when the
+        // model declares that input (dragonkue/e5 yes, bge-m3 no).
+        let needs_token_type = session
+            .inputs
+            .iter()
+            .any(|i| i.name == "token_type_ids");
+        let token_type_arr = Array2::<i64>::zeros((1, seq_len));
+        let outputs = if needs_token_type {
+            let tt_ref = TensorRef::<i64>::from_array_view(token_type_arr.view())
+                .map_err(|e| anyhow!("tensor token_type: {e}"))?;
+            session.run(ort::inputs![
+                "input_ids" => ids_ref,
+                "attention_mask" => mask_ref,
+                "token_type_ids" => tt_ref,
+            ])?
+        } else {
+            session.run(ort::inputs![
+                "input_ids" => ids_ref,
+                "attention_mask" => mask_ref,
+            ])?
+        };
 
         // bge-m3 ONNX exports token-level embeddings as "token_embeddings";
         // fall back to "last_hidden_state" for standard BERT-style models.

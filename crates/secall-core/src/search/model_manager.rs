@@ -5,8 +5,13 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+// TODO(#1577): swap to the dragonkue ONNX host once provisioned (HF repo or a
+// khanrc/seCall release asset — hosting decision pending). dragonkue is a single
+// 449 MB model.onnx with NO external-data sidecar, so MODEL_DATA_URL becomes
+// None. Kept on bge-m3 until then; the manager already handles both shapes.
 const MODEL_URL: &str = "https://huggingface.co/BAAI/bge-m3/resolve/main/onnx/model.onnx";
-const MODEL_DATA_URL: &str = "https://huggingface.co/BAAI/bge-m3/resolve/main/onnx/model.onnx_data";
+const MODEL_DATA_URL: Option<&str> =
+    Some("https://huggingface.co/BAAI/bge-m3/resolve/main/onnx/model.onnx_data");
 const TOKENIZER_URL: &str = "https://huggingface.co/BAAI/bge-m3/resolve/main/tokenizer.json";
 const HF_API_URL: &str = "https://huggingface.co/api/models/BAAI/bge-m3";
 
@@ -53,8 +58,11 @@ impl ModelManager {
     }
 
     pub fn is_downloaded(&self) -> bool {
+        // model.onnx_data only exists for models exported in ONNX external-data
+        // format (bge-m3, >2GB). Single-file models (dragonkue, 449MB) have none.
+        let data_ok = MODEL_DATA_URL.is_none() || self.model_dir.join("model.onnx_data").exists();
         self.model_dir.join("model.onnx").exists()
-            && self.model_dir.join("model.onnx_data").exists()
+            && data_ok
             && self.model_dir.join("tokenizer.json").exists()
     }
 
@@ -70,10 +78,15 @@ impl ModelManager {
             .await
             .context("failed to download model.onnx")?;
 
-        let model_data_sha = self
-            .download_file(MODEL_DATA_URL, "model.onnx_data")
-            .await
-            .context("failed to download model.onnx_data")?;
+        let model_data_sha = if let Some(url) = MODEL_DATA_URL {
+            Some(
+                self.download_file(url, "model.onnx_data")
+                    .await
+                    .context("failed to download model.onnx_data")?,
+            )
+        } else {
+            None
+        };
 
         let tokenizer_sha = self
             .download_file(TOKENIZER_URL, "tokenizer.json")
@@ -84,7 +97,7 @@ impl ModelManager {
             model: "BAAI/bge-m3".to_string(),
             downloaded_at: chrono::Utc::now().to_rfc3339(),
             sha256_model: model_sha,
-            sha256_model_data: Some(model_data_sha),
+            sha256_model_data: model_data_sha,
             sha256_tokenizer: tokenizer_sha,
             source_revision: "main".to_string(),
         };

@@ -37,6 +37,10 @@ pub struct VectorIndexer {
     #[cfg(not(target_os = "windows"))]
     ann_index: Option<AnnIndex>,
     batch_size: usize,
+    /// e5-style prefixes (dragonkue). Empty for bge-m3. Applied symmetrically:
+    /// passage_prefix on indexed chunks, query_prefix on search queries.
+    query_prefix: String,
+    passage_prefix: String,
 }
 
 impl VectorIndexer {
@@ -46,7 +50,16 @@ impl VectorIndexer {
             #[cfg(not(target_os = "windows"))]
             ann_index: None,
             batch_size: 32,
+            query_prefix: String::new(),
+            passage_prefix: String::new(),
         }
+    }
+
+    /// Set the e5 query/passage prefixes. Empty strings are a no-op (bge-m3).
+    pub fn with_prefixes(mut self, query_prefix: String, passage_prefix: String) -> Self {
+        self.query_prefix = query_prefix;
+        self.passage_prefix = passage_prefix;
+        self
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -124,8 +137,13 @@ impl VectorIndexer {
             return Ok(IndexStats::default());
         }
 
-        // Phase 1: 임베딩 계산 — 트랜잭션 밖에서 수행 (CPU 시간 동안 DB lock 없음)
-        let texts: Vec<&str> = pending_chunks.iter().map(|c| c.text.as_str()).collect();
+        // Phase 1: 임베딩 계산 — 트랜잭션 밖에서 수행 (CPU 시간 동안 DB lock 없음).
+        // passage_prefix (e5 "passage: ") is prepended here; empty for bge-m3.
+        let prefixed_texts: Vec<String> = pending_chunks
+            .iter()
+            .map(|c| format!("{}{}", self.passage_prefix, c.text))
+            .collect();
+        let texts: Vec<&str> = prefixed_texts.iter().map(|s| s.as_str()).collect();
         let batch_size = self.batch_size;
         let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; pending_chunks.len()];
         let mut embed_errors = 0usize;
@@ -245,14 +263,21 @@ impl VectorIndexer {
         filters: &SearchFilters,
         candidate_session_ids: Option<&[String]>,
     ) -> Result<Vec<SearchResult>> {
-        let query_embedding = self.embedder.embed(query).await?;
+        let query_embedding = self.embed_query(query).await?;
         // ANN-aware 경로를 공통으로 사용
         self.search_with_embedding(db, &query_embedding, limit, filters, candidate_session_ids)
     }
 
     /// Embed a query string without DB access (safe to call before locking DB mutex).
     pub async fn embed_query(&self, query: &str) -> anyhow::Result<Vec<f32>> {
-        self.embedder.embed(query).await
+        // query_prefix (e5 "query: ") prepended; empty for bge-m3.
+        if self.query_prefix.is_empty() {
+            self.embedder.embed(query).await
+        } else {
+            self.embedder
+                .embed(&format!("{}{}", self.query_prefix, query))
+                .await
+        }
     }
 
     /// Search vectors using a pre-computed embedding (sync, no async needed).
@@ -538,6 +563,11 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
             return try_ollama_fallback_with_ann(config).await;
         }
     };
+
+    let indexer = indexer.with_prefixes(
+        config.embedding.query_prefix.clone().unwrap_or_default(),
+        config.embedding.passage_prefix.clone().unwrap_or_default(),
+    );
 
     #[cfg(not(target_os = "windows"))]
     let indexer = attach_ann_index(indexer);

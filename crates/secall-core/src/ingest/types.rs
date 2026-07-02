@@ -61,6 +61,33 @@ pub struct Turn {
     pub is_sidechain: bool,
 }
 
+impl Turn {
+    /// Text used for both vector and BM25 indexing: the turn's content plus a
+    /// compact fold of its tool calls (`[Tool: name] input_summary`). Thinking
+    /// is intentionally excluded from the index (stored/displayed only), and
+    /// tool output is excluded (input summary carries the "what ran" signal at
+    /// far lower token cost). Sharing this between the chunker and BM25 keeps
+    /// tool-only assistant turns — which have empty `content` — searchable
+    /// instead of indexing as empty and being skipped (#1585).
+    pub fn index_text(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.content.is_empty() {
+            parts.push(self.content.clone());
+        }
+        for action in &self.actions {
+            if let Action::ToolUse {
+                name,
+                input_summary,
+                ..
+            } = action
+            {
+                parts.push(format!("[Tool: {}] {}", name, input_summary));
+            }
+        }
+        parts.join("\n\n")
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Role {
     User,

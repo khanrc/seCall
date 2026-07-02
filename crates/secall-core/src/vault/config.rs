@@ -88,6 +88,12 @@ pub struct EmbeddingConfig {
     pub cloud_model: Option<String>,
     /// Ollama Cloud API key — managed via env OLLAMA_CLOUD_API_KEY, not stored in config
     pub cloud_api_key: Option<String>,
+    /// Prefix prepended to search text before embedding. e5 models
+    /// (dragonkue) require "query: "; bge-m3 wants none. Empty when unset.
+    pub query_prefix: Option<String>,
+    /// Prefix prepended to indexed chunk text before embedding. e5 models
+    /// (dragonkue) require "passage: "; bge-m3 wants none. Empty when unset.
+    pub passage_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -360,6 +366,8 @@ impl Default for EmbeddingConfig {
             cloud_host: None,
             cloud_model: None,
             cloud_api_key: None,
+            query_prefix: None,
+            passage_prefix: None,
         }
     }
 }

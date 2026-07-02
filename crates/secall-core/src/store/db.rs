@@ -157,6 +157,14 @@ impl Database {
                     .execute("ALTER TABLE sessions ADD COLUMN source_mtime INTEGER", [])?;
             }
         }
+        if current < 12 && !self.column_exists("turns", "actions_json")? {
+            // Persist tool-call actions so the deferred (--no-embed → catchup)
+            // embed path can fold tool text into the index; the loader used to
+            // reconstruct turns without actions, so tool-only turns embedded as
+            // empty and were skipped (#1585).
+            self.conn
+                .execute("ALTER TABLE turns ADD COLUMN actions_json TEXT", [])?;
+        }
         if current < CURRENT_SCHEMA_VERSION {
             self.conn.execute(
                 "INSERT OR REPLACE INTO config(key, value) VALUES ('schema_version', ?1)",

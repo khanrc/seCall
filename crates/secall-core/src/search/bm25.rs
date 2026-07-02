@@ -96,19 +96,10 @@ impl Bm25Indexer {
         db.insert_session(session)?;
 
         for turn in &session.turns {
-            // Tokenize turn content
-            let tokenized = self.tokenizer.tokenize_for_fts(&turn.content);
-
-            // Also tokenize thinking if present
-            let full_text = if let Some(thinking) = &turn.thinking {
-                format!(
-                    "{} {}",
-                    tokenized,
-                    self.tokenizer.tokenize_for_fts(thinking)
-                )
-            } else {
-                tokenized
-            };
+            // Index the same text the vector chunker embeds: content + folded
+            // tool-call summaries, thinking excluded (#1585). Keeps tool-only
+            // turns searchable via BM25 and keeps the two channels aligned.
+            let full_text = self.tokenizer.tokenize_for_fts(&turn.index_text());
 
             db.insert_turn(&session.id, turn)?;
             db.insert_fts(&full_text, &session.id, turn.index)?;

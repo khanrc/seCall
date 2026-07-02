@@ -1,4 +1,4 @@
-pub const CURRENT_SCHEMA_VERSION: u32 = 11;
+pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 
 pub const CREATE_SESSIONS: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS turns (
     has_tool    INTEGER DEFAULT 0,
     tool_names  TEXT,
     thinking    TEXT,
+    actions_json TEXT,
     tokens_in   INTEGER DEFAULT 0,
     tokens_out  INTEGER DEFAULT 0,
     UNIQUE(session_id, turn_index)

@@ -108,9 +108,17 @@ impl SessionRepo for Database {
 
         let has_tool = !tool_names.is_empty();
 
+        // Persist the full action list so the deferred embed path can fold tool
+        // text into the index (#1585). NULL when there are no actions.
+        let actions_json = if turn.actions.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&turn.actions).ok()
+        };
+
         self.conn().execute(
-            "INSERT OR IGNORE INTO turns(session_id, turn_index, role, timestamp, content, has_tool, tool_names, thinking, tokens_in, tokens_out)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT OR IGNORE INTO turns(session_id, turn_index, role, timestamp, content, has_tool, tool_names, thinking, actions_json, tokens_in, tokens_out)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 session_id,
                 turn.index as i64,
@@ -120,6 +128,7 @@ impl SessionRepo for Database {
                 has_tool as i64,
                 serde_json::to_string(&tool_names).ok(),
                 turn.thinking,
+                actions_json,
                 turn.tokens.as_ref().map(|t| t.input as i64).unwrap_or(0),
                 turn.tokens.as_ref().map(|t| t.output as i64).unwrap_or(0),
             ],
@@ -585,9 +594,11 @@ impl Database {
 
         let cwd = cwd_str.map(std::path::PathBuf::from);
 
-        // turns 조회
+        // turns 조회 — actions_json을 복원해 tool text가 임베딩에 포함되도록 한다 (#1585).
+        // deferred embed 경로는 이 로더로 세션을 재구성하므로, 여기서 actions를
+        // 복원하지 않으면 tool-only 턴이 빈 텍스트로 임베딩돼 스킵된다.
         let mut stmt = self.conn().prepare(
-            "SELECT turn_index, role, content, timestamp FROM turns
+            "SELECT turn_index, role, content, timestamp, actions_json FROM turns
              WHERE session_id = ?1 ORDER BY turn_index ASC",
         )?;
         let turns: Vec<Turn> = stmt
@@ -597,10 +608,11 @@ impl Database {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             })?
             .filter_map(|r| r.ok())
-            .map(|(idx, role_str, content, ts_str)| {
+            .map(|(idx, role_str, content, ts_str, actions_json)| {
                 let role = match role_str.as_str() {
                     "assistant" => Role::Assistant,
                     "system" => Role::System,
@@ -611,12 +623,15 @@ impl Database {
                         .map(|dt| dt.with_timezone(&chrono::Utc))
                         .ok()
                 });
+                let actions = actions_json
+                    .and_then(|j| serde_json::from_str::<Vec<crate::ingest::Action>>(&j).ok())
+                    .unwrap_or_default();
                 Turn {
                     index: idx as u32,
                     role,
                     timestamp,
                     content,
-                    actions: Vec::new(),
+                    actions,
                     tokens: None,
                     thinking: None,
                     is_sidechain: false,
