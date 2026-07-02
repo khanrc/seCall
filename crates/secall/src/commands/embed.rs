@@ -46,6 +46,17 @@ pub async fn run(all: bool, batch_size: Option<usize>, concurrency: usize) -> Re
     let batch_size = batch_size.unwrap_or(32);
     let indexer = Arc::new(indexer.with_batch_size(batch_size));
 
+    // Single-active-model invariant: if the store holds a previous model's
+    // vectors, wipe them before embedding. Runs here — single-threaded, before
+    // the pre-filter scan (which would otherwise treat old-model chunks as
+    // "already embedded" and silently skip) and before the concurrent embed
+    // loop (avoiding any wipe/insert race on the shared DB).
+    if db.reconcile_vector_model(indexer.model_name())? {
+        eprintln!(
+            "Embedding model changed → cleared stale vectors; performing a full re-embed."
+        );
+    }
+
     let tz = config.timezone();
     let candidate_ids: Vec<String> = db.list_all_session_ids()?;
 

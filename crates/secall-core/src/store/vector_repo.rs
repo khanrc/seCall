@@ -292,6 +292,60 @@ impl Database {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Enforce the single-active-model invariant on the vector store.
+    ///
+    /// `turn_vectors` is expected to hold exactly one embedding model's vectors
+    /// at a time — both hybrid search and the turn-incremental skip in
+    /// `index_session` assume a single vector space. When the active embedding
+    /// model changes, every stored vector belongs to the *old* space: a
+    /// different dimension trips the insert dimension-guard, and a
+    /// same-dimension-different-model vector would be silently cross-compared at
+    /// search time. Both are corruption, not staleness, so the only safe move is
+    /// a clean slate.
+    ///
+    /// Wipes the whole table when any stored row's `model` differs from
+    /// `current_model`, forcing a full re-embed. Returns `true` when it wiped.
+    /// No-op (`false`) when the table is missing, empty, or already holds only
+    /// `current_model` rows. The ANN index is keyed by `model`+`dim` on disk, so
+    /// the new model opens a fresh index file; no ANN cleanup is needed here.
+    ///
+    /// Call once at each embed entrypoint before the embed loop — never on a
+    /// read/search path, which must not mutate the store.
+    pub fn reconcile_vector_model(&self, current_model: &str) -> Result<bool> {
+        let table_exists: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='turn_vectors'",
+            [],
+            |r| r.get(0),
+        )?;
+        if table_exists == 0 {
+            return Ok(false);
+        }
+
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT DISTINCT model FROM turn_vectors")?;
+        let stored_models: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let has_foreign = stored_models.iter().any(|m| m != current_model);
+        if !has_foreign {
+            return Ok(false);
+        }
+
+        let deleted = self
+            .conn()
+            .execute("DELETE FROM turn_vectors", [])?;
+        tracing::warn!(
+            current_model,
+            stale_models = ?stored_models,
+            deleted,
+            "embedding model changed — cleared stale vectors for a full re-embed"
+        );
+        Ok(true)
+    }
+
     /// Vector rows whose session_id does not exist in sessions
     pub fn find_orphan_vectors(&self) -> Result<Vec<(i64, String)>> {
         let table_exists: i64 = self.conn().query_row(
@@ -439,5 +493,52 @@ mod tests {
 
         let empty = db.get_session_chunk_keys("missing").unwrap();
         assert!(empty.is_empty());
+    }
+
+    /// 저장된 모든 벡터가 현재 모델과 같으면 reconcile은 no-op.
+    #[test]
+    fn test_reconcile_vector_model_noop_when_same_model() {
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+        db.insert_vector(&[1.0_f32, 0.0, 0.0], "A", 0, 0, "dragonkue")
+            .unwrap();
+        db.insert_vector(&[0.0_f32, 1.0, 0.0], "A", 1, 0, "dragonkue")
+            .unwrap();
+
+        let wiped = db.reconcile_vector_model("dragonkue").unwrap();
+        assert!(!wiped, "same model must not wipe");
+        assert!(db.has_embeddings().unwrap(), "vectors must survive");
+    }
+
+    /// 모델이 바뀌면 (foreign 행 존재) 테이블 전체를 비운다 — full re-embed 유도.
+    #[test]
+    fn test_reconcile_vector_model_wipes_on_model_change() {
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+        // 옛 bge-m3 (1024차원과 무관하게 model 태그로 판정) 벡터
+        db.insert_vector(&[1.0_f32, 0.0, 0.0], "A", 0, 0, "bge-m3")
+            .unwrap();
+        db.insert_vector(&[0.0_f32, 1.0, 0.0], "B", 0, 0, "bge-m3")
+            .unwrap();
+
+        let wiped = db.reconcile_vector_model("dragonkue").unwrap();
+        assert!(wiped, "model change must wipe");
+        assert!(!db.has_embeddings().unwrap(), "table must be empty after wipe");
+
+        // 비운 뒤에는 차원이 다른 새 모델 벡터도 정상 삽입 (dimension-guard 통과)
+        db.insert_vector(&[0.1_f32, 0.2], "A", 0, 0, "dragonkue")
+            .unwrap();
+    }
+
+    /// 빈 테이블 / 테이블 없음 모두 안전하게 no-op.
+    #[test]
+    fn test_reconcile_vector_model_noop_when_empty() {
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+        assert!(!db.reconcile_vector_model("dragonkue").unwrap());
+
+        // 테이블 자체가 없는 신규 DB에서도 에러 없이 false
+        let fresh = Database::open_memory().unwrap();
+        assert!(!fresh.reconcile_vector_model("dragonkue").unwrap());
     }
 }

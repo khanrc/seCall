@@ -381,6 +381,18 @@ pub async fn ingest_sessions(
     // BM25/vault 완료 후 벡터 임베딩을 일괄 처리하기 위한 수집 목록.
     let mut vector_tasks: Vec<secall_core::ingest::Session> = Vec::new();
 
+    // Single-active-model invariant: if the embedding model changed since the
+    // last pass, the stored vectors are from the old space and must be cleared
+    // before any new embed (dimension-guard + turn-incremental skip both assume
+    // one model). Runs once here, before the per-file loop. The sanctioned
+    // rebuild path is `secall embed --all`; this keeps the incremental daemon
+    // self-healing if the model is switched without a manual full re-embed.
+    if !no_embed {
+        if let Some(model) = engine.vector_model_name() {
+            db.reconcile_vector_model(model)?;
+        }
+    }
+
     let compiled_rules = compile_classification_rules(config)?;
 
     let total_paths = paths.len();

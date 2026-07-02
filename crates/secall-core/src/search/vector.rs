@@ -73,6 +73,13 @@ impl VectorIndexer {
         self
     }
 
+    /// The active embedding model's name (model-dir basename for ORT, provider
+    /// model id otherwise). Used to reconcile the vector store's single-model
+    /// invariant before an embed pass.
+    pub fn model_name(&self) -> &str {
+        self.embedder.model_name()
+    }
+
     /// ANN 인덱스를 파일에 저장. 존재하지 않으면 no-op.
     pub fn save_ann_if_present(&self) -> Result<()> {
         #[cfg(not(target_os = "windows"))]
