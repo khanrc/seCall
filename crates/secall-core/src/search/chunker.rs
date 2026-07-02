@@ -277,4 +277,39 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_split_by_tokens_windows_within_budget_with_overlap() {
+        use std::collections::HashMap;
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+        use tokenizers::Tokenizer;
+
+        // Trivial word-level tokenizer: one token per whitespace-delimited word,
+        // so token counts are deterministic (no on-disk model needed).
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for i in 0..40u32 {
+            vocab.insert(format!("w{i}"), i);
+        }
+        vocab.insert("[UNK]".to_string(), 40);
+        let model = WordLevel::builder()
+            .vocab(vocab.into_iter().collect()) // infers the builder's AHashMap
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let mut tok = Tokenizer::new(model);
+        tok.with_pre_tokenizer(Some(Whitespace::default()));
+
+        let text = (0..20).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let chunks = split_by_tokens(&text, &tok, 5, 2);
+
+        assert!(chunks.len() > 1, "20 tokens / budget 5 → multiple chunks");
+        for c in &chunks {
+            let n = tok.encode(c.as_str(), false).unwrap().get_ids().len();
+            assert!(n <= 5, "chunk exceeds token budget: {n} tokens in {c:?}");
+        }
+        // First and last original tokens are covered (no head/tail loss).
+        assert!(chunks[0].contains("w0"));
+        assert!(chunks.last().unwrap().contains("w19"));
+    }
 }
