@@ -5,10 +5,12 @@ use crate::ingest::Session;
 // dragonkue/multilingual-e5-small (xlm-roberta) has max_seq_length 512. We split
 // on the model tokenizer so a chunk never overflows and gets silently truncated
 // (the char-based 3600 cap did exactly that for Korean — ~2 chars/token — losing
-// the tail of long turns). 510 leaves room for the 2 special tokens the embedder
-// adds; overlap is ~15%.
-const MAX_CHUNK_TOKENS: usize = 510;
-const OVERLAP_TOKENS: usize = 77;
+// the tail of long turns). The embedded sequence is `<e5 prefix> + chunk + 2
+// special tokens`, so the chunk budget must reserve room for both: 500 leaves
+// ~12 tokens for the "query: "/"passage: " prefix (~4) and specials (2) with
+// margin, keeping the real input ≤512. Overlap is ~15%.
+const MAX_CHUNK_TOKENS: usize = 500;
+const OVERLAP_TOKENS: usize = 75;
 
 // Fallback char budget when the model tokenizer isn't on disk (unit tests, or
 // before the model is downloaded). Conservative: 1000 chars stays under 510
@@ -69,14 +71,25 @@ fn split_turn_text(text: &str) -> Vec<String> {
     split_into_chunks(text, FALLBACK_MAX_CHUNK_CHARS, FALLBACK_OVERLAP_CHARS)
 }
 
-/// Lazily load the embedding model's tokenizer from the model dir. `None` when
-/// the model hasn't been downloaded (tests, fresh install) → char fallback.
+/// Lazily load the embedding model's tokenizer so token counts match what the
+/// embedder actually feeds the model. Resolves the same path the embedder does
+/// (`config.embedding.model_path`, else the default) — not a hardcoded default —
+/// so a custom model dir keeps chunker and embedder in sync. Truncation is
+/// forced off: we rely on our own windowing for the budget, and a tokenizer that
+/// shipped a truncation setting would otherwise silently cap `encode`, hiding
+/// the very tail-loss this chunker exists to prevent. `None` (→ char fallback)
+/// when the model isn't on disk (tests, fresh install).
 fn model_tokenizer() -> Option<&'static tokenizers::Tokenizer> {
     static TOKENIZER: OnceLock<Option<tokenizers::Tokenizer>> = OnceLock::new();
     TOKENIZER
         .get_or_init(|| {
-            let path = crate::search::model_manager::default_model_path().join("tokenizer.json");
-            tokenizers::Tokenizer::from_file(&path).ok()
+            let model_dir = crate::vault::Config::load_or_default()
+                .embedding
+                .model_path
+                .unwrap_or_else(crate::search::model_manager::default_model_path);
+            let mut tok = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).ok()?;
+            tok.with_truncation(None).ok();
+            Some(tok)
         })
         .as_ref()
 }

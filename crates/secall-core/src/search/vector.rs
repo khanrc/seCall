@@ -11,7 +11,7 @@ use super::ann::AnnIndex;
 use super::bm25::{IndexStats, SearchFilters, SearchResult, SessionMeta};
 use super::chunker::chunk_session;
 use super::embedding::{Embedder, OllamaEmbedder, OpenAIEmbedder, OrtEmbedder};
-use super::model_manager::ModelManager;
+use super::model_manager::{default_model_path, ModelManager};
 use crate::ingest::Session;
 use crate::store::db::Database;
 use crate::store::{SessionRepo, VectorRepo};
@@ -453,9 +453,22 @@ fn resolve_pool_size(config: &crate::vault::config::Config) -> usize {
     }
 }
 
-/// Create a VectorIndexer based on config.embedding.backend.
-/// Falls back to Ollama if ort fails; returns None if neither is available.
+/// Create a VectorIndexer for the configured backend, with the e5 query/passage
+/// prefixes applied to *every* resolution path (primary and all fallbacks). The
+/// inner builder has several early returns; applying prefixes here — at the one
+/// exit — keeps a future backend arm from silently dropping them.
 pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
+    build_vector_indexer_inner(config).await.map(|vi| {
+        vi.with_prefixes(
+            config.embedding.query_prefix.clone().unwrap_or_default(),
+            config.embedding.passage_prefix.clone().unwrap_or_default(),
+        )
+    })
+}
+
+/// Resolve the backend and build the indexer (no prefixes — see the wrapper).
+/// Falls back to Ollama if ort fails; returns None if neither is available.
+async fn build_vector_indexer_inner(config: &Config) -> Option<VectorIndexer> {
     let indexer = match config.embedding.backend.as_str() {
         "ort" => {
             let model_dir = config
@@ -564,11 +577,6 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
         }
     };
 
-    let indexer = indexer.with_prefixes(
-        config.embedding.query_prefix.clone().unwrap_or_default(),
-        config.embedding.passage_prefix.clone().unwrap_or_default(),
-    );
-
     #[cfg(not(target_os = "windows"))]
     let indexer = attach_ann_index(indexer);
     Some(indexer)
@@ -649,15 +657,6 @@ fn attach_ann_index(indexer: VectorIndexer) -> VectorIndexer {
             indexer
         }
     }
-}
-
-fn default_model_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".cache")
-        .join("secall")
-        .join("models")
-        .join("bge-m3-onnx")
 }
 
 #[cfg(test)]

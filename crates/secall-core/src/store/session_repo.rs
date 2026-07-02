@@ -1442,6 +1442,62 @@ mod tests {
     }
 
     #[test]
+    fn test_actions_json_round_trip_for_embedding() {
+        use crate::ingest::{Action, AgentKind, Role, Session, TokenUsage, Turn};
+        use crate::store::SessionRepo;
+        use chrono::{TimeZone, Utc};
+
+        let db = Database::open_memory().unwrap();
+        let session = Session {
+            id: "sess-tool".to_string(),
+            agent: AgentKind::ClaudeCode,
+            model: None,
+            project: Some("p".to_string()),
+            cwd: None,
+            git_branch: None,
+            host: None,
+            start_time: Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+            end_time: None,
+            turns: vec![],
+            total_tokens: TokenUsage::default(),
+            session_type: "interactive".to_string(),
+            archived: false,
+            archived_at: None,
+        };
+        db.insert_session(&session).unwrap();
+        // Tool-only turn: empty content, one tool call. Without actions_json the
+        // deferred loader would restore empty actions → empty index text → skip.
+        let turn = Turn {
+            index: 0,
+            role: Role::Assistant,
+            timestamp: None,
+            content: String::new(),
+            actions: vec![Action::ToolUse {
+                name: "Bash".to_string(),
+                input_summary: "ls -la".to_string(),
+                output_summary: "files".to_string(),
+                tool_use_id: Some("t1".to_string()),
+            }],
+            tokens: None,
+            thinking: None,
+            is_sidechain: false,
+        };
+        db.insert_turn(&session.id, &turn).unwrap();
+
+        let loaded = db.get_session_for_embedding(&session.id).unwrap();
+        assert_eq!(loaded.turns.len(), 1);
+        assert_eq!(
+            loaded.turns[0].actions.len(),
+            1,
+            "actions restored from actions_json"
+        );
+        assert!(
+            loaded.turns[0].index_text().contains("[Tool: Bash] ls -la"),
+            "tool-only turn stays searchable after round-trip"
+        );
+    }
+
+    #[test]
     fn test_archive_session_sets_db_and_frontmatter() {
         use crate::vault::Vault;
         use tempfile::TempDir;

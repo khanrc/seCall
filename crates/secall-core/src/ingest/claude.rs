@@ -171,17 +171,15 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
 
                 // Parse usage
                 let usage = &message["usage"];
+                // Session totals are summed per-turn after the loop, not here:
+                // Claude Code repeats the same usage on every split event of one
+                // message, so accumulating per-event would multiply-count merged
+                // messages. Per-turn tokens (deduped by the merge) are the source.
                 let tokens = if !usage.is_null() {
-                    let input = usage["input_tokens"].as_u64().unwrap_or(0);
-                    let output = usage["output_tokens"].as_u64().unwrap_or(0);
-                    let cached = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-                    total_tokens.input += input;
-                    total_tokens.output += output;
-                    total_tokens.cached += cached;
                     Some(TokenUsage {
-                        input,
-                        output,
-                        cached,
+                        input: usage["input_tokens"].as_u64().unwrap_or(0),
+                        output: usage["output_tokens"].as_u64().unwrap_or(0),
+                        cached: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
                     })
                 } else {
                     None
@@ -317,6 +315,15 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
 
     let start_time = first_timestamp.unwrap_or_else(chrono::Utc::now);
     let end_time = last_timestamp;
+
+    // Sum session totals from the (merge-deduped) per-turn usage.
+    for turn in &turns {
+        if let Some(tk) = &turn.tokens {
+            total_tokens.input += tk.input;
+            total_tokens.output += tk.output;
+            total_tokens.cached += tk.cached;
+        }
+    }
 
     Ok(Session {
         id,
@@ -483,6 +490,53 @@ mod tests {
         assert!(a.index_text().contains("[Tool: Bash]"));
         // a different message.id starts a new turn
         assert_eq!(session.turns[2].content, "Done");
+    }
+
+    #[test]
+    fn test_merge_interleaved_parallel_tools() {
+        // One assistant message issues two tool calls; Claude Code interleaves
+        // tool_use / tool_result events, all under one message.id. Both results
+        // must attach to the right action in the single merged turn (this is
+        // what the pending-index offset exists for).
+        let lines = &[
+            r#"{"type":"user","message":{"role":"user","content":"do two things"},"timestamp":"2026-04-05T10:00:00Z","sessionId":"s6","cwd":"/p","gitBranch":"main"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"mp","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-04-05T10:00:01Z"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"OUT_ONE"}]},"timestamp":"2026-04-05T10:00:02Z"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"mp","content":[{"type":"tool_use","id":"t2","name":"Grep","input":{"pattern":"foo"}}]},"timestamp":"2026-04-05T10:00:03Z"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"OUT_TWO"}]},"timestamp":"2026-04-05T10:00:04Z"}"#,
+        ];
+        let f = write_jsonl(lines);
+        let s = parse_claude_jsonl(f.path()).unwrap();
+        assert_eq!(s.turns.len(), 2, "user + one merged assistant turn");
+        let a = &s.turns[1];
+        assert_eq!(a.actions.len(), 2, "both tool calls in the merged turn");
+        let outs: Vec<&str> = a
+            .actions
+            .iter()
+            .filter_map(|act| match act {
+                Action::ToolUse { output_summary, .. } => Some(output_summary.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(outs.contains(&"OUT_ONE"), "first tool_result attached");
+        assert!(outs.contains(&"OUT_TWO"), "second tool_result attached to offset action");
+    }
+
+    #[test]
+    fn test_split_message_tokens_counted_once() {
+        // One message split across two events repeats the same usage; the session
+        // total must count it once, not once per event.
+        let lines = &[
+            r#"{"type":"user","message":{"role":"user","content":"go"},"timestamp":"2026-04-05T10:00:00Z","sessionId":"s5","cwd":"/tmp","gitBranch":"main"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"mm","content":[{"type":"thinking","thinking":"hmm"}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":5}},"timestamp":"2026-04-05T10:00:01Z"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"mm","content":[{"type":"text","text":"answer"}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":5}},"timestamp":"2026-04-05T10:00:02Z"}"#,
+        ];
+        let f = write_jsonl(lines);
+        let s = parse_claude_jsonl(f.path()).unwrap();
+        assert_eq!(s.turns.len(), 2, "user + one merged assistant");
+        assert_eq!(s.total_tokens.input, 10, "repeated usage counted once");
+        assert_eq!(s.total_tokens.output, 20);
+        assert_eq!(s.total_tokens.cached, 5);
     }
 
     #[test]

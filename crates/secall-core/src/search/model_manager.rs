@@ -5,15 +5,18 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-// TODO(#1577): swap to the dragonkue ONNX host once provisioned (HF repo or a
-// khanrc/seCall release asset — hosting decision pending). dragonkue is a single
-// 449 MB model.onnx with NO external-data sidecar, so MODEL_DATA_URL becomes
-// None. Kept on bge-m3 until then; the manager already handles both shapes.
-const MODEL_URL: &str = "https://huggingface.co/BAAI/bge-m3/resolve/main/onnx/model.onnx";
-const MODEL_DATA_URL: Option<&str> =
-    Some("https://huggingface.co/BAAI/bge-m3/resolve/main/onnx/model.onnx_data");
-const TOKENIZER_URL: &str = "https://huggingface.co/BAAI/bge-m3/resolve/main/tokenizer.json";
-const HF_API_URL: &str = "https://huggingface.co/api/models/BAAI/bge-m3";
+// dragonkue/multilingual-e5-small-ko-v2, exported to ONNX for the ORT backend
+// (#1577). Single-file export — no external-data sidecar, so MODEL_DATA_URL is
+// None. tokenizer_config.json carries model_max_length, which the embedder uses
+// to cap tokenization at the model's real limit (512 here).
+const MODEL_NAME: &str = "dragonkue/multilingual-e5-small-ko-v2";
+const MODEL_URL: &str =
+    "https://huggingface.co/logan-cha/multilingual-e5-small-ko-v2-onnx/resolve/main/model.onnx";
+const MODEL_DATA_URL: Option<&str> = None;
+const TOKENIZER_URL: &str =
+    "https://huggingface.co/logan-cha/multilingual-e5-small-ko-v2-onnx/resolve/main/tokenizer.json";
+const TOKENIZER_CONFIG_URL: &str = "https://huggingface.co/logan-cha/multilingual-e5-small-ko-v2-onnx/resolve/main/tokenizer_config.json";
+const HF_API_URL: &str = "https://huggingface.co/api/models/logan-cha/multilingual-e5-small-ko-v2-onnx";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionInfo {
@@ -59,11 +62,26 @@ impl ModelManager {
 
     pub fn is_downloaded(&self) -> bool {
         // model.onnx_data only exists for models exported in ONNX external-data
-        // format (bge-m3, >2GB). Single-file models (dragonkue, 449MB) have none.
+        // format (>2GB). Single-file exports (dragonkue, 449MB) have none.
         let data_ok = MODEL_DATA_URL.is_none() || self.model_dir.join("model.onnx_data").exists();
-        self.model_dir.join("model.onnx").exists()
+        let files_ok = self.model_dir.join("model.onnx").exists()
             && data_ok
             && self.model_dir.join("tokenizer.json").exists()
+            && self.model_dir.join("tokenizer_config.json").exists();
+        if !files_ok {
+            return false;
+        }
+        // Re-download if the installed model isn't the one we now target (e.g. a
+        // stale bge-m3 dir after the dragonkue switch). No version.json (legacy)
+        // → trust the files present.
+        self.installed_version()
+            .map(|v| v.model == MODEL_NAME)
+            .unwrap_or(true)
+    }
+
+    fn installed_version(&self) -> Option<VersionInfo> {
+        let raw = std::fs::read_to_string(self.model_dir.join("version.json")).ok()?;
+        serde_json::from_str(&raw).ok()
     }
 
     pub async fn download(&self, force: bool) -> Result<()> {
@@ -93,8 +111,14 @@ impl ModelManager {
             .await
             .context("failed to download tokenizer.json")?;
 
+        // Carries model_max_length → the embedder caps tokenization at the
+        // model's real limit (512 for e5) instead of erroring on overflow.
+        self.download_file(TOKENIZER_CONFIG_URL, "tokenizer_config.json")
+            .await
+            .context("failed to download tokenizer_config.json")?;
+
         let version = VersionInfo {
-            model: "BAAI/bge-m3".to_string(),
+            model: MODEL_NAME.to_string(),
             downloaded_at: chrono::Utc::now().to_rfc3339(),
             sha256_model: model_sha,
             sha256_model_data: model_data_sha,
@@ -252,7 +276,9 @@ pub fn default_model_path() -> PathBuf {
         .join(".cache")
         .join("secall")
         .join("models")
-        .join("bge-m3-onnx")
+        // Model-specific dir: the dragonkue export lives beside any stale
+        // bge-m3-onnx dir rather than overwriting it, so the switch is clean.
+        .join("dragonkue-e5-onnx")
 }
 
 #[cfg(test)]
@@ -286,7 +312,7 @@ mod tests {
     #[test]
     fn test_default_model_path() {
         let path = default_model_path();
-        assert!(path.to_str().unwrap().contains("bge-m3-onnx"));
+        assert!(path.to_str().unwrap().contains("dragonkue-e5-onnx"));
     }
 
     #[test]
