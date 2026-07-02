@@ -1,7 +1,24 @@
+use std::sync::OnceLock;
+
 use crate::ingest::Session;
 
-const MAX_CHUNK_CHARS: usize = 3600;
-const OVERLAP_CHARS: usize = 540; // ~15%
+// We split on the model tokenizer so a chunk never overflows the model's
+// max_seq and gets silently truncated (the char-based 3600 cap did exactly that
+// for Korean — ~2 chars/token — losing the tail of long turns). The budget is
+// derived from the model's own model_max_length minus RESERVE_TOKENS, since the
+// embedded sequence is `<e5 prefix> + chunk + 2 special tokens`: ~4 prefix + 2
+// specials + margin. So an e5 512-model → 500, bge-m3 8192 → 8180, automatically.
+// `embedding.max_chunk_tokens` overrides; DEFAULT is the last-resort fallback
+// when model_max_length can't be read. Overlap is ~15%, overridable too.
+const RESERVE_TOKENS: usize = 12;
+const DEFAULT_MAX_CHUNK_TOKENS: usize = 500;
+const DEFAULT_OVERLAP_TOKENS: usize = 75;
+
+// Fallback char budget when the model tokenizer isn't on disk (unit tests, or
+// before the model is downloaded). Conservative: 1000 chars stays under 510
+// tokens even for dense Korean (~2 chars/token).
+const FALLBACK_MAX_CHUNK_CHARS: usize = 1000;
+const FALLBACK_OVERLAP_CHARS: usize = 150;
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -25,63 +42,152 @@ pub fn chunk_session(session: &Session, tz: chrono_tz::Tz) -> Vec<Chunk> {
             turn.role.as_str(),
         );
 
-        let text = build_turn_text(turn);
+        // index_text() folds tool-call summaries into the embedded/BM25 text so
+        // tool-only assistant turns (empty content) stay searchable (#1585).
+        let text = turn.index_text();
         if text.is_empty() {
             continue;
         }
 
-        if text.len() <= MAX_CHUNK_CHARS {
+        for (seq, chunk_text) in split_turn_text(&text).into_iter().enumerate() {
             chunks.push(Chunk {
                 session_id: session.id.clone(),
                 turn_index: turn.index,
-                seq: 0,
-                text,
+                seq: seq as u32,
+                text: chunk_text,
                 context: context.clone(),
             });
-        } else {
-            let turn_chunks = split_into_chunks(&text, MAX_CHUNK_CHARS, OVERLAP_CHARS);
-            for (seq, chunk_text) in turn_chunks.into_iter().enumerate() {
-                chunks.push(Chunk {
-                    session_id: session.id.clone(),
-                    turn_index: turn.index,
-                    seq: seq as u32,
-                    text: chunk_text,
-                    context: context.clone(),
-                });
-            }
         }
     }
 
     chunks
 }
 
-fn build_turn_text(turn: &crate::ingest::Turn) -> String {
-    let mut parts = Vec::new();
-
-    if !turn.content.is_empty() {
-        parts.push(turn.content.clone());
+/// Split one turn's text into chunks that stay within the embedding model's
+/// token budget. Uses the model tokenizer when available (token-precise, the
+/// dragonkue/e5 path); falls back to a conservative char split otherwise.
+fn split_turn_text(text: &str) -> Vec<String> {
+    let cfg = chunker_config();
+    if let Some(tok) = &cfg.tokenizer {
+        return split_by_tokens(text, tok, cfg.max_tokens, cfg.overlap);
     }
+    split_into_chunks(text, FALLBACK_MAX_CHUNK_CHARS, FALLBACK_OVERLAP_CHARS)
+}
 
-    if let Some(thinking) = &turn.thinking {
-        parts.push(thinking.clone());
-    }
+struct ChunkerConfig {
+    /// The embedding model's tokenizer (`None` → char fallback: model not on
+    /// disk, e.g. tests / fresh install).
+    tokenizer: Option<tokenizers::Tokenizer>,
+    max_tokens: usize,
+    overlap: usize,
+}
 
-    for action in &turn.actions {
-        if let crate::ingest::Action::ToolUse {
-            name,
-            input_summary,
-            output_summary,
-            ..
-        } = action
-        {
-            parts.push(format!(
-                "[Tool: {}] {} {}",
-                name, input_summary, output_summary
-            ));
+/// Lazily resolve the chunker's config once. The tokenizer is loaded from the
+/// same path the embedder uses (`config.embedding.model_path`, else default) so
+/// token counts match what the model is actually fed; truncation is forced off
+/// so a tokenizer that shipped a truncation setting can't silently cap `encode`
+/// and hide the tail-loss this chunker exists to prevent. The token budget /
+/// overlap come from config (`embedding.max_chunk_tokens` / `overlap_tokens`),
+/// defaulting to the e5-512-safe values.
+fn chunker_config() -> &'static ChunkerConfig {
+    static CFG: OnceLock<ChunkerConfig> = OnceLock::new();
+    CFG.get_or_init(|| {
+        let cfg = crate::vault::Config::load_or_default();
+        let model_dir = cfg
+            .embedding
+            .model_path
+            .clone()
+            .unwrap_or_else(crate::search::model_manager::default_model_path);
+        let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
+            .ok()
+            .map(|mut t| {
+                t.with_truncation(None).ok();
+                t
+            });
+        // Budget derives from the model's real limit; an explicit override is
+        // still clamped to it (a chunk larger than the model can never help —
+        // it would just get truncated). Everything stays ≥1. When the model
+        // limit is unknown we trust the override, else the fallback default.
+        let model_budget = crate::search::model_manager::read_model_max_length(&model_dir)
+            .map(|m| m.saturating_sub(RESERVE_TOKENS).max(1));
+        let max_tokens = match (cfg.embedding.max_chunk_tokens, model_budget) {
+            (Some(ovr), Some(limit)) => ovr.clamp(1, limit),
+            (Some(ovr), None) => ovr.max(1),
+            (None, Some(limit)) => limit,
+            (None, None) => DEFAULT_MAX_CHUNK_TOKENS,
+        };
+        // Overlap must leave a positive stride, or windowing can't advance.
+        let overlap = cfg
+            .embedding
+            .overlap_tokens
+            .unwrap_or(DEFAULT_OVERLAP_TOKENS)
+            .min(max_tokens.saturating_sub(1));
+        ChunkerConfig {
+            tokenizer,
+            max_tokens,
+            overlap,
         }
+    })
+}
+
+/// Token-precise windowing. Encodes without special tokens, then slices the
+/// original text at the byte offsets of token boundaries so each window holds
+/// at most `max_tokens` content tokens, with `overlap` tokens of carry-over.
+fn split_by_tokens(
+    text: &str,
+    tokenizer: &tokenizers::Tokenizer,
+    max_tokens: usize,
+    overlap: usize,
+) -> Vec<String> {
+    // Guarantee a positive stride so the window always advances (overlap ==
+    // max_tokens would otherwise loop forever). Defensive at the boundary.
+    let max_tokens = max_tokens.max(1);
+    let overlap = overlap.min(max_tokens - 1);
+    let encoding = match tokenizer.encode(text, false) {
+        Ok(e) => e,
+        Err(_) => return split_into_chunks(text, FALLBACK_MAX_CHUNK_CHARS, FALLBACK_OVERLAP_CHARS),
+    };
+    let offsets = encoding.get_offsets();
+    let n = offsets.len();
+    if n <= max_tokens {
+        return vec![text.to_string()];
     }
 
-    parts.join("\n\n")
+    let mut chunks = Vec::new();
+    let mut start_tok = 0;
+    while start_tok < n {
+        let end_tok = (start_tok + max_tokens).min(n);
+        let start_byte = clamp_boundary(text, offsets[start_tok].0);
+        let end_byte = if end_tok < n {
+            clamp_boundary(text, offsets[end_tok].0)
+        } else {
+            text.len()
+        };
+        if end_byte > start_byte {
+            chunks.push(text[start_byte..end_byte].to_string());
+        }
+        if end_tok >= n {
+            break;
+        }
+        start_tok = end_tok.saturating_sub(overlap);
+    }
+    if chunks.is_empty() {
+        chunks.push(text.to_string());
+    }
+    chunks
+}
+
+/// Round a byte index down to the nearest UTF-8 char boundary. Tokenizer
+/// offsets are char-aligned in practice, but a normalizer can shift them; this
+/// keeps slicing panic-free.
+fn clamp_boundary(text: &str, mut idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
 }
 
 fn split_into_chunks(text: &str, max_size: usize, overlap: usize) -> Vec<String> {
@@ -210,5 +316,40 @@ mod tests {
                 assert_eq!(chunk.seq, i as u32);
             }
         }
+    }
+
+    #[test]
+    fn test_split_by_tokens_windows_within_budget_with_overlap() {
+        use std::collections::HashMap;
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+        use tokenizers::Tokenizer;
+
+        // Trivial word-level tokenizer: one token per whitespace-delimited word,
+        // so token counts are deterministic (no on-disk model needed).
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for i in 0..40u32 {
+            vocab.insert(format!("w{i}"), i);
+        }
+        vocab.insert("[UNK]".to_string(), 40);
+        let model = WordLevel::builder()
+            .vocab(vocab.into_iter().collect()) // infers the builder's AHashMap
+            .unk_token("[UNK]".to_string())
+            .build()
+            .unwrap();
+        let mut tok = Tokenizer::new(model);
+        tok.with_pre_tokenizer(Some(Whitespace::default()));
+
+        let text = (0..20).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let chunks = split_by_tokens(&text, &tok, 5, 2);
+
+        assert!(chunks.len() > 1, "20 tokens / budget 5 → multiple chunks");
+        for c in &chunks {
+            let n = tok.encode(c.as_str(), false).unwrap().get_ids().len();
+            assert!(n <= 5, "chunk exceeds token budget: {n} tokens in {c:?}");
+        }
+        // First and last original tokens are covered (no head/tail loss).
+        assert!(chunks[0].contains("w0"));
+        assert!(chunks.last().unwrap().contains("w19"));
     }
 }

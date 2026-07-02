@@ -11,7 +11,7 @@ use super::ann::AnnIndex;
 use super::bm25::{IndexStats, SearchFilters, SearchResult, SessionMeta};
 use super::chunker::chunk_session;
 use super::embedding::{Embedder, OllamaEmbedder, OpenAIEmbedder, OrtEmbedder};
-use super::model_manager::ModelManager;
+use super::model_manager::{default_model_path, ModelManager};
 use crate::ingest::Session;
 use crate::store::db::Database;
 use crate::store::{SessionRepo, VectorRepo};
@@ -37,6 +37,10 @@ pub struct VectorIndexer {
     #[cfg(not(target_os = "windows"))]
     ann_index: Option<AnnIndex>,
     batch_size: usize,
+    /// e5-style prefixes (dragonkue). Empty for bge-m3. Applied symmetrically:
+    /// passage_prefix on indexed chunks, query_prefix on search queries.
+    query_prefix: String,
+    passage_prefix: String,
 }
 
 impl VectorIndexer {
@@ -46,7 +50,16 @@ impl VectorIndexer {
             #[cfg(not(target_os = "windows"))]
             ann_index: None,
             batch_size: 32,
+            query_prefix: String::new(),
+            passage_prefix: String::new(),
         }
+    }
+
+    /// Set the e5 query/passage prefixes. Empty strings are a no-op (bge-m3).
+    pub fn with_prefixes(mut self, query_prefix: impl Into<String>, passage_prefix: impl Into<String>) -> Self {
+        self.query_prefix = query_prefix.into();
+        self.passage_prefix = passage_prefix.into();
+        self
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -58,6 +71,13 @@ impl VectorIndexer {
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size.max(1);
         self
+    }
+
+    /// The active embedding model's name (model-dir basename for ORT, provider
+    /// model id otherwise). Used to reconcile the vector store's single-model
+    /// invariant before an embed pass.
+    pub fn model_name(&self) -> &str {
+        self.embedder.model_name()
     }
 
     /// ANN 인덱스를 파일에 저장. 존재하지 않으면 no-op.
@@ -124,8 +144,13 @@ impl VectorIndexer {
             return Ok(IndexStats::default());
         }
 
-        // Phase 1: 임베딩 계산 — 트랜잭션 밖에서 수행 (CPU 시간 동안 DB lock 없음)
-        let texts: Vec<&str> = pending_chunks.iter().map(|c| c.text.as_str()).collect();
+        // Phase 1: 임베딩 계산 — 트랜잭션 밖에서 수행 (CPU 시간 동안 DB lock 없음).
+        // passage_prefix (e5 "passage: ") is prepended here; empty for bge-m3.
+        let prefixed_texts: Vec<String> = pending_chunks
+            .iter()
+            .map(|c| format!("{}{}", self.passage_prefix, c.text))
+            .collect();
+        let texts: Vec<&str> = prefixed_texts.iter().map(|s| s.as_str()).collect();
         let batch_size = self.batch_size;
         let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; pending_chunks.len()];
         let mut embed_errors = 0usize;
@@ -245,14 +270,21 @@ impl VectorIndexer {
         filters: &SearchFilters,
         candidate_session_ids: Option<&[String]>,
     ) -> Result<Vec<SearchResult>> {
-        let query_embedding = self.embedder.embed(query).await?;
+        let query_embedding = self.embed_query(query).await?;
         // ANN-aware 경로를 공통으로 사용
         self.search_with_embedding(db, &query_embedding, limit, filters, candidate_session_ids)
     }
 
     /// Embed a query string without DB access (safe to call before locking DB mutex).
     pub async fn embed_query(&self, query: &str) -> anyhow::Result<Vec<f32>> {
-        self.embedder.embed(query).await
+        // query_prefix (e5 "query: ") prepended; empty for bge-m3.
+        if self.query_prefix.is_empty() {
+            self.embedder.embed(query).await
+        } else {
+            self.embedder
+                .embed(&format!("{}{}", self.query_prefix, query))
+                .await
+        }
     }
 
     /// Search vectors using a pre-computed embedding (sync, no async needed).
@@ -428,7 +460,10 @@ fn resolve_pool_size(config: &crate::vault::config::Config) -> usize {
     }
 }
 
-/// Create a VectorIndexer based on config.embedding.backend.
+/// Create a VectorIndexer for the configured backend. The e5 query/passage
+/// prefixes are bound to the ORT model (model_manager::model_prefixes) and
+/// applied only on the ORT paths — they are a property of that model, not a
+/// user setting, so a non-e5 backend (ollama/openai) never carries them.
 /// Falls back to Ollama if ort fails; returns None if neither is available.
 pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
     let indexer = match config.embedding.backend.as_str() {
@@ -456,7 +491,8 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                         pool_size = pool,
                         "ort ONNX loaded, local vector search enabled"
                     );
-                    VectorIndexer::new(Box::new(e))
+                    let (qp, pp) = super::model_manager::installed_prefixes(&model_dir);
+                    VectorIndexer::new(Box::new(e)).with_prefixes(qp, pp)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "ort load failed, trying Ollama fallback");
@@ -486,7 +522,9 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
             match crate::search::embedding::OpenVinoEmbedder::new(&model_dir, device, ov_dir) {
                 Ok(e) => {
                     tracing::info!(device = %e.device, "OpenVINO loaded, NPU vector search enabled");
-                    VectorIndexer::new(Box::new(e))
+                    // Same model as the ORT path → same e5 prefixes.
+                    let (qp, pp) = super::model_manager::installed_prefixes(&model_dir);
+                    VectorIndexer::new(Box::new(e)).with_prefixes(qp, pp)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "OpenVINO load failed, trying ORT CPU fallback");
@@ -560,7 +598,8 @@ async fn try_ort_cpu_fallback(config: &Config) -> Option<VectorIndexer> {
                 pool_size = pool,
                 "ORT CPU fallback loaded, vector search enabled"
             );
-            let indexer = VectorIndexer::new(Box::new(e));
+            let (qp, pp) = super::model_manager::installed_prefixes(&model_dir);
+            let indexer = VectorIndexer::new(Box::new(e)).with_prefixes(qp, pp);
             #[cfg(not(target_os = "windows"))]
             let indexer = attach_ann_index(indexer);
             Some(indexer)
@@ -619,15 +658,6 @@ fn attach_ann_index(indexer: VectorIndexer) -> VectorIndexer {
             indexer
         }
     }
-}
-
-fn default_model_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".cache")
-        .join("secall")
-        .join("models")
-        .join("bge-m3-onnx")
 }
 
 #[cfg(test)]

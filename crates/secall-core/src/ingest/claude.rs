@@ -49,6 +49,11 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
     // Pending tool_use entries keyed by tool_use_id waiting for tool_result
     let mut pending_tool_uses: HashMap<String, usize> = HashMap::new(); // tool_use_id -> action index in last assistant turn
 
+    // message.id of the last assistant turn, to merge Claude Code's split
+    // streaming events (thinking / text / tool_use of one message arrive as
+    // separate events sharing an id) into a single Turn (#1585 WS2).
+    let mut last_asst_msg_id: Option<String> = None;
+
     let mut line_count = 0;
 
     for line in reader.lines() {
@@ -166,17 +171,15 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
 
                 // Parse usage
                 let usage = &message["usage"];
+                // Session totals are summed per-turn after the loop, not here:
+                // Claude Code repeats the same usage on every split event of one
+                // message, so accumulating per-event would multiply-count merged
+                // messages. Per-turn tokens (deduped by the merge) are the source.
                 let tokens = if !usage.is_null() {
-                    let input = usage["input_tokens"].as_u64().unwrap_or(0);
-                    let output = usage["output_tokens"].as_u64().unwrap_or(0);
-                    let cached = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-                    total_tokens.input += input;
-                    total_tokens.output += output;
-                    total_tokens.cached += cached;
                     Some(TokenUsage {
-                        input,
-                        output,
-                        cached,
+                        input: usage["input_tokens"].as_u64().unwrap_or(0),
+                        output: usage["output_tokens"].as_u64().unwrap_or(0),
+                        cached: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
                     })
                 } else {
                     None
@@ -223,8 +226,6 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
                     }
                 }
 
-                pending_tool_uses = new_pending;
-
                 let content = text_parts.join("\n\n");
                 let thinking = if thinking_parts.is_empty() {
                     None
@@ -232,17 +233,60 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
                     Some(thinking_parts.join("\n\n"))
                 };
 
-                let turn = Turn {
-                    index: turns.len() as u32,
-                    role: Role::Assistant,
-                    timestamp: ts,
-                    content,
-                    actions,
-                    tokens,
-                    thinking,
-                    is_sidechain,
-                };
-                turns.push(turn);
+                // Merge into the previous turn when it is the same assistant
+                // message split across events; otherwise start a new turn. The
+                // role check guards against merging across an intervening user
+                // turn (message ids are unique per message anyway).
+                let msg_id = message["id"].as_str().map(|s| s.to_string());
+                let merge = msg_id.is_some()
+                    && msg_id == last_asst_msg_id
+                    && turns.last().map(|t| t.role == Role::Assistant).unwrap_or(false);
+
+                if merge {
+                    let last = turns.last_mut().unwrap();
+                    let action_base = last.actions.len();
+                    if !content.is_empty() {
+                        if last.content.is_empty() {
+                            last.content = content;
+                        } else {
+                            last.content.push_str("\n\n");
+                            last.content.push_str(&content);
+                        }
+                    }
+                    if let Some(tk) = thinking {
+                        match last.thinking.as_mut() {
+                            Some(existing) => {
+                                existing.push_str("\n\n");
+                                existing.push_str(&tk);
+                            }
+                            None => last.thinking = Some(tk),
+                        }
+                    }
+                    last.actions.extend(actions);
+                    // usage repeats across a message's events; keep the latest.
+                    if tokens.is_some() {
+                        last.tokens = tokens;
+                    }
+                    // new tool_uses land after the pre-merge actions — offset
+                    // their pending indices so tool_result attaches correctly.
+                    for (k, v) in new_pending {
+                        pending_tool_uses.insert(k, v + action_base);
+                    }
+                } else {
+                    let turn = Turn {
+                        index: turns.len() as u32,
+                        role: Role::Assistant,
+                        timestamp: ts,
+                        content,
+                        actions,
+                        tokens,
+                        thinking,
+                        is_sidechain,
+                    };
+                    turns.push(turn);
+                    pending_tool_uses = new_pending;
+                }
+                last_asst_msg_id = msg_id;
             }
 
             // Skip non-conversation message types
@@ -271,6 +315,15 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
 
     let start_time = first_timestamp.unwrap_or_else(chrono::Utc::now);
     let end_time = last_timestamp;
+
+    // Sum session totals from the (merge-deduped) per-turn usage.
+    for turn in &turns {
+        if let Some(tk) = &turn.tokens {
+            total_tokens.input += tk.input;
+            total_tokens.output += tk.output;
+            total_tokens.cached += tk.cached;
+        }
+    }
 
     Ok(Session {
         id,
@@ -394,6 +447,96 @@ mod tests {
         assert_eq!(session.turns[0].role, Role::User);
         assert_eq!(session.turns[1].role, Role::Assistant);
         assert_eq!(session.model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn test_merge_split_assistant_message() {
+        // Claude Code streams one assistant message's blocks (thinking / text /
+        // tool_use) as separate events sharing a message.id; they must collapse
+        // into one turn, preserving thinking and attaching the tool_result to
+        // the merged turn's action (#1585 WS2).
+        let lines = &[
+            r#"{"type":"user","message":{"role":"user","content":"run ls"},"timestamp":"2026-04-05T10:00:00Z","sessionId":"s1","cwd":"/p","gitBranch":"main"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"msg_A","model":"claude","content":[{"type":"thinking","thinking":"let me think"}],"usage":{"output_tokens":3}},"timestamp":"2026-04-05T10:00:01Z"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"msg_A","content":[{"type":"text","text":"Listing now"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-04-05T10:00:02Z"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"file1\nfile2"}]},"timestamp":"2026-04-05T10:00:03Z"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"msg_B","content":[{"type":"text","text":"Done"}]},"timestamp":"2026-04-05T10:00:04Z"}"#,
+        ];
+        let f = write_jsonl(lines);
+        let session = parse_claude_jsonl(f.path()).unwrap();
+
+        // user, merged assistant (msg_A), separate assistant (msg_B)
+        assert_eq!(session.turns.len(), 3);
+        let a = &session.turns[1];
+        assert_eq!(a.role, Role::Assistant);
+        assert_eq!(a.thinking.as_deref(), Some("let me think"));
+        assert_eq!(a.content, "Listing now");
+        assert_eq!(a.actions.len(), 1);
+        match &a.actions[0] {
+            Action::ToolUse {
+                name,
+                output_summary,
+                ..
+            } => {
+                assert_eq!(name, "Bash");
+                assert!(
+                    output_summary.contains("file1"),
+                    "tool_result must attach to the merged turn's action"
+                );
+            }
+            _ => panic!("expected ToolUse action"),
+        }
+        // tool text is folded into the indexed text so the turn stays searchable
+        assert!(a.index_text().contains("[Tool: Bash]"));
+        // a different message.id starts a new turn
+        assert_eq!(session.turns[2].content, "Done");
+    }
+
+    #[test]
+    fn test_merge_interleaved_parallel_tools() {
+        // One assistant message issues two tool calls; Claude Code interleaves
+        // tool_use / tool_result events, all under one message.id. Both results
+        // must attach to the right action in the single merged turn (this is
+        // what the pending-index offset exists for).
+        let lines = &[
+            r#"{"type":"user","message":{"role":"user","content":"do two things"},"timestamp":"2026-04-05T10:00:00Z","sessionId":"s6","cwd":"/p","gitBranch":"main"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"mp","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-04-05T10:00:01Z"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"OUT_ONE"}]},"timestamp":"2026-04-05T10:00:02Z"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"mp","content":[{"type":"tool_use","id":"t2","name":"Grep","input":{"pattern":"foo"}}]},"timestamp":"2026-04-05T10:00:03Z"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"OUT_TWO"}]},"timestamp":"2026-04-05T10:00:04Z"}"#,
+        ];
+        let f = write_jsonl(lines);
+        let s = parse_claude_jsonl(f.path()).unwrap();
+        assert_eq!(s.turns.len(), 2, "user + one merged assistant turn");
+        let a = &s.turns[1];
+        assert_eq!(a.actions.len(), 2, "both tool calls in the merged turn");
+        let outs: Vec<&str> = a
+            .actions
+            .iter()
+            .filter_map(|act| match act {
+                Action::ToolUse { output_summary, .. } => Some(output_summary.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(outs.contains(&"OUT_ONE"), "first tool_result attached");
+        assert!(outs.contains(&"OUT_TWO"), "second tool_result attached to offset action");
+    }
+
+    #[test]
+    fn test_split_message_tokens_counted_once() {
+        // One message split across two events repeats the same usage; the session
+        // total must count it once, not once per event.
+        let lines = &[
+            r#"{"type":"user","message":{"role":"user","content":"go"},"timestamp":"2026-04-05T10:00:00Z","sessionId":"s5","cwd":"/tmp","gitBranch":"main"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"mm","content":[{"type":"thinking","thinking":"hmm"}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":5}},"timestamp":"2026-04-05T10:00:01Z"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"mm","content":[{"type":"text","text":"answer"}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":5}},"timestamp":"2026-04-05T10:00:02Z"}"#,
+        ];
+        let f = write_jsonl(lines);
+        let s = parse_claude_jsonl(f.path()).unwrap();
+        assert_eq!(s.turns.len(), 2, "user + one merged assistant");
+        assert_eq!(s.total_tokens.input, 10, "repeated usage counted once");
+        assert_eq!(s.total_tokens.output, 20);
+        assert_eq!(s.total_tokens.cached, 5);
     }
 
     #[test]

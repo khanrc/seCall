@@ -5,10 +5,51 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const MODEL_URL: &str = "https://huggingface.co/BAAI/bge-m3/resolve/main/onnx/model.onnx";
-const MODEL_DATA_URL: &str = "https://huggingface.co/BAAI/bge-m3/resolve/main/onnx/model.onnx_data";
-const TOKENIZER_URL: &str = "https://huggingface.co/BAAI/bge-m3/resolve/main/tokenizer.json";
-const HF_API_URL: &str = "https://huggingface.co/api/models/BAAI/bge-m3";
+// dragonkue/multilingual-e5-small-ko-v2, exported to ONNX for the ORT backend
+// (#1577). Single-file export — no external-data sidecar, so MODEL_DATA_URL is
+// None. tokenizer_config.json carries model_max_length, which the embedder uses
+// to cap tokenization at the model's real limit (512 here).
+const MODEL_NAME: &str = "dragonkue/multilingual-e5-small-ko-v2";
+const MODEL_URL: &str =
+    "https://huggingface.co/logan-cha/multilingual-e5-small-ko-v2-onnx/resolve/main/model.onnx";
+const MODEL_DATA_URL: Option<&str> = None;
+const TOKENIZER_URL: &str =
+    "https://huggingface.co/logan-cha/multilingual-e5-small-ko-v2-onnx/resolve/main/tokenizer.json";
+const TOKENIZER_CONFIG_URL: &str = "https://huggingface.co/logan-cha/multilingual-e5-small-ko-v2-onnx/resolve/main/tokenizer_config.json";
+const HF_API_URL: &str = "https://huggingface.co/api/models/logan-cha/multilingual-e5-small-ko-v2-onnx";
+
+// The e5 family requires these instruction prefixes on inputs; retrieval quality
+// silently degrades without them. They are a property of THIS model, stamped into
+// version.json at download so the prefix is bound to the artifact (read back by
+// `installed_prefixes`), not to the backend — a different model in the dir can't
+// inherit e5's prefix.
+const MODEL_QUERY_PREFIX: &str = "query: ";
+const MODEL_PASSAGE_PREFIX: &str = "passage: ";
+
+/// The query/passage prefixes recorded in a model dir's version.json. Empty
+/// (no prefix) when there's no version.json or it predates the field — the safe
+/// default for a manually-placed or non-e5 model.
+pub fn installed_prefixes(model_dir: &std::path::Path) -> (String, String) {
+    let raw = match std::fs::read_to_string(model_dir.join("version.json")) {
+        Ok(r) => r,
+        Err(_) => return (String::new(), String::new()),
+    };
+    match serde_json::from_str::<VersionInfo>(&raw) {
+        Ok(v) => (v.query_prefix, v.passage_prefix),
+        Err(_) => (String::new(), String::new()),
+    }
+}
+
+/// Read `model_max_length` from a model dir's tokenizer_config.json, if it is a
+/// sane bound. `None` when absent or the "effectively unlimited" sentinel some
+/// tokenizers ship (~1e30). Shared by the embedder (truncation cap) and the
+/// chunker (token budget) so both derive the limit from the same source.
+pub fn read_model_max_length(model_dir: &std::path::Path) -> Option<usize> {
+    let raw = std::fs::read_to_string(model_dir.join("tokenizer_config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let n = v.get("model_max_length")?.as_u64()?;
+    (1..=100_000).contains(&n).then_some(n as usize)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionInfo {
@@ -19,6 +60,14 @@ pub struct VersionInfo {
     pub sha256_model_data: Option<String>,
     pub sha256_tokenizer: String,
     pub source_revision: String,
+    /// e5 instruction prefixes this model requires, stamped at download so the
+    /// prefix travels with the artifact — a model dir without version.json (a
+    /// manually-placed / non-e5 model) yields no prefix rather than wrongly
+    /// inheriting e5's.
+    #[serde(default)]
+    pub query_prefix: String,
+    #[serde(default)]
+    pub passage_prefix: String,
 }
 
 #[derive(Debug)]
@@ -53,9 +102,27 @@ impl ModelManager {
     }
 
     pub fn is_downloaded(&self) -> bool {
-        self.model_dir.join("model.onnx").exists()
-            && self.model_dir.join("model.onnx_data").exists()
+        // model.onnx_data only exists for models exported in ONNX external-data
+        // format (>2GB). Single-file exports (dragonkue, 449MB) have none.
+        let data_ok = MODEL_DATA_URL.is_none() || self.model_dir.join("model.onnx_data").exists();
+        let files_ok = self.model_dir.join("model.onnx").exists()
+            && data_ok
             && self.model_dir.join("tokenizer.json").exists()
+            && self.model_dir.join("tokenizer_config.json").exists();
+        if !files_ok {
+            return false;
+        }
+        // Re-download if the installed model isn't the one we now target (e.g. a
+        // stale bge-m3 dir after the dragonkue switch). No version.json (legacy)
+        // → trust the files present.
+        self.installed_version()
+            .map(|v| v.model == MODEL_NAME)
+            .unwrap_or(true)
+    }
+
+    fn installed_version(&self) -> Option<VersionInfo> {
+        let raw = std::fs::read_to_string(self.model_dir.join("version.json")).ok()?;
+        serde_json::from_str(&raw).ok()
     }
 
     pub async fn download(&self, force: bool) -> Result<()> {
@@ -70,23 +137,36 @@ impl ModelManager {
             .await
             .context("failed to download model.onnx")?;
 
-        let model_data_sha = self
-            .download_file(MODEL_DATA_URL, "model.onnx_data")
-            .await
-            .context("failed to download model.onnx_data")?;
+        let model_data_sha = if let Some(url) = MODEL_DATA_URL {
+            Some(
+                self.download_file(url, "model.onnx_data")
+                    .await
+                    .context("failed to download model.onnx_data")?,
+            )
+        } else {
+            None
+        };
 
         let tokenizer_sha = self
             .download_file(TOKENIZER_URL, "tokenizer.json")
             .await
             .context("failed to download tokenizer.json")?;
 
+        // Carries model_max_length → the embedder caps tokenization at the
+        // model's real limit (512 for e5) instead of erroring on overflow.
+        self.download_file(TOKENIZER_CONFIG_URL, "tokenizer_config.json")
+            .await
+            .context("failed to download tokenizer_config.json")?;
+
         let version = VersionInfo {
-            model: "BAAI/bge-m3".to_string(),
+            model: MODEL_NAME.to_string(),
             downloaded_at: chrono::Utc::now().to_rfc3339(),
             sha256_model: model_sha,
-            sha256_model_data: Some(model_data_sha),
+            sha256_model_data: model_data_sha,
             sha256_tokenizer: tokenizer_sha,
             source_revision: "main".to_string(),
+            query_prefix: MODEL_QUERY_PREFIX.to_string(),
+            passage_prefix: MODEL_PASSAGE_PREFIX.to_string(),
         };
         let version_path = self.model_dir.join("version.json");
         std::fs::write(&version_path, serde_json::to_string_pretty(&version)?)
@@ -239,7 +319,9 @@ pub fn default_model_path() -> PathBuf {
         .join(".cache")
         .join("secall")
         .join("models")
-        .join("bge-m3-onnx")
+        // Model-specific dir: the dragonkue export lives beside any stale
+        // bge-m3-onnx dir rather than overwriting it, so the switch is clean.
+        .join("dragonkue-e5-onnx")
 }
 
 #[cfg(test)]
@@ -263,6 +345,8 @@ mod tests {
             sha256_model_data: Some("ghi789".to_string()),
             sha256_tokenizer: "def456".to_string(),
             source_revision: "main".to_string(),
+            query_prefix: String::new(),
+            passage_prefix: String::new(),
         };
         let json = serde_json::to_string(&v).unwrap();
         let v2: VersionInfo = serde_json::from_str(&json).unwrap();
@@ -273,7 +357,27 @@ mod tests {
     #[test]
     fn test_default_model_path() {
         let path = default_model_path();
-        assert!(path.to_str().unwrap().contains("bge-m3-onnx"));
+        assert!(path.to_str().unwrap().contains("dragonkue-e5-onnx"));
+    }
+
+    #[test]
+    fn test_installed_prefixes_from_version_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No version.json → no prefix (safe default for a non-e5 / manual dir).
+        assert_eq!(
+            installed_prefixes(tmp.path()),
+            (String::new(), String::new())
+        );
+        // With version.json carrying prefixes → read them back.
+        std::fs::write(
+            tmp.path().join("version.json"),
+            r#"{"model":"m","downloaded_at":"t","sha256_model":"a","sha256_tokenizer":"b","source_revision":"main","query_prefix":"query: ","passage_prefix":"passage: "}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            installed_prefixes(tmp.path()),
+            ("query: ".to_string(), "passage: ".to_string())
+        );
     }
 
     #[test]

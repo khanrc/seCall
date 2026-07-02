@@ -58,7 +58,18 @@ pub fn run() -> Result<()> {
     println!("Index Statistics:");
     println!("  Sessions:      {}", stats.session_count);
     println!("  Turns:         {}", stats.turn_count);
-    println!("  Embedded:      {}", stats.vector_count);
+    // Coverage is embedded turns / embeddable turns (both turn-unit), not vector
+    // rows / turn count — mixing units read as partial at 100% done (#1585 WS3).
+    let coverage = if stats.embeddable_turns > 0 {
+        100.0 * stats.embedded_turns as f64 / stats.embeddable_turns as f64
+    } else {
+        100.0
+    };
+    println!(
+        "  Embedded:      {}/{} embeddable turns ({:.1}%)",
+        stats.embedded_turns, stats.embeddable_turns, coverage
+    );
+    println!("  Vector chunks: {}", stats.vector_count);
     println!();
 
     // Vault status

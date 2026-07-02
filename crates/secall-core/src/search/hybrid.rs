@@ -134,6 +134,13 @@ impl SearchEngine {
         SearchEngine { bm25, vector }
     }
 
+    /// The active embedding model's name, if a vector backend is present.
+    /// `None` in BM25-only mode. Used to reconcile the vector store before
+    /// embedding.
+    pub fn vector_model_name(&self) -> Option<&str> {
+        self.vector.as_ref().map(|v| v.model_name())
+    }
+
     pub async fn search(
         &self,
         db: &Database,

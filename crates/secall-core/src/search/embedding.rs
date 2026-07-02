@@ -143,6 +143,9 @@ pub struct OrtEmbedder {
     next_session: std::sync::atomic::AtomicUsize,
     tokenizer: Arc<tokenizers::Tokenizer>,
     dim: usize,
+    /// Model dir basename — tags stored vectors and the ANN index so they
+    /// track the actual model (dragonkue-e5-onnx), not a hardcoded name.
+    model_name: String,
 }
 
 impl OrtEmbedder {
@@ -154,8 +157,19 @@ impl OrtEmbedder {
         use ort::session::builder::GraphOptimizationLevel;
 
         let pool_size = pool_size.max(1);
-        let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
+        let mut tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| anyhow!("tokenizer load failed: {e}"))?;
+        // Cap tokenization at the model's own max sequence length so a chunk that
+        // re-tokenizes just over the limit degrades to a truncated embedding
+        // rather than an ORT position-index error that drops the chunk. Read
+        // per-model from tokenizer_config.json (e5→512, bge-m3→8192) — never a
+        // hardcoded cap, which would silently truncate a large-context model.
+        if let Some(max_len) = super::model_manager::read_model_max_length(model_dir) {
+            let _ = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+                max_length: max_len,
+                ..Default::default()
+            }));
+        }
 
         // Build first session and probe dimensions
         #[allow(unused_mut)]
@@ -174,7 +188,11 @@ impl OrtEmbedder {
             .commit_from_file(model_dir.join("model.onnx"))
             .map_err(|e| anyhow!("load model: {e}"))?;
 
-        let dim = Self::probe_dim(&mut first_session, &tokenizer).unwrap_or(1024);
+        // Probe the true output dim from the model; erroring beats guessing a
+        // stale default (the old 1024 fallback was a bge-m3 relic that would
+        // mis-dimension a 384d model's index if the probe ever failed).
+        let dim = Self::probe_dim(&mut first_session, &tokenizer)
+            .map_err(|e| anyhow!("could not probe embedding dimension from model: {e}"))?;
 
         let mut sessions = Vec::with_capacity(pool_size);
         sessions.push(Arc::new(Mutex::new(first_session)));
@@ -210,11 +228,17 @@ impl OrtEmbedder {
             "ORT session pool created"
         );
 
+        let model_name = model_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "ort".to_string());
+
         Ok(Self {
             sessions,
             next_session: std::sync::atomic::AtomicUsize::new(0),
             tokenizer: Arc::new(tokenizer),
             dim,
+            model_name,
         })
     }
 
@@ -283,10 +307,28 @@ impl OrtEmbedder {
         let mask_ref = TensorRef::<i64>::from_array_view(attention_mask.view())
             .map_err(|e| anyhow!("tensor mask: {e}"))?;
 
-        let outputs = session.run(ort::inputs![
-            "input_ids" => ids_ref,
-            "attention_mask" => mask_ref,
-        ])?;
+        // xlm-roberta exports (dragonkue/e5) declare token_type_ids as a required
+        // input; bge-m3's export omits it. Supply zeros only when the model asks
+        // for it — ort errors if the input set doesn't match exactly.
+        let needs_token_type = session
+            .inputs
+            .iter()
+            .any(|i| i.name == "token_type_ids");
+        let token_type_ids = Array2::<i64>::zeros((batch_size, max_len));
+        let outputs = if needs_token_type {
+            let tt_ref = TensorRef::<i64>::from_array_view(token_type_ids.view())
+                .map_err(|e| anyhow!("tensor token_type: {e}"))?;
+            session.run(ort::inputs![
+                "input_ids" => ids_ref,
+                "attention_mask" => mask_ref,
+                "token_type_ids" => tt_ref,
+            ])?
+        } else {
+            session.run(ort::inputs![
+                "input_ids" => ids_ref,
+                "attention_mask" => mask_ref,
+            ])?
+        };
 
         // bge-m3 ONNX exports token-level embeddings as "token_embeddings";
         // fall back to "last_hidden_state" for standard BERT-style models.
@@ -361,10 +403,27 @@ impl OrtEmbedder {
         let mask_ref = TensorRef::<i64>::from_array_view(mask_arr.view())
             .map_err(|e| anyhow!("tensor mask: {e}"))?;
 
-        let outputs = session.run(ort::inputs![
-            "input_ids" => ids_ref,
-            "attention_mask" => mask_ref,
-        ])?;
+        // See run_inference_batch: supply token_type_ids zeros only when the
+        // model declares that input (dragonkue/e5 yes, bge-m3 no).
+        let needs_token_type = session
+            .inputs
+            .iter()
+            .any(|i| i.name == "token_type_ids");
+        let token_type_arr = Array2::<i64>::zeros((1, seq_len));
+        let outputs = if needs_token_type {
+            let tt_ref = TensorRef::<i64>::from_array_view(token_type_arr.view())
+                .map_err(|e| anyhow!("tensor token_type: {e}"))?;
+            session.run(ort::inputs![
+                "input_ids" => ids_ref,
+                "attention_mask" => mask_ref,
+                "token_type_ids" => tt_ref,
+            ])?
+        } else {
+            session.run(ort::inputs![
+                "input_ids" => ids_ref,
+                "attention_mask" => mask_ref,
+            ])?
+        };
 
         // bge-m3 ONNX exports token-level embeddings as "token_embeddings";
         // fall back to "last_hidden_state" for standard BERT-style models.
@@ -443,7 +502,7 @@ impl Embedder for OrtEmbedder {
     }
 
     fn model_name(&self) -> &str {
-        "bge-m3-onnx"
+        &self.model_name
     }
 }
 
@@ -452,6 +511,14 @@ impl Embedder for OrtEmbedder {
 /// Local ONNX-based embedder using openvino-rs crate directly (not ORT EP).
 /// Uses a dedicated worker thread since openvino types are !Send/!Sync.
 /// Requires OpenVINO runtime installed on the system.
+///
+/// Only feeds `input_ids` + `attention_mask` and applies no max-length
+/// truncation. A model that requires `token_type_ids` (xlm-roberta/e5, e.g.
+/// dragonkue) therefore fails the init dimension probe below, so `new()` errors
+/// and the factory falls back to the ORT backend (which handles token_type_ids,
+/// truncation, and prefixes). This is intentional — OpenVINO here targets
+/// simpler 2-input models; e5 support lives on the ORT path. Not built in the
+/// default feature set.
 #[cfg(feature = "openvino")]
 pub struct OpenVinoEmbedder {
     tx: std::sync::Mutex<std::sync::mpsc::Sender<OpenVinoWork>>,

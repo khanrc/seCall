@@ -157,6 +157,23 @@ impl Database {
                     .execute("ALTER TABLE sessions ADD COLUMN source_mtime INTEGER", [])?;
             }
         }
+        if current < 12 {
+            // Persist tool-call actions so the deferred (--no-embed → catchup)
+            // embed path can fold tool text into the index; the loader used to
+            // reconstruct turns without actions, so tool-only turns embedded as
+            // empty and were skipped (#1585). Fresh installs get the column from
+            // CREATE_TURNS; guard the ALTER on the table existing so migrating a
+            // DB that predates the turns table can't panic on open.
+            let turns_exists: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='turns'",
+                [],
+                |r| r.get(0),
+            )?;
+            if turns_exists > 0 && !self.column_exists("turns", "actions_json")? {
+                self.conn
+                    .execute("ALTER TABLE turns ADD COLUMN actions_json TEXT", [])?;
+            }
+        }
         if current < CURRENT_SCHEMA_VERSION {
             self.conn.execute(
                 "INSERT OR REPLACE INTO config(key, value) VALUES ('schema_version', ?1)",
@@ -219,17 +236,34 @@ impl Database {
         let turn_count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))?;
-        let vector_count: i64 = {
+        // Embeddable turns = those that produce index text: non-empty content or
+        // a tool call. Empty-shell turns (no content, no tool) legitimately never
+        // embed, so coverage is measured against this denominator, not turn_count
+        // — otherwise a fully-embedded index reads as partial (#1585 WS3).
+        let embeddable_turns: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM turns WHERE content != '' OR has_tool = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        let (vector_count, embedded_turns): (i64, i64) = {
             let exists: i64 = self.conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='turn_vectors'",
                 [],
                 |r| r.get(0),
             )?;
             if exists > 0 {
-                self.conn
-                    .query_row("SELECT COUNT(*) FROM turn_vectors", [], |r| r.get(0))?
+                let chunks: i64 = self
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM turn_vectors", [], |r| r.get(0))?;
+                // Distinct turns with ≥1 chunk — comparable to embeddable_turns.
+                let turns: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM (SELECT DISTINCT session_id, turn_index FROM turn_vectors)",
+                    [],
+                    |r| r.get(0),
+                )?;
+                (chunks, turns)
             } else {
-                0
+                (0, 0)
             }
         };
 
@@ -257,7 +291,9 @@ impl Database {
         Ok(DbStats {
             session_count,
             turn_count,
+            embeddable_turns,
             vector_count,
+            embedded_turns,
             recent_ingests,
         })
     }
@@ -290,7 +326,12 @@ impl Database {
 pub struct DbStats {
     pub session_count: i64,
     pub turn_count: i64,
+    /// Turns that produce index text (non-empty content or a tool call).
+    pub embeddable_turns: i64,
+    /// Total vector rows (chunks) — a turn can yield several.
     pub vector_count: i64,
+    /// Distinct turns with at least one vector — comparable to embeddable_turns.
+    pub embedded_turns: i64,
     pub recent_ingests: Vec<IngestLogEntry>,
 }
 
