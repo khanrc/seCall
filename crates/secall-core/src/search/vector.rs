@@ -41,6 +41,11 @@ pub struct VectorIndexer {
     /// passage_prefix on indexed chunks, query_prefix on search queries.
     query_prefix: String,
     passage_prefix: String,
+    /// True when this indexer is a degraded fallback (ORT failed → Ollama), not
+    /// the configured backend. A fallback carries a different model name, so it
+    /// must never trigger a destructive vector-store reconcile — see
+    /// `reconcile_vector_model` and the embed entrypoint.
+    is_fallback: bool,
 }
 
 impl VectorIndexer {
@@ -52,7 +57,21 @@ impl VectorIndexer {
             batch_size: 32,
             query_prefix: String::new(),
             passage_prefix: String::new(),
+            is_fallback: false,
         }
+    }
+
+    /// Mark this indexer as a degraded fallback (see `is_fallback`).
+    pub fn as_fallback(mut self) -> Self {
+        self.is_fallback = true;
+        self
+    }
+
+    /// Whether this indexer is a degraded fallback rather than the configured
+    /// backend. The embed entrypoint refuses to authorize a model-switch wipe
+    /// for a fallback indexer.
+    pub fn is_fallback(&self) -> bool {
+        self.is_fallback
     }
 
     /// Set the e5 query/passage prefixes. Empty strings are a no-op (bge-m3).
@@ -237,18 +256,22 @@ impl VectorIndexer {
         db.with_transaction(|| {
             for (chunk, emb_opt) in pending_chunks.iter().zip(embeddings.iter()) {
                 if let Some(embedding) = emb_opt {
-                    let _rowid = db.insert_vector(
+                    let rowid = db.insert_vector(
                         embedding,
                         &chunk.session_id,
                         chunk.turn_index,
                         chunk.seq,
                         self.embedder.model_name(),
                     )?; // Err → 클로저 종료 → ROLLBACK
-                    chunks_embedded += 1;
-                    #[cfg(not(target_os = "windows"))]
-                    if let Some(ref ann) = self.ann_index {
-                        if let Err(e) = ann.add(_rowid as u64, embedding) {
-                            tracing::warn!(error = %e, "ANN index add failed");
+                    // None → an identical chunk row already existed (idempotent
+                    // insert); don't count it or add a stale rowid to the ANN.
+                    if let Some(rowid) = rowid {
+                        chunks_embedded += 1;
+                        #[cfg(not(target_os = "windows"))]
+                        if let Some(ref ann) = self.ann_index {
+                            if let Err(e) = ann.add(rowid as u64, embedding) {
+                                tracing::warn!(error = %e, "ANN index add failed");
+                            }
                         }
                     }
                 }
@@ -480,7 +503,7 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                 tracing::warn!("ONNX model not found, downloading");
                 if let Err(e) = mgr.download(false).await {
                     tracing::warn!(error = %e, "download failed, trying Ollama fallback");
-                    return try_ollama_fallback_with_ann(config).await;
+                    return try_ollama_fallback_with_ann(config, true).await;
                 }
             }
 
@@ -496,7 +519,7 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "ort load failed, trying Ollama fallback");
-                    return try_ollama_fallback_with_ann(config).await;
+                    return try_ollama_fallback_with_ann(config, true).await;
                 }
             }
         }
@@ -541,7 +564,7 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                 VectorIndexer::new(Box::new(embedder))
             } else {
                 tracing::warn!("OPENAI_API_KEY not set, trying Ollama fallback");
-                return try_ollama_fallback_with_ann(config).await;
+                return try_ollama_fallback_with_ann(config, true).await;
             }
         }
         "ollama_cloud" => {
@@ -560,7 +583,7 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                 tracing::warn!(
                     "OLLAMA_CLOUD_API_KEY not set — set it via env to enable cloud embedding, falling back to local Ollama"
                 );
-                return try_ollama_fallback_with_ann(config).await;
+                return try_ollama_fallback_with_ann(config, true).await;
             }
             let embedder = OllamaEmbedder::new(Some(base_url), model).with_api_key(api_key);
             if embedder.is_available().await {
@@ -568,12 +591,30 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                 VectorIndexer::new(Box::new(embedder))
             } else {
                 tracing::warn!("Ollama Cloud unreachable, falling back to local Ollama");
-                return try_ollama_fallback_with_ann(config).await;
+                return try_ollama_fallback_with_ann(config, true).await;
             }
         }
-        _ => {
-            // "ollama" or any unknown value → Ollama
-            return try_ollama_fallback_with_ann(config).await;
+        "ollama" => {
+            // Configured local Ollama — the real backend, so it may authorize a
+            // deliberate model-switch reconcile (is_fallback = false).
+            return try_ollama_fallback_with_ann(config, false).await;
+        }
+        "none" => {
+            // Vector search explicitly disabled (BM25-only). Return no indexer so
+            // neither embedding nor reconcile ever runs — never touch the store.
+            tracing::info!("embedding.backend = none — vector search disabled (BM25 only)");
+            return None;
+        }
+        other => {
+            // Unknown / mis-typed value, or a cfg-gated backend (e.g. openvino) on
+            // a build without its feature. Fall back to local Ollama, but flag it
+            // as a fallback so --allow-model-switch can NEVER authorize a
+            // destructive reconcile through an un-configured backend name.
+            tracing::warn!(
+                backend = other,
+                "unknown embedding backend — falling back to local Ollama (a model-switch wipe is never authorized through it)"
+            );
+            return try_ollama_fallback_with_ann(config, true).await;
         }
     };
 
@@ -606,18 +647,25 @@ async fn try_ort_cpu_fallback(config: &Config) -> Option<VectorIndexer> {
         }
         Err(e) => {
             tracing::warn!(error = %e, "ORT CPU fallback also failed, trying Ollama");
-            try_ollama_fallback_with_ann(config).await
+            try_ollama_fallback_with_ann(config, true).await
         }
     }
 }
 
-async fn try_ollama_fallback_with_ann(config: &Config) -> Option<VectorIndexer> {
+/// Build a local-Ollama VectorIndexer. `is_fallback` is true when we reached
+/// here by *falling back* from a configured backend (ORT/OpenVINO/OpenAI/cloud
+/// that failed to load or authenticate) — that indexer carries a different
+/// model name than the configured one, so it must be flagged so it can never
+/// authorize a destructive vector-store reconcile. It is false only when
+/// `backend = "ollama"` is the configured backend itself.
+async fn try_ollama_fallback_with_ann(config: &Config, is_fallback: bool) -> Option<VectorIndexer> {
     let base_url = config.embedding.ollama_url.as_deref();
     let model = config.embedding.ollama_model.as_deref();
     let embedder = OllamaEmbedder::new(base_url, model);
     if embedder.is_available().await {
         tracing::info!("Ollama available, vector search enabled");
         let indexer = VectorIndexer::new(Box::new(embedder));
+        let indexer = if is_fallback { indexer.as_fallback() } else { indexer };
         #[cfg(not(target_os = "windows"))]
         let indexer = attach_ann_index(indexer);
         Some(indexer)
@@ -855,6 +903,58 @@ mod tests {
         assert!(
             result.is_none(),
             "no api_key + unreachable local Ollama should return None"
+        );
+    }
+
+    /// `backend = "none"` disables vector search (BM25-only): no indexer, and —
+    /// critically — it must NOT fall through to Ollama, so no reconcile/wipe can
+    /// ever run against a store while embedding is configured off. Regression-
+    /// sensitive: Ollama is pointed at a *reachable* mock, so a `None` result can
+    /// only come from the `"none"` early-return, not from an unavailable fallback
+    /// (the old fall-through-to-Ollama bug would return `Some` here).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_create_vector_indexer_none_backend_returns_none() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/tags")
+            .with_status(200)
+            .with_body(r#"{"models":[]}"#)
+            .create_async()
+            .await;
+
+        let mut config = crate::vault::config::Config::default();
+        config.embedding.backend = "none".to_string();
+        config.embedding.ollama_url = Some(server.url());
+
+        let result = create_vector_indexer(&config).await;
+        assert!(
+            result.is_none(),
+            "backend=none must disable vectors even when Ollama is reachable"
+        );
+    }
+
+    /// An unknown / mis-typed backend falls back to local Ollama but MUST be
+    /// flagged `is_fallback` so `--allow-model-switch` can never authorize a
+    /// destructive reconcile through an un-configured backend name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_create_vector_indexer_unknown_backend_flags_fallback() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/tags")
+            .with_status(200)
+            .with_body(r#"{"models":[]}"#)
+            .create_async()
+            .await;
+
+        let mut config = crate::vault::config::Config::default();
+        config.embedding.backend = "totally-bogus-backend".to_string();
+        config.embedding.ollama_url = Some(server.url());
+
+        let result = create_vector_indexer(&config).await;
+        let indexer = result.expect("reachable Ollama fallback should yield an indexer");
+        assert!(
+            indexer.is_fallback(),
+            "unknown backend must be flagged as a fallback (no wipe authority)"
         );
     }
 

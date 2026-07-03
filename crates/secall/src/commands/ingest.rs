@@ -13,7 +13,7 @@ use secall_core::{
     jobs::ProgressSink,
     search::tokenizer::create_tokenizer,
     search::{Bm25Indexer, SearchEngine},
-    store::{get_default_db_path, Database, SessionRepo},
+    store::{get_default_db_path, Database, ReconcileOutcome, SessionRepo},
     vault::{Config, Vault},
 };
 
@@ -387,9 +387,22 @@ pub async fn ingest_sessions(
     // one model). Runs once here, before the per-file loop. The sanctioned
     // rebuild path is `secall embed --all`; this keeps the incremental daemon
     // self-healing if the model is switched without a manual full re-embed.
-    if !no_embed {
+    // Ingest never authorizes a destructive model-switch wipe (allow_wipe=false)
+    // — that is `secall embed --allow-model-switch`'s job. If the store holds a
+    // different model (backend switched or fell back), reconcile refuses and we
+    // skip embedding for this pass so mixed-model vectors are never sealed; BM25
+    // and structure indexing still run.
+    let mut embed_this_run = !no_embed;
+    if embed_this_run {
         if let Some(model) = engine.vector_model_name() {
-            db.reconcile_vector_model(model)?;
+            if db.reconcile_vector_model(model, false)? == ReconcileOutcome::Refused {
+                tracing::error!(
+                    active_model = model,
+                    "vector store holds a different embedding model — skipping embedding \
+                     this ingest pass. Run `secall embed --allow-model-switch` to re-embed."
+                );
+                embed_this_run = false;
+            }
         }
     }
 
@@ -441,15 +454,19 @@ pub async fn ingest_sessions(
     }
 
     // 벡터 인덱싱 일괄 처리 (BM25/vault와 분리하여 체감 속도 개선)
-    if no_embed && !vector_tasks.is_empty() {
-        eprintln!(
-            "Skipping vector embedding for {} session(s) (--no-embed)",
-            vector_tasks.len()
-        );
-        // 후속 semantic / wiki 단계가 길어질 수 있어 사용 끝난 핸들 즉시 해제.
+    if !embed_this_run && !vector_tasks.is_empty() {
+        // Not embedding this pass — either --no-embed, or a Refused reconcile
+        // (model mismatch / fallback) disabled it above. Release the collected
+        // Session handles either way before the longer semantic / wiki phase.
+        if no_embed {
+            eprintln!(
+                "Skipping vector embedding for {} session(s) (--no-embed)",
+                vector_tasks.len()
+            );
+        }
         vector_tasks.clear();
     }
-    if !no_embed && !vector_tasks.is_empty() {
+    if embed_this_run && !vector_tasks.is_empty() {
         let cancelled = embed_vector_tasks(
             config,
             db,
@@ -1012,6 +1029,18 @@ enum ReingestAction {
 /// as must a shrink or a compaction-scale jump, so stale rows are never sealed.
 fn decide_reingest(agent: &AgentKind, parsed: usize, db_turn_count: usize) -> ReingestAction {
     let append_only = matches!(agent, AgentKind::ClaudeCode | AgentKind::Codex);
+    // Correctness for append-only agents rests on the invariant that
+    // already-indexed turns are immutable (CC/codex only ever *append* JSONL
+    // lines) — we deliberately do NOT handle in-place rewrites of earlier turns,
+    // which those formats don't produce. The huge-jump guard below is therefore
+    // not a correctness gate but a conservative catch for the one way an
+    // "append-only" file can still betray that invariant: a session id reused for
+    // a wholly different transcript, or a compaction that renumbers turns. The
+    // thresholds are heuristic, not measured — `> db+10` ignores small appends,
+    // `> db*2` requires the growth to also more-than-double the count, so only a
+    // large *and* proportionally huge jump forces a rebuild; ordinary growth
+    // stays on the cheap incremental path. Getting this wrong only costs an
+    // unnecessary full rebuild (wasted work, never incorrect).
     if parsed > db_turn_count + 10 && parsed > db_turn_count * 2 {
         ReingestAction::FullRebuild
     } else if append_only && parsed > db_turn_count {

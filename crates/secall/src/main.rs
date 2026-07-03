@@ -143,6 +143,13 @@ enum Commands {
         /// Number of sessions to embed concurrently (default: 4)
         #[arg(long, default_value = "4")]
         concurrency: usize,
+
+        /// Authorize a destructive re-embed when the stored vectors use a
+        /// different embedding model (deliberate model migration). Without this,
+        /// a model mismatch aborts instead of wiping — so a degraded fallback or
+        /// mis-configured model can never silently destroy the vector space.
+        #[arg(long)]
+        allow_model_switch: bool,
     },
 
     /// Classify sessions using config rules (backfill existing sessions)
@@ -547,8 +554,9 @@ async fn main() -> anyhow::Result<()> {
             all,
             batch_size,
             concurrency,
+            allow_model_switch,
         } => {
-            commands::embed::run(all, batch_size, concurrency).await?;
+            commands::embed::run(all, batch_size, concurrency, allow_model_switch).await?;
         }
         Commands::Classify { dry_run } => {
             commands::classify::run_backfill(dry_run).await?;
