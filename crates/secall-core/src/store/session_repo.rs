@@ -18,6 +18,8 @@ pub type DailySessionRow = (
 pub trait SessionRepo {
     fn insert_session(&self, session: &Session) -> Result<()>;
     fn update_session_vault_path(&self, session_id: &str, vault_path: &str) -> Result<()>;
+    /// INSERT OR IGNORE a turn. Returns rows affected: `1` if newly inserted,
+    /// `0` if the `(session_id, turn_index)` row already existed.
     fn insert_turn(&self, session_id: &str, turn: &Turn) -> Result<i64>;
     fn session_exists(&self, session_id: &str) -> Result<bool>;
     fn session_exists_by_prefix(&self, prefix: &str) -> Result<bool>;
@@ -50,9 +52,22 @@ impl SessionRepo for Database {
 
         let summary = extract_summary(session);
 
+        // Upsert: a re-ingest of an append-grown session must refresh the
+        // turn-derived aggregates so RRF demotion (turn_count) and recency
+        // (end_time) stay correct. User-/classification-owned columns
+        // (tags, summary, status, session_type, ingested_at) and immutable
+        // identity columns are left untouched on conflict — INSERT OR IGNORE
+        // used to freeze turn_count at the first-ingest value.
         self.conn().execute(
-            "INSERT OR IGNORE INTO sessions(id, agent, model, project, cwd, git_branch, host, start_time, end_time, turn_count, tokens_in, tokens_out, tools_used, tags, summary, ingested_at, status, session_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            "INSERT INTO sessions(id, agent, model, project, cwd, git_branch, host, start_time, end_time, turn_count, tokens_in, tokens_out, tools_used, tags, summary, ingested_at, status, session_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+             ON CONFLICT(id) DO UPDATE SET
+                 end_time = excluded.end_time,
+                 turn_count = excluded.turn_count,
+                 tokens_in = excluded.tokens_in,
+                 tokens_out = excluded.tokens_out,
+                 tools_used = excluded.tools_used,
+                 model = COALESCE(excluded.model, model)",
             rusqlite::params![
                 session.id,
                 session.agent.as_str(),
@@ -116,7 +131,13 @@ impl SessionRepo for Database {
             serde_json::to_string(&turn.actions).ok()
         };
 
-        self.conn().execute(
+        // Returns rows affected: 1 when the turn was newly inserted, 0 when the
+        // UNIQUE(session_id, turn_index) row already existed and INSERT OR IGNORE
+        // skipped it. Callers use this to drive turn-incremental re-indexing
+        // (embed/FTS only the genuinely new turns on an append-grown session).
+        // `last_insert_rowid()` would be wrong here: on an ignored insert it
+        // returns a stale rowid from a prior insert on the same connection.
+        let affected = self.conn().execute(
             "INSERT OR IGNORE INTO turns(session_id, turn_index, role, timestamp, content, has_tool, tool_names, thinking, actions_json, tokens_in, tokens_out)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
@@ -133,7 +154,7 @@ impl SessionRepo for Database {
                 turn.tokens.as_ref().map(|t| t.output as i64).unwrap_or(0),
             ],
         )?;
-        Ok(self.conn().last_insert_rowid())
+        Ok(affected as i64)
     }
 
     fn session_exists(&self, session_id: &str) -> crate::error::Result<bool> {

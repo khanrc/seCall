@@ -417,6 +417,126 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_turn_reports_new_vs_duplicate() {
+        // insert_turn returns rows affected: 1 when newly inserted, 0 when the
+        // (session_id, turn_index) row already existed. The turn-incremental
+        // re-index path relies on this to embed/FTS only the new turns (#1592).
+        let db = Database::open_memory().unwrap();
+        db.insert_session(&make_test_session("dup")).unwrap();
+        let t = make_turn(0, Role::User, "hello", &[]);
+        assert_eq!(db.insert_turn("dup", &t).unwrap(), 1);
+        assert_eq!(db.insert_turn("dup", &t).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_insert_session_upsert_refreshes_aggregates_preserves_user_fields() {
+        // A re-ingest of an append-grown session refreshes turn-derived
+        // aggregates (turn_count / end_time / tokens) but leaves user- and
+        // classification-owned columns untouched (#1592). INSERT OR IGNORE used
+        // to freeze turn_count at the first-ingest value.
+        let db = Database::open_memory().unwrap();
+
+        let mut s = make_test_session("up");
+        s.turns = vec![make_turn(0, Role::User, "u0", &[])];
+        s.end_time = Some(chrono::Utc.with_ymd_and_hms(2026, 4, 1, 1, 0, 0).unwrap());
+        db.insert_session(&s).unwrap();
+        // Simulate user / classification edits on mutable columns.
+        db.conn()
+            .execute(
+                "UPDATE sessions SET tags='[\"keep\"]', summary='mysummary', \
+                 session_type='favorite', status='indexed' WHERE id='up'",
+                [],
+            )
+            .unwrap();
+
+        // Re-ingest the grown session: more turns, later end_time, more tokens.
+        let mut s2 = make_test_session("up");
+        s2.turns = vec![
+            make_turn(0, Role::User, "u0", &[]),
+            make_turn(1, Role::Assistant, "a1", &["Edit"]),
+            make_turn(2, Role::User, "u2", &[]),
+        ];
+        s2.total_tokens = TokenUsage {
+            input: 999,
+            output: 888,
+            cached: 0,
+        };
+        s2.end_time = Some(chrono::Utc.with_ymd_and_hms(2026, 4, 2, 0, 0, 0).unwrap());
+        db.insert_session(&s2).unwrap();
+
+        let (turn_count, tokens_in, tokens_out, tags, summary, session_type, status, end_time): (
+            i64,
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = db
+            .conn()
+            .query_row(
+                "SELECT turn_count, tokens_in, tokens_out, tags, summary, session_type, status, end_time \
+                 FROM sessions WHERE id='up'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        // Aggregates refreshed.
+        assert_eq!(turn_count, 3);
+        assert_eq!(tokens_in, 999);
+        assert_eq!(tokens_out, 888);
+        assert!(end_time.starts_with("2026-04-02"));
+        // User / classification fields preserved.
+        assert_eq!(tags, "[\"keep\"]");
+        assert_eq!(summary, "mysummary");
+        assert_eq!(session_type, "favorite");
+        assert_eq!(status, "indexed");
+    }
+
+    #[test]
+    fn test_insert_session_upsert_fills_model_without_downgrading() {
+        // model is populated from the first assistant message, so an early
+        // ingest (user turn only) can store NULL. A later re-ingest must fill it
+        // in — but a re-ingest that parses NULL must not downgrade a known model.
+        let db = Database::open_memory().unwrap();
+        let read_model = |db: &Database| -> Option<String> {
+            db.conn()
+                .query_row("SELECT model FROM sessions WHERE id='m'", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        let mut s = make_test_session("m");
+        s.model = None;
+        db.insert_session(&s).unwrap();
+        assert_eq!(read_model(&db), None);
+
+        // Assistant turn arrived → model known.
+        let mut s2 = make_test_session("m");
+        s2.model = Some("claude-opus-4-8".to_string());
+        db.insert_session(&s2).unwrap();
+        assert_eq!(read_model(&db), Some("claude-opus-4-8".to_string()));
+
+        // A later parse with NULL model must not clobber the known value.
+        let mut s3 = make_test_session("m");
+        s3.model = None;
+        db.insert_session(&s3).unwrap();
+        assert_eq!(read_model(&db), Some("claude-opus-4-8".to_string()));
+    }
+
+    #[test]
     fn test_migrate_creates_sessions_table() {
         let db = Database::open_memory().unwrap();
         assert!(db.table_exists("sessions").unwrap());
