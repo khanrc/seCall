@@ -22,9 +22,18 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
-        )?;
+        // busy_timeout first — before any other statement, including the WAL
+        // switch — so even the journal_mode change is protected if another
+        // process is mid-write at open time. Several secall processes write this
+        // DB concurrently (10-min sync reindex, hourly catchup embed, per-turn
+        // ingest); WAL permits one writer at a time and busy_timeout is how long
+        // a contender waits for the lock. Every write transaction is per-session
+        // and short (a big embed is a few seconds), so a waiter succeeds. At 5s
+        // the wait expired on larger sessions → `database is locked` → the whole
+        // session rolled back and never re-embedded (logan-cha/log#1590). 30s
+        // clears the longest realistic per-session write with wide margin.
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
@@ -215,7 +224,14 @@ impl Database {
     where
         F: FnOnce() -> Result<T>,
     {
-        self.conn.execute_batch("BEGIN")?;
+        // BEGIN IMMEDIATE takes the write lock up front. Every caller writes,
+        // and some SELECT before their first INSERT (e.g. insert_vector's
+        // dimension check). A deferred BEGIN would take a read snapshot then try
+        // to upgrade to writer, which fails with SQLITE_BUSY_SNAPSHOT — a
+        // conflict busy_timeout does NOT retry. IMMEDIATE makes the whole
+        // transaction a writer from the start, so contention is a plain
+        // lock-wait that busy_timeout covers (logan-cha/log#1590).
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
         match f() {
             Ok(val) => {
                 self.conn.execute_batch("COMMIT")?;
