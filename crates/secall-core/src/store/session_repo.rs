@@ -367,23 +367,32 @@ impl Database {
     }
 
     /// 세션과 관련된 모든 데이터를 삭제 (sessions, turns, turn_vectors).
-    /// `--force` 재수집 시 기존 데이터를 정리하는 데 사용.
+    /// `--force` 및 full-rebuild 재수집 시 기존 데이터를 정리하는 데 사용.
+    ///
+    /// Atomic: the four deletes run in one transaction so a mid-delete failure
+    /// (e.g. SQLITE_BUSY past the busy_timeout) can't leave turns present with
+    /// their FTS rows gone — a state the incremental re-ingest path's
+    /// newly-inserted gate would never re-fill (no FTS heal path, unlike the
+    /// vectors' anti-join backfill). All callers invoke this outside any
+    /// transaction, so the BEGIN IMMEDIATE here never nests.
     pub fn delete_session_full(&self, session_id: &str) -> Result<()> {
-        self.delete_session_vectors(session_id)?;
-        // FTS5 행 삭제 (turns 삭제 전에 수행 — session_id로 매칭)
-        self.conn().execute(
-            "DELETE FROM turns_fts WHERE session_id = ?1",
-            rusqlite::params![session_id],
-        )?;
-        self.conn().execute(
-            "DELETE FROM turns WHERE session_id = ?1",
-            rusqlite::params![session_id],
-        )?;
-        self.conn().execute(
-            "DELETE FROM sessions WHERE id = ?1",
-            rusqlite::params![session_id],
-        )?;
-        Ok(())
+        self.with_transaction(|| {
+            self.delete_session_vectors(session_id)?;
+            // FTS5 행 삭제 (turns 삭제 전에 수행 — session_id로 매칭)
+            self.conn().execute(
+                "DELETE FROM turns_fts WHERE session_id = ?1",
+                rusqlite::params![session_id],
+            )?;
+            self.conn().execute(
+                "DELETE FROM turns WHERE session_id = ?1",
+                rusqlite::params![session_id],
+            )?;
+            self.conn().execute(
+                "DELETE FROM sessions WHERE id = ?1",
+                rusqlite::params![session_id],
+            )?;
+            Ok(())
+        })
     }
 
     /// 마지막 ingest 시점에 기록한 소스 파일 `(size, mtime)` 스냅샷을 조회 (#13).
