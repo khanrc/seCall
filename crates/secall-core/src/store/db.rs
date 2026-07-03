@@ -281,12 +281,18 @@ impl Database {
         let turn_count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))?;
-        // Embeddable turns = those that produce index text: non-empty content or
-        // a tool call. Empty-shell turns (no content, no tool) legitimately never
-        // embed, so coverage is measured against this denominator, not turn_count
-        // — otherwise a fully-embedded index reads as partial (#1585 WS3).
+        // Embeddable turns = those `index_text()` renders non-empty: real content,
+        // or a tool call whose summary was persisted (actions_json). A has_tool turn
+        // with no actions_json (ingested before that column existed) renders empty
+        // and can never embed — counting it pins coverage far below reality. #1585
+        // WS3 widened this to `has_tool = 1` alone, which held a fully-embedded index
+        // at ~50%; backfilling old tool detail is a separate, accepted non-goal.
+        // The actions_json check is a DB-side proxy for `index_text() != ""`.
         let embeddable_turns: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM turns WHERE content != '' OR has_tool = 1",
+            "SELECT COUNT(*) FROM turns \
+             WHERE content != '' \
+                OR (has_tool = 1 AND actions_json IS NOT NULL \
+                    AND actions_json != '' AND actions_json != '[]')",
             [],
             |r| r.get(0),
         )?;
@@ -1516,6 +1522,40 @@ mod tests {
         assert_eq!(stats.assistant_turns, 0);
         assert_eq!(stats.system_turns, 0);
         assert!(stats.tool_counts.is_empty());
+    }
+
+    #[test]
+    fn test_get_stats_embeddable_turns_excludes_legacy_tool_turns() {
+        // Coverage denominator counts only turns index_text() renders non-empty:
+        // real content, or a tool call whose actions_json was persisted. A legacy
+        // has_tool turn with NULL actions_json can never embed and must be excluded,
+        // else coverage reads far below reality (#1585 WS3 / #1605).
+        let db = Database::open_memory().unwrap();
+        db.insert_session(&make_test_session("emb")).unwrap();
+
+        // embeddable: real content
+        db.insert_turn("emb", &make_turn(0, Role::User, "hello", &[]))
+            .unwrap();
+        // embeddable: tool-only turn — insert_turn stores actions_json
+        db.insert_turn("emb", &make_turn(1, Role::Assistant, "", &["Bash"]))
+            .unwrap();
+        // NOT embeddable: empty shell (no content, no tool)
+        db.insert_turn("emb", &make_turn(2, Role::Assistant, "", &[]))
+            .unwrap();
+        // NOT embeddable: legacy tool turn — has_tool=1 but actions_json NULL (the
+        // column predates the fold; insert_turn couples the two, so only raw SQL
+        // can reproduce the historical shape).
+        db.conn
+            .execute(
+                "INSERT INTO turns(session_id, turn_index, role, content, has_tool, actions_json)
+                 VALUES ('emb', 3, 'assistant', '', 1, NULL)",
+                [],
+            )
+            .unwrap();
+
+        let stats = db.get_stats().unwrap();
+        assert_eq!(stats.turn_count, 4);
+        assert_eq!(stats.embeddable_turns, 2); // turns 0 and 1 only
     }
 
     // ─── P37 Task 00: semantic_extracted_at 컬럼 (v8) ────────────────────────
