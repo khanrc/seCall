@@ -7,7 +7,7 @@ use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use secall_core::{
     ingest::Session,
-    store::{get_default_db_path, Database},
+    store::{get_default_db_path, Database, ReconcileOutcome},
     vault::Config,
 };
 
@@ -30,7 +30,12 @@ impl WorkItem {
     }
 }
 
-pub async fn run(all: bool, batch_size: Option<usize>, concurrency: usize) -> Result<()> {
+pub async fn run(
+    all: bool,
+    batch_size: Option<usize>,
+    concurrency: usize,
+    allow_model_switch: bool,
+) -> Result<()> {
     let config = Config::load_or_default();
     let db_path = get_default_db_path();
     let db = Database::open(&db_path)?;
@@ -51,10 +56,47 @@ pub async fn run(all: bool, batch_size: Option<usize>, concurrency: usize) -> Re
     // the pre-filter scan (which would otherwise treat old-model chunks as
     // "already embedded" and silently skip) and before the concurrent embed
     // loop (avoiding any wipe/insert race on the shared DB).
-    if db.reconcile_vector_model(indexer.model_name())? {
-        eprintln!(
-            "Embedding model changed → cleared stale vectors; performing a full re-embed."
-        );
+    // A wipe destroys every stored vector, so it is authorized only for a
+    // deliberate model migration: the operator passed --allow-model-switch AND
+    // this is the configured backend (never a degraded fallback, whose model
+    // name differs and would otherwise trigger the wipe). Without authorization,
+    // a foreign-model store makes reconcile refuse → we abort with a nonzero exit
+    // (the daemon's embed-down alert fires) rather than silently corrupt or
+    // regress the vector space.
+    let allow_wipe = allow_model_switch && !indexer.is_fallback();
+    match db.reconcile_vector_model(indexer.model_name(), allow_wipe)? {
+        ReconcileOutcome::Wiped => {
+            eprintln!(
+                "Embedding model changed → cleared stale vectors; performing a full re-embed."
+            );
+        }
+        ReconcileOutcome::Refused => {
+            // Branch BOTH the diagnosis and the remedy: in the fallback case
+            // --allow-model-switch is deliberately inert (a fallback can never
+            // wipe), so pointing the operator at that flag would send them into a
+            // no-op retry during exactly the incident this guard defends against.
+            let (reason, remedy) = if indexer.is_fallback() {
+                (
+                    "the configured embedding backend failed to load and this run fell back \
+                     to a different model",
+                    "Repair the configured embedding backend (ONNX runtime + model load) so it \
+                     loads, then re-run `secall embed` — a fallback model can never authorize a \
+                     wipe.",
+                )
+            } else {
+                (
+                    "the vector store holds a different embedding model",
+                    "Re-run `secall embed --allow-model-switch` to intentionally re-embed from \
+                     scratch with the active model.",
+                )
+            };
+            anyhow::bail!(
+                "refusing to embed: {reason}. The store still holds the previous model's \
+                 vectors; embedding the active model now would corrupt the single-model \
+                 invariant. {remedy}"
+            );
+        }
+        ReconcileOutcome::Clean => {}
     }
 
     let tz = config.timezone();

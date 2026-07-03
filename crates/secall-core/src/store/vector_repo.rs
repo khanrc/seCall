@@ -1,8 +1,31 @@
 use crate::search::vector::VectorRow;
 use crate::store::db::Database;
 
+/// Outcome of [`Database::reconcile_vector_model`]. The store holds exactly one
+/// embedding model's vectors; reconcile enforces that before an embed pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// Store already holds only the active model's vectors, or is empty. Proceed.
+    Clean,
+    /// Foreign-model vectors were present and wiped; a full re-embed follows.
+    Wiped,
+    /// Foreign-model vectors were present but the caller did not permit a wipe
+    /// (`allow_wipe == false`). The store is left untouched. The active model
+    /// must NOT be embedded into a store of a different model, so the caller is
+    /// responsible for aborting the embed pass and surfacing this visibly — it
+    /// is the guard against a fallback/mis-config model name silently
+    /// destroying the primary vector space.
+    Refused,
+}
+
 pub trait VectorRepo {
     fn init_vector_table(&self) -> anyhow::Result<()>;
+    /// Insert one chunk vector. Returns `Some(rowid)` when a new row was written
+    /// (caller adds it to the ANN index), or `None` when an identical
+    /// `(session_id, turn_index, chunk_seq, model)` row already existed and the
+    /// insert was ignored — the vector store is idempotent per chunk key, so a
+    /// double embed (e.g. a manual `embed` racing the daemon pass) can't create
+    /// duplicate vectors.
     fn insert_vector(
         &self,
         embedding: &[f32],
@@ -10,7 +33,7 @@ pub trait VectorRepo {
         turn_index: u32,
         chunk_seq: u32,
         model: &str,
-    ) -> anyhow::Result<i64>;
+    ) -> anyhow::Result<Option<i64>>;
     fn search_vectors(
         &self,
         query_embedding: &[f32],
@@ -38,6 +61,8 @@ impl VectorRepo for Database {
             );
             CREATE INDEX IF NOT EXISTS idx_vectors_session ON turn_vectors(session_id);
             CREATE INDEX IF NOT EXISTS idx_vectors_session_turn ON turn_vectors(session_id, turn_index);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_vectors_chunk_key
+                ON turn_vectors(session_id, turn_index, chunk_seq, model);
         ",
         )?;
         Ok(())
@@ -50,7 +75,7 @@ impl VectorRepo for Database {
         turn_index: u32,
         chunk_seq: u32,
         model: &str,
-    ) -> anyhow::Result<i64> {
+    ) -> anyhow::Result<Option<i64>> {
         if embedding.is_empty() {
             anyhow::bail!("empty embedding for session={session_id} turn={turn_index}");
         }
@@ -75,12 +100,20 @@ impl VectorRepo for Database {
         }
 
         let bytes = floats_to_bytes(embedding);
-        self.conn().execute(
-            "INSERT INTO turn_vectors(session_id, turn_index, chunk_seq, model, embedded_at, embedding)
+        // INSERT OR IGNORE against the unique (session_id, turn_index, chunk_seq,
+        // model) index: a second writer that embedded the same pending chunk
+        // (before the first committed) inserts nothing rather than a duplicate.
+        // `changes() == 0` means the row already existed → return None so the
+        // caller skips adding a stale last_insert_rowid to the ANN index.
+        let affected = self.conn().execute(
+            "INSERT OR IGNORE INTO turn_vectors(session_id, turn_index, chunk_seq, model, embedded_at, embedding)
              VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)",
             rusqlite::params![session_id, turn_index as i64, chunk_seq as i64, model, bytes],
         )?;
-        Ok(self.conn().last_insert_rowid())
+        if affected == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.conn().last_insert_rowid()))
     }
 
     fn search_vectors(
@@ -303,22 +336,34 @@ impl Database {
     /// search time. Both are corruption, not staleness, so the only safe move is
     /// a clean slate.
     ///
-    /// Wipes the whole table when any stored row's `model` differs from
-    /// `current_model`, forcing a full re-embed. Returns `true` when it wiped.
-    /// No-op (`false`) when the table is missing, empty, or already holds only
+    /// The wipe is **destructive and gated**. When a foreign model's rows are
+    /// present, the table is wiped only if `allow_wipe` is true (→ `Wiped`);
+    /// otherwise the store is left untouched (→ `Refused`) and the caller must
+    /// abort the embed pass. This is the guard for the ORT→Ollama fallback: an
+    /// ORT load failure falls back to the Ollama embedder, whose model name
+    /// differs, which would otherwise wipe the entire dragonkue space and
+    /// silently re-embed with the deprecated fallback model. A wipe is a
+    /// deliberate model migration (`secall embed --allow-model-switch`), never a
+    /// side effect of a degraded fallback or a mis-typed `model_path`.
+    ///
+    /// `Clean` when the table is missing, empty, or already holds only
     /// `current_model` rows. The ANN index is keyed by `model`+`dim` on disk, so
     /// the new model opens a fresh index file; no ANN cleanup is needed here.
     ///
     /// Call once at each embed entrypoint before the embed loop — never on a
     /// read/search path, which must not mutate the store.
-    pub fn reconcile_vector_model(&self, current_model: &str) -> Result<bool> {
+    pub fn reconcile_vector_model(
+        &self,
+        current_model: &str,
+        allow_wipe: bool,
+    ) -> Result<ReconcileOutcome> {
         let table_exists: i64 = self.conn().query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='turn_vectors'",
             [],
             |r| r.get(0),
         )?;
         if table_exists == 0 {
-            return Ok(false);
+            return Ok(ReconcileOutcome::Clean);
         }
 
         let mut stmt = self
@@ -331,7 +376,18 @@ impl Database {
 
         let has_foreign = stored_models.iter().any(|m| m != current_model);
         if !has_foreign {
-            return Ok(false);
+            return Ok(ReconcileOutcome::Clean);
+        }
+
+        if !allow_wipe {
+            tracing::error!(
+                current_model,
+                stored_models = ?stored_models,
+                "vector store holds a different embedding model and a wipe was not \
+                 authorized — refusing to clear it (embed aborted). Re-run \
+                 `secall embed --allow-model-switch` for a deliberate model migration."
+            );
+            return Ok(ReconcileOutcome::Refused);
         }
 
         let deleted = self
@@ -343,7 +399,7 @@ impl Database {
             deleted,
             "embedding model changed — cleared stale vectors for a full re-embed"
         );
-        Ok(true)
+        Ok(ReconcileOutcome::Wiped)
     }
 
     /// Vector rows whose session_id does not exist in sessions
@@ -370,7 +426,7 @@ impl Database {
 mod tests {
     use crate::ingest::{AgentKind, Role, Session, TokenUsage, Turn};
     use crate::store::db::Database;
-    use crate::store::{SessionRepo, VectorRepo};
+    use crate::store::{ReconcileOutcome, SessionRepo, VectorRepo};
     use chrono::TimeZone;
 
     fn make_session(id: &str) -> Session {
@@ -505,14 +561,14 @@ mod tests {
         db.insert_vector(&[0.0_f32, 1.0, 0.0], "A", 1, 0, "dragonkue")
             .unwrap();
 
-        let wiped = db.reconcile_vector_model("dragonkue").unwrap();
-        assert!(!wiped, "same model must not wipe");
+        let outcome = db.reconcile_vector_model("dragonkue", true).unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Clean, "same model must not wipe");
         assert!(db.has_embeddings().unwrap(), "vectors must survive");
     }
 
-    /// 모델이 바뀌면 (foreign 행 존재) 테이블 전체를 비운다 — full re-embed 유도.
+    /// 모델이 바뀌고 allow_wipe=true 면 테이블 전체를 비운다 — full re-embed 유도.
     #[test]
-    fn test_reconcile_vector_model_wipes_on_model_change() {
+    fn test_reconcile_vector_model_wipes_on_model_change_when_allowed() {
         let db = Database::open_memory().unwrap();
         db.init_vector_table().unwrap();
         // 옛 bge-m3 (1024차원과 무관하게 model 태그로 판정) 벡터
@@ -521,8 +577,8 @@ mod tests {
         db.insert_vector(&[0.0_f32, 1.0, 0.0], "B", 0, 0, "bge-m3")
             .unwrap();
 
-        let wiped = db.reconcile_vector_model("dragonkue").unwrap();
-        assert!(wiped, "model change must wipe");
+        let outcome = db.reconcile_vector_model("dragonkue", true).unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Wiped, "model change must wipe");
         assert!(!db.has_embeddings().unwrap(), "table must be empty after wipe");
 
         // 비운 뒤에는 차원이 다른 새 모델 벡터도 정상 삽입 (dimension-guard 통과)
@@ -530,15 +586,59 @@ mod tests {
             .unwrap();
     }
 
-    /// 빈 테이블 / 테이블 없음 모두 안전하게 no-op.
+    /// 모델이 바뀌었지만 allow_wipe=false 면 (ORT→Ollama 폴백 등) 절대 지우지 않고
+    /// Refused 를 돌려준다 — 폴백/오타가 기존 벡터 공간을 파괴하지 못하게 막는다.
     #[test]
-    fn test_reconcile_vector_model_noop_when_empty() {
+    fn test_reconcile_vector_model_refuses_wipe_when_not_allowed() {
         let db = Database::open_memory().unwrap();
         db.init_vector_table().unwrap();
-        assert!(!db.reconcile_vector_model("dragonkue").unwrap());
+        db.insert_vector(&[1.0_f32, 0.0, 0.0], "A", 0, 0, "dragonkue")
+            .unwrap();
 
-        // 테이블 자체가 없는 신규 DB에서도 에러 없이 false
+        let outcome = db.reconcile_vector_model("bge-m3", false).unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Refused, "unauthorized wipe must be refused");
+        assert!(db.has_embeddings().unwrap(), "vectors must be untouched on refusal");
+    }
+
+    /// 빈 테이블 / 테이블 없음 모두 안전하게 Clean.
+    #[test]
+    fn test_reconcile_vector_model_clean_when_empty() {
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+        assert_eq!(
+            db.reconcile_vector_model("dragonkue", true).unwrap(),
+            ReconcileOutcome::Clean
+        );
+
+        // 테이블 자체가 없는 신규 DB에서도 에러 없이 Clean
         let fresh = Database::open_memory().unwrap();
-        assert!(!fresh.reconcile_vector_model("dragonkue").unwrap());
+        assert_eq!(
+            fresh.reconcile_vector_model("dragonkue", true).unwrap(),
+            ReconcileOutcome::Clean
+        );
+    }
+
+    /// 같은 (session, turn, chunk, model) 청크를 두 번 삽입하면 두 번째는 무시되고
+    /// (None) 행 수는 1 로 유지된다 — 벡터 저장이 청크 키 기준 멱등.
+    #[test]
+    fn test_insert_vector_idempotent_on_duplicate_chunk_key() {
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+
+        let first = db
+            .insert_vector(&[1.0_f32, 0.0, 0.0], "A", 3, 0, "dragonkue")
+            .unwrap();
+        assert!(first.is_some(), "first insert returns a rowid");
+
+        let second = db
+            .insert_vector(&[1.0_f32, 0.0, 0.0], "A", 3, 0, "dragonkue")
+            .unwrap();
+        assert!(second.is_none(), "duplicate chunk key is ignored → None");
+
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM turn_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "no duplicate row written");
     }
 }

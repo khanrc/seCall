@@ -16,7 +16,7 @@ pub use jobs_repo::JobRow;
 pub use search_repo::SearchRepo;
 pub use session_repo::SessionRepo;
 pub use tag_normalize::{normalize_tag, normalize_tags};
-pub use vector_repo::VectorRepo;
+pub use vector_repo::{ReconcileOutcome, VectorRepo};
 pub use wiki_vector_repo::WikiVectorRepo;
 
 pub fn get_default_db_path() -> PathBuf {

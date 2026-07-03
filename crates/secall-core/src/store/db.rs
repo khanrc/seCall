@@ -183,6 +183,35 @@ impl Database {
                     .execute("ALTER TABLE turns ADD COLUMN actions_json TEXT", [])?;
             }
         }
+        if current < 13 {
+            // Idempotent vector store: one row per (session_id, turn_index,
+            // chunk_seq, model). Before v13, insert_vector was a plain INSERT,
+            // so a manual `embed` racing the daemon embed pass could write
+            // duplicate vectors for the same chunk. Dedup any pre-existing
+            // duplicates (keep the lowest rowid), then add the unique index that
+            // INSERT OR IGNORE now relies on. Guarded on the table existing —
+            // turn_vectors is created lazily by init_vector_table, so a DB that
+            // never embedded won't have it yet (fresh installs get the index
+            // straight from init_vector_table).
+            let tv_exists: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='turn_vectors'",
+                [],
+                |r| r.get(0),
+            )?;
+            if tv_exists > 0 {
+                self.conn.execute(
+                    "DELETE FROM turn_vectors WHERE id NOT IN (
+                         SELECT MIN(id) FROM turn_vectors
+                         GROUP BY session_id, turn_index, chunk_seq, model
+                     )",
+                    [],
+                )?;
+                self.conn.execute_batch(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_vectors_chunk_key \
+                     ON turn_vectors(session_id, turn_index, chunk_seq, model);",
+                )?;
+            }
+        }
         if current < CURRENT_SCHEMA_VERSION {
             self.conn.execute(
                 "INSERT OR REPLACE INTO config(key, value) VALUES ('schema_version', ?1)",
