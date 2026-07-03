@@ -709,7 +709,7 @@ fn ingest_path(
     match parser.parse(session_path) {
         Ok(session) => {
             let sid = session.id.clone();
-            ingest_single_session(
+            let outcome = ingest_single_session(
                 config,
                 compiled_rules,
                 db,
@@ -728,11 +728,16 @@ fn ingest_path(
                 error_details,
                 hook_failures,
             );
-            // 변경 감지 기준 갱신 (#13). 세션이 min_turns/noise 로 skip 되면
-            // 해당 row 가 없어 UPDATE 는 0 rows — 무해.
-            if let Some((size, mtime)) = file_meta {
-                if let Err(e) = db.set_source_meta(&sid, size, mtime) {
-                    tracing::warn!(session = %sid, "failed to record source meta: {}", e);
+            // 변경 감지 기준 갱신 (#13). Advance the source snapshot only when the
+            // ingest did NOT fail — a failed ingest that advances it would make
+            // the next sweep see the source "unchanged" and skip the session,
+            // sealing the failure. A deliberate skip (min_turns/noise) still
+            // advances (its UPDATE is a 0-row no-op when there's no session row).
+            if !matches!(outcome, SessionOutcome::Failed) {
+                if let Some((size, mtime)) = file_meta {
+                    if let Err(e) = db.set_source_meta(&sid, size, mtime) {
+                        tracing::warn!(session = %sid, "failed to record source meta: {}", e);
+                    }
                 }
             }
         }
@@ -1019,6 +1024,20 @@ enum ReingestAction {
     FullRebuild,
 }
 
+/// Result of `ingest_single_session`, used by the caller to gate whether to
+/// advance the source-file `(size, mtime)` snapshot. A failed ingest must NOT
+/// advance it: otherwise the next sweep sees the source "unchanged", skips the
+/// session, and the failure is sealed (its appended turns stay unindexed until
+/// the next append, or forever if it was the last). #1592 removed the
+/// delete-first path that used to self-heal this; this gate replaces it.
+enum SessionOutcome {
+    /// Indexed, or a deliberate skip (noise / min_turns / no new turns) — the
+    /// source snapshot may be recorded.
+    Complete,
+    /// A failure occurred — do not record the snapshot; the next sweep retries.
+    Failed,
+}
+
 /// Decide how to re-ingest an existing session given its agent, the freshly
 /// parsed turn count, and the turn count already in the DB.
 ///
@@ -1073,7 +1092,7 @@ fn ingest_single_session(
     vector_tasks: &mut Vec<secall_core::ingest::Session>,
     error_details: &mut Vec<IngestError>,
     hook_failures: &mut usize,
-) {
+) -> SessionOutcome {
     // P49: TMPDIR / secall 자기참조 노이즈 세션 차단
     if let Some(reason) = secall_core::ingest::is_noise_session(&session) {
         tracing::info!(
@@ -1083,13 +1102,13 @@ fn ingest_single_session(
             "skipping noise session"
         );
         *skipped += 1;
-        return;
+        return SessionOutcome::Complete;
     }
 
     // 턴 수 필터 — min_turns > 0 이면 짧은 세션 skip
     if min_turns > 0 && session.turns.len() < min_turns {
         *skipped_min_turns += 1;
-        return;
+        return SessionOutcome::Complete;
     }
 
     // 세션 분류: 첫 번째 user turn의 내용 또는 project 이름을 규칙과 매칭
@@ -1109,7 +1128,11 @@ fn ingest_single_session(
     }
 
     // 실제 session.id 기준 중복 체크 (--force 시 기존 데이터 삭제 후 재삽입)
-    // compact 후 turn 수가 크게 증가한 경우 자동 재인제스트
+    // compact 후 turn 수가 크게 증가한 경우 자동 재인제스트.
+    // `was_new` gates the vault-md cleanup below: on a BM25 failure we only
+    // delete the md we just created for a *new* session — never a re-ingest's
+    // pre-existing (and possibly already-pushed) md.
+    let mut was_new = false;
     match db.session_exists(&session.id) {
         Ok(true) if !force => {
             // DB turn 수와 파싱된 turn 수 비교 — compact 이후 turn 누락 감지
@@ -1118,7 +1141,9 @@ fn ingest_single_session(
                 Err(e) => {
                     tracing::warn!(session = &session.id, error = %e, "failed to count turns, skipping");
                     *skipped += 1;
-                    return;
+                    // DB error, not a real skip — don't advance source_meta so
+                    // the next sweep retries instead of sealing it.
+                    return SessionOutcome::Failed;
                 }
             };
             let parsed = session.turns.len();
@@ -1138,7 +1163,7 @@ fn ingest_single_session(
                     if let Err(e) = db.delete_session_full(&session.id) {
                         tracing::warn!(session = &session.id, error = %e, "failed to delete session for re-ingest");
                         *errors += 1;
-                        return;
+                        return SessionOutcome::Failed;
                     }
                     // fall through — rebuild from scratch
                 }
@@ -1170,7 +1195,7 @@ fn ingest_single_session(
                     // No new turns on an append-only log — only mtime or the
                     // in-progress last turn changed; nothing to index now.
                     *skipped += 1;
-                    return;
+                    return SessionOutcome::Complete;
                 }
             }
         }
@@ -1185,14 +1210,16 @@ fn ingest_single_session(
                     message: e.to_string(),
                 });
                 *errors += 1;
-                return;
+                return SessionOutcome::Failed;
             }
             tracing::info!(
                 session = &session.id,
                 "deleted existing session for re-ingest"
             );
         }
-        Ok(false) => {}
+        Ok(false) => {
+            was_new = true;
+        }
         Err(e) => {
             tracing::warn!(session = &session.id, error = %e, "DB check failed, skipping");
             error_details.push(IngestError {
@@ -1202,7 +1229,7 @@ fn ingest_single_session(
                 message: e.to_string(),
             });
             *errors += 1;
-            return;
+            return SessionOutcome::Failed;
         }
     }
 
@@ -1219,7 +1246,7 @@ fn ingest_single_session(
                 message: e.to_string(),
             });
             *errors += 1;
-            return;
+            return SessionOutcome::Failed;
         }
     };
 
@@ -1236,8 +1263,17 @@ fn ingest_single_session(
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(session = &session.id, error = %e, "indexing failed, rolling back");
-            if let Err(rm_err) = std::fs::remove_file(config.vault.path.join(&rel_path)) {
-                tracing::warn!(error = %rm_err, "failed to cleanup vault file");
+            // Only clean up the md for a brand-new session (this pass created it
+            // and nothing else references it yet). For a re-ingest (was_new=false)
+            // leave it: on the incremental path the BM25 rollback kept the prior
+            // turns, so deleting the md would strand a populated DB and propagate
+            // the deletion via sync; on a full-rebuild the DB rows are already
+            // gone, so the md is a harmless orphan the next sweep rewrites. Either
+            // way source_meta isn't advanced, so the next sweep re-ingests/re-syncs.
+            if was_new {
+                if let Err(rm_err) = std::fs::remove_file(config.vault.path.join(&rel_path)) {
+                    tracing::warn!(error = %rm_err, "failed to cleanup vault file");
+                }
             }
             error_details.push(IngestError {
                 path: String::new(),
@@ -1246,7 +1282,7 @@ fn ingest_single_session(
                 message: e.to_string(),
             });
             *errors += 1;
-            return;
+            return SessionOutcome::Failed;
         }
     };
 
@@ -1269,6 +1305,8 @@ fn ingest_single_session(
     if !skip_embed {
         vector_tasks.push(session);
     }
+
+    SessionOutcome::Complete
 }
 
 fn collect_paths(path: Option<&str>, auto: bool, cwd: Option<&Path>) -> Result<Vec<PathBuf>> {

@@ -390,14 +390,22 @@ impl Database {
             return Ok(ReconcileOutcome::Refused);
         }
 
-        let deleted = self
-            .conn()
-            .execute("DELETE FROM turn_vectors", [])?;
+        // Scope the wipe to foreign-model rows. Since schema v13 put `model` in
+        // the unique chunk key, current-model vectors are valid regardless of a
+        // foreign model's presence, so there's no need to clear them — and doing
+        // so turns recovery from a few stray foreign rows (e.g. a cross-process
+        // model switch mid-embed) into a multi-hour full re-embed of every
+        // current vector. Identical to the whole-table wipe in the normal
+        // migration case (all rows foreign).
+        let deleted = self.conn().execute(
+            "DELETE FROM turn_vectors WHERE model != ?1",
+            rusqlite::params![current_model],
+        )?;
         tracing::warn!(
             current_model,
             stale_models = ?stored_models,
             deleted,
-            "embedding model changed — cleared stale vectors for a full re-embed"
+            "embedding model changed — cleared stale (foreign-model) vectors for re-embed"
         );
         Ok(ReconcileOutcome::Wiped)
     }
@@ -584,6 +592,39 @@ mod tests {
         // 비운 뒤에는 차원이 다른 새 모델 벡터도 정상 삽입 (dimension-guard 통과)
         db.insert_vector(&[0.1_f32, 0.2], "A", 0, 0, "dragonkue")
             .unwrap();
+    }
+
+    /// A model change wipes only the foreign-model rows; current-model vectors
+    /// survive (schema v13 keys on `model`, so they're valid regardless). This
+    /// keeps recovery from a few stray foreign rows O(foreign) instead of a
+    /// full re-embed of the live set.
+    #[test]
+    fn test_reconcile_vector_model_wipe_is_scoped_to_foreign_rows() {
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+        // Live dragonkue vectors + a few stray foreign rows (same dim so both
+        // coexist past the dimension guard — the realistic mixed-model case).
+        db.insert_vector(&[0.1_f32, 0.2, 0.3], "live1", 0, 0, "dragonkue")
+            .unwrap();
+        db.insert_vector(&[0.4_f32, 0.5, 0.6], "live2", 0, 0, "dragonkue")
+            .unwrap();
+        db.insert_vector(&[1.0_f32, 0.0, 0.0], "stray", 0, 0, "bge-m3")
+            .unwrap();
+
+        let outcome = db.reconcile_vector_model("dragonkue", true).unwrap();
+        assert_eq!(outcome, ReconcileOutcome::Wiped, "foreign rows present → Wiped");
+
+        let count = |model: &str| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM turn_vectors WHERE model = ?1",
+                    rusqlite::params![model],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count("dragonkue"), 2, "current-model vectors must be preserved");
+        assert_eq!(count("bge-m3"), 0, "foreign-model vectors must be cleared");
     }
 
     /// 모델이 바뀌었지만 allow_wipe=false 면 (ORT→Ollama 폴백 등) 절대 지우지 않고
