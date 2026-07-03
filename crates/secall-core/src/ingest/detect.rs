@@ -159,6 +159,18 @@ pub fn find_claude_sessions(base: Option<&Path>) -> Result<Vec<std::path::PathBu
         .filter_map(|e| e.ok())
     {
         let p = entry.path();
+        // Skip the subagents/ subtree entirely. Subagent transcripts
+        // (…/<parent>/subagents/agent-<hash>.jsonl) carry the PARENT session's
+        // `sessionId` (isSidechain), so parsing them lands on the parent's DB
+        // row and fights over its turns/vectors — a driver of the #1592
+        // oscillating-coverage churn. Workflow journals
+        // (…/subagents/workflows/wf_*/journal.jsonl) are non-conversational
+        // event logs that all collapse to the filename-stem id "journal".
+        // Indexing subagent conversations as first-class sessions needs
+        // synthesized unique ids and is tracked separately.
+        if p.components().any(|c| c.as_os_str() == "subagents") {
+            continue;
+        }
         if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
             paths.push(p.to_path_buf());
         }
@@ -279,6 +291,39 @@ mod tests {
             parser.agent_kind(),
             super::super::types::AgentKind::ClaudeCode
         );
+    }
+
+    #[test]
+    fn test_find_claude_sessions_skips_subagents_subtree() {
+        // Parent session files are indexed; everything under a `subagents/`
+        // subtree (sidechain transcripts + workflow journals) is skipped, since
+        // subagent transcripts carry the parent's sessionId and collide on its
+        // row (#1592).
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("-home-user-proj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let parent = make_jsonl_file(
+            &proj,
+            "11111111-2222-3333-4444-555555555555.jsonl",
+            &[r#"{"sessionId":"11111111-2222-3333-4444-555555555555","type":"user","message":{"role":"user","content":[]}}"#],
+        );
+
+        let sub = proj
+            .join("11111111-2222-3333-4444-555555555555")
+            .join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        make_jsonl_file(
+            &sub,
+            "agent-abc.jsonl",
+            &[r#"{"sessionId":"11111111-2222-3333-4444-555555555555","isSidechain":true,"type":"user","message":{"role":"user","content":[]}}"#],
+        );
+        let wf = sub.join("workflows").join("wf_1");
+        std::fs::create_dir_all(&wf).unwrap();
+        make_jsonl_file(&wf, "journal.jsonl", &[r#"{"type":"started","key":"x","agentId":"a"}"#]);
+
+        let found = find_claude_sessions(Some(dir.path())).unwrap();
+        assert_eq!(found, vec![parent]);
     }
 
     #[test]

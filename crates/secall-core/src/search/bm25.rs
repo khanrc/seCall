@@ -96,14 +96,20 @@ impl Bm25Indexer {
         db.insert_session(session)?;
 
         for turn in &session.turns {
-            // Index the same text the vector chunker embeds: content + folded
-            // tool-call summaries, thinking excluded (#1585). Keeps tool-only
-            // turns searchable via BM25 and keeps the two channels aligned.
-            let full_text = self.tokenizer.tokenize_for_fts(&turn.index_text());
-
-            db.insert_turn(&session.id, turn)?;
-            db.insert_fts(&full_text, &session.id, turn.index)?;
-            stats.turns_indexed += 1;
+            // Turn-incremental: `turns_fts` is a plain FTS5 insert with no dedup,
+            // so we may only insert it for turns `insert_turn` reports as newly
+            // added (rows affected == 1). Re-indexing an append-grown session
+            // then adds FTS rows for the new turns only, never duplicating the
+            // ones already indexed. `turns` itself is INSERT OR IGNORE.
+            let newly_inserted = db.insert_turn(&session.id, turn)? > 0;
+            if newly_inserted {
+                // Index the same text the vector chunker embeds: content + folded
+                // tool-call summaries, thinking excluded (#1585). Keeps tool-only
+                // turns searchable via BM25 and keeps the two channels aligned.
+                let full_text = self.tokenizer.tokenize_for_fts(&turn.index_text());
+                db.insert_fts(&full_text, &session.id, turn.index)?;
+                stats.turns_indexed += 1;
+            }
         }
 
         Ok(stats)
@@ -341,6 +347,64 @@ mod tests {
             archived: false,
             archived_at: None,
         }
+    }
+
+    #[test]
+    fn test_index_session_incremental_no_fts_dup() {
+        // Re-indexing an append-grown session must add FTS rows for the NEW
+        // turns only — never duplicating turns already indexed — and must
+        // refresh the sessions.turn_count aggregate (upsert). Regression guard
+        // for the #1592 incremental re-index path.
+        let db = Database::open_memory().unwrap();
+        let tok = LinderaKoTokenizer::new().unwrap();
+        let indexer = Bm25Indexer::new(Box::new(tok));
+
+        let fts_count = |db: &Database| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM turns_fts WHERE session_id = 'grow'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let stored_turn_count = |db: &Database| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT turn_count FROM sessions WHERE id = 'grow'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        let before = make_multi_turn_session(
+            "grow",
+            vec![("", "alpha turn one"), ("", "beta turn two")],
+        );
+        let stats = indexer.index_session(&db, &before).unwrap();
+        assert_eq!(stats.turns_indexed, 2);
+        assert_eq!(fts_count(&db), 2);
+        assert_eq!(db.count_turns_for_session("grow").unwrap(), 2);
+        assert_eq!(stored_turn_count(&db), 2);
+
+        // Session grew by two turns; re-index the whole (grown) session.
+        let after = make_multi_turn_session(
+            "grow",
+            vec![
+                ("", "alpha turn one"),
+                ("", "beta turn two"),
+                ("", "gamma turn three"),
+                ("", "delta turn four"),
+            ],
+        );
+        let stats = indexer.index_session(&db, &after).unwrap();
+        // Only the 2 genuinely-new turns are indexed — no FTS duplication.
+        assert_eq!(stats.turns_indexed, 2);
+        assert_eq!(fts_count(&db), 4);
+        assert_eq!(db.count_turns_for_session("grow").unwrap(), 4);
+        // Upsert refreshed the aggregate (INSERT OR IGNORE would freeze it at 2).
+        assert_eq!(stored_turn_count(&db), 4);
     }
 
     #[test]

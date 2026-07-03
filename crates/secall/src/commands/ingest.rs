@@ -660,16 +660,15 @@ fn ingest_path(
                 // 로 보였기 때문 (#13).
                 let stored = db.get_source_meta(session_id_hint).unwrap_or(None);
                 if source_changed(stored, file_meta) {
-                    if let Err(e) = db.delete_session_full(session_id_hint) {
-                        tracing::warn!(
-                            session = session_id_hint,
-                            "failed to delete changed session: {}",
-                            e
-                        );
-                        *skipped += 1;
-                        return;
-                    }
-                    tracing::debug!(session = session_id_hint, "re-ingesting changed session");
+                    // Source grew (CC/codex/gemini JSONLs are append-only). Do NOT
+                    // delete here — fall through to parse + ingest_single_session,
+                    // which re-indexes turn-incrementally (new turns only) and
+                    // preserves existing turn_vectors. Deleting the whole session
+                    // on every append is what wiped vectors under `--no-embed`
+                    // and caused the oscillating coverage in #1592. The genuine
+                    // full-rebuild cases (compaction, `--force`) still delete,
+                    // inside ingest_single_session.
+                    tracing::debug!(session = session_id_hint, "re-ingesting changed session (incremental)");
                 } else {
                     *skipped += 1;
                     return;
@@ -991,6 +990,40 @@ pub(crate) fn apply_classification(
         .unwrap_or_else(|| default_type.to_string())
 }
 
+/// How to re-ingest a session that already exists in the DB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReingestAction {
+    /// No new turns on an append-only log — skip.
+    Skip,
+    /// Append-only growth: index the new turns, preserve existing rows/vectors.
+    Incremental,
+    /// Delete + rebuild: huge turn jump (compaction/renumber), a shrink, or a
+    /// non-append-only agent whose file is rewritten wholesale (Gemini).
+    FullRebuild,
+}
+
+/// Decide how to re-ingest an existing session given its agent, the freshly
+/// parsed turn count, and the turn count already in the DB.
+///
+/// Only append-only agents (Claude Code / Codex JSONL) take the incremental
+/// fast-path — their already-indexed turns are immutable, so new turns can be
+/// added without wiping vectors (#1592). Any agent whose session file is
+/// rewritten wholesale (Gemini writes a single `session-*.json`) must rebuild,
+/// as must a shrink or a compaction-scale jump, so stale rows are never sealed.
+fn decide_reingest(agent: &AgentKind, parsed: usize, db_turn_count: usize) -> ReingestAction {
+    let append_only = matches!(agent, AgentKind::ClaudeCode | AgentKind::Codex);
+    if parsed > db_turn_count + 10 && parsed > db_turn_count * 2 {
+        ReingestAction::FullRebuild
+    } else if append_only && parsed > db_turn_count {
+        ReingestAction::Incremental
+    } else if append_only && parsed == db_turn_count {
+        ReingestAction::Skip
+    } else {
+        // shrink (parsed < db_turn_count) or a non-append-only agent
+        ReingestAction::FullRebuild
+    }
+}
+
 /// 단일 Session을 vault + BM25 + 벡터 목록에 ingest
 #[allow(clippy::too_many_arguments)]
 fn ingest_single_session(
@@ -1059,22 +1092,57 @@ fn ingest_single_session(
                     return;
                 }
             };
-            if session.turns.len() > db_turn_count + 10 && session.turns.len() > db_turn_count * 2 {
-                tracing::info!(
-                    session = &session.id,
-                    db_turns = db_turn_count,
-                    parsed_turns = session.turns.len(),
-                    "re-ingesting session with significantly more turns"
-                );
-                if let Err(e) = db.delete_session_full(&session.id) {
-                    tracing::warn!(session = &session.id, error = %e, "failed to delete session for auto re-ingest");
-                    *errors += 1;
+            let parsed = session.turns.len();
+            match decide_reingest(&session.agent, parsed, db_turn_count) {
+                ReingestAction::FullRebuild => {
+                    // Huge turn jump (compaction / renumber), a shrink, or a
+                    // non-append-only agent (e.g. Gemini rewrites the whole
+                    // session file) — existing turns may have changed, so a full
+                    // delete + rebuild is the only way to avoid sealing stale
+                    // turns/FTS/vectors.
+                    tracing::info!(
+                        session = &session.id,
+                        db_turns = db_turn_count,
+                        parsed_turns = parsed,
+                        "re-ingesting session (full rebuild)"
+                    );
+                    if let Err(e) = db.delete_session_full(&session.id) {
+                        tracing::warn!(session = &session.id, error = %e, "failed to delete session for re-ingest");
+                        *errors += 1;
+                        return;
+                    }
+                    // fall through — rebuild from scratch
+                }
+                ReingestAction::Incremental => {
+                    // Append-growth on an append-only log (the common, hot path).
+                    // Fall through WITHOUT deleting — index_session_bm25 inserts
+                    // just the new turns/FTS (INSERT OR IGNORE + newly-inserted
+                    // gate) while the embed pass fills only the new chunks
+                    // (get_session_chunk_keys), so existing turn_vectors are
+                    // preserved. Deleting here is what wiped vectors on every
+                    // append and caused the oscillating coverage in #1592.
+                    //
+                    // This assumes already-indexed turns are immutable — true for
+                    // CC/codex append-only JSONL. The one gap: a boundary turn
+                    // captured mid-write (a single assistant message split across
+                    // JSONL lines by message.id) can stay partial until the next
+                    // full rebuild (compaction/--force), since INSERT OR IGNORE
+                    // won't update it. That is a bounded, low-probability recall
+                    // gap on a single turn — accepted, not worked around.
+                    tracing::debug!(
+                        session = &session.id,
+                        db_turns = db_turn_count,
+                        parsed_turns = parsed,
+                        "incrementally re-indexing appended turns"
+                    );
+                    // fall through — incremental re-index, no delete
+                }
+                ReingestAction::Skip => {
+                    // No new turns on an append-only log — only mtime or the
+                    // in-progress last turn changed; nothing to index now.
+                    *skipped += 1;
                     return;
                 }
-                // 아래로 계속 진행하여 재인제스트
-            } else {
-                *skipped += 1;
-                return;
             }
         }
         Ok(true) => {
@@ -1252,6 +1320,44 @@ mod tests {
         assert!(source_changed(Some((100, 10)), Some((100, 20))));
         // 지금 stat 불가 → 보수적으로 재인제스트
         assert!(source_changed(Some((100, 10)), None));
+    }
+
+    #[test]
+    fn test_decide_reingest_append_only_agents() {
+        use ReingestAction::*;
+        // Append-only agents (CC/codex): new turns → incremental, same → skip,
+        // shrink → full rebuild, compaction-scale jump → full rebuild.
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex] {
+            assert_eq!(decide_reingest(&agent, 30, 25), Incremental);
+            assert_eq!(decide_reingest(&agent, 25, 25), Skip);
+            assert_eq!(decide_reingest(&agent, 20, 25), FullRebuild);
+            // > db+10 && > db*2
+            assert_eq!(decide_reingest(&agent, 60, 25), FullRebuild);
+            // grew but not past the 2× compaction threshold → still incremental
+            assert_eq!(decide_reingest(&agent, 40, 25), Incremental);
+            // from an empty/zombie row, any turns are new → incremental
+            assert_eq!(decide_reingest(&agent, 5, 0), Incremental);
+        }
+    }
+
+    #[test]
+    fn test_decide_reingest_non_append_agents_always_rebuild() {
+        use ReingestAction::*;
+        // Agents whose session file is rewritten wholesale (Gemini, Claude.ai /
+        // ChatGPT exports) or whose append-safety is unverified (OpenCode) never
+        // take the incremental fast-path — existing turns may change, so rebuild
+        // on any change to avoid sealing stale rows.
+        for agent in [
+            AgentKind::GeminiCli,
+            AgentKind::GeminiWeb,
+            AgentKind::ClaudeAi,
+            AgentKind::ChatGpt,
+            AgentKind::OpenCode,
+        ] {
+            assert_eq!(decide_reingest(&agent, 30, 25), FullRebuild);
+            assert_eq!(decide_reingest(&agent, 25, 25), FullRebuild);
+            assert_eq!(decide_reingest(&agent, 20, 25), FullRebuild);
+        }
     }
 
     fn pattern_rules(patterns: &[(&str, &str)]) -> Vec<CompiledRule> {
