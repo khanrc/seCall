@@ -22,6 +22,12 @@ fn has_invalid_values(embedding: &[f32]) -> bool {
     embedding.iter().any(|v| v.is_nan() || v.is_infinite())
 }
 
+/// Chunks committed per write transaction in the embed pass. Bounds how long any
+/// single transaction holds the WAL write lock so it never outlasts busy_timeout
+/// under writer contention — a whole-session transaction rolled back large
+/// sessions indefinitely (logan-cha/log#1590).
+const COMMIT_BATCH_CHUNKS: usize = 128;
+
 #[derive(Debug)]
 pub struct VectorRow {
     pub rowid: i64,
@@ -249,35 +255,68 @@ impl VectorIndexer {
             );
         }
 
-        // Phase 2: INSERT only — DELETE 단계 없음. 이미 임베딩된 chunk는 보존되므로
-        // partial commit이 발생해도 다음 호출이 잔여분만 채운다 (turn-incremental).
-        let mut chunks_embedded = 0usize;
+        // Phase 2: INSERT only (no DELETE) — already-embedded chunks are preserved,
+        // so a partial commit only leaves the remainder for the next call
+        // (turn-incremental). Committed in bounded batches: a whole-session
+        // transaction on a large session outlasts busy_timeout under writer
+        // contention and the entire session rolls back to 0 vectors, permanently
+        // (logan-cha/log#1590). Per-batch transactions stay short (busy_timeout
+        // always covers them), and a lost race costs one batch — the committed
+        // batches survive and the session advances every cycle.
+        let embedded: Vec<(&super::chunker::Chunk, &Vec<f32>)> = pending_chunks
+            .iter()
+            .zip(embeddings.iter())
+            .filter_map(|(chunk, emb)| emb.as_ref().map(|e| (*chunk, e)))
+            .collect();
 
-        db.with_transaction(|| {
-            for (chunk, emb_opt) in pending_chunks.iter().zip(embeddings.iter()) {
-                if let Some(embedding) = emb_opt {
-                    let rowid = db.insert_vector(
+        let mut chunks_embedded = 0usize;
+        for batch in embedded.chunks(COMMIT_BATCH_CHUNKS) {
+            // rowids go to the in-memory ANN only after the batch commits — a
+            // rolled-back insert must not leave a phantom rowid in the index.
+            let mut committed: Vec<(i64, &Vec<f32>)> = Vec::new();
+            // Re-check existence inside the write transaction. A concurrent
+            // delete_session_full (rebuild / --force) between batches must not
+            // leave later batches orphaned against a deleted session (turn_vectors
+            // has no sessions FK). Both are BEGIN IMMEDIATE, so they serialize:
+            // if the delete won, we skip (its wipe already removed our earlier
+            // batches); if we win, the delete then wipes what we wrote. No orphans.
+            // Residual (out of scope, self-healing on next rebuild): a delete+
+            // reinsert of the same id in this gap can attach this run's stale
+            // vectors to the rebuilt session — closing that needs a per-session
+            // generation token, not just a presence check (logan-cha/log#1605).
+            let session_live = db.with_transaction(|| {
+                if !db.session_exists(&session.id)? {
+                    return Ok(false);
+                }
+                for &(chunk, embedding) in batch {
+                    // None → an identical chunk row already existed (idempotent insert).
+                    if let Some(rowid) = db.insert_vector(
                         embedding,
                         &chunk.session_id,
                         chunk.turn_index,
                         chunk.seq,
                         self.embedder.model_name(),
-                    )?; // Err → 클로저 종료 → ROLLBACK
-                    // None → an identical chunk row already existed (idempotent
-                    // insert); don't count it or add a stale rowid to the ANN.
-                    if let Some(rowid) = rowid {
-                        chunks_embedded += 1;
-                        #[cfg(not(target_os = "windows"))]
-                        if let Some(ref ann) = self.ann_index {
-                            if let Err(e) = ann.add(rowid as u64, embedding) {
-                                tracing::warn!(error = %e, "ANN index add failed");
-                            }
-                        }
+                    )? {
+                        committed.push((rowid, embedding));
+                    }
+                }
+                Ok(true)
+            })?; // A batch error (lock timeout, dimension/disk failure) propagates:
+                 // batches already committed persist in their own transactions and
+                 // the next cycle resumes the remainder — no silent partial success.
+            if !session_live {
+                break;
+            }
+            chunks_embedded += committed.len();
+            #[cfg(not(target_os = "windows"))]
+            if let Some(ref ann) = self.ann_index {
+                for (rowid, embedding) in &committed {
+                    if let Err(e) = ann.add(*rowid as u64, embedding) {
+                        tracing::warn!(error = %e, "ANN index add failed");
                     }
                 }
             }
-            Ok(())
-        })?;
+        }
 
         Ok(IndexStats {
             chunks_embedded,
@@ -713,6 +752,126 @@ mod tests {
     use super::*;
     use crate::store::db::Database;
     use crate::store::vector_repo::{bytes_to_floats, cosine_distance};
+
+    /// Deterministic embedder for index-path tests — fixed small vector, no model.
+    struct FakeEmbedder;
+    #[async_trait::async_trait]
+    impl Embedder for FakeEmbedder {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(vec![0.1_f32; 8])
+        }
+        async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.1_f32; 8]).collect())
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        fn dimensions(&self) -> usize {
+            8
+        }
+        fn model_name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_index_session_commits_across_batches() {
+        // A session with more chunks than COMMIT_BATCH_CHUNKS must embed every
+        // chunk — the batched Phase 2 commit (#1605) must not drop the tail batch.
+        use crate::ingest::{AgentKind, Role, Session, TokenUsage, Turn};
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+
+        let n = COMMIT_BATCH_CHUNKS + 5; // spans two batches
+        let turns: Vec<Turn> = (0..n as u32)
+            .map(|i| Turn {
+                index: i,
+                role: Role::User,
+                timestamp: None,
+                content: format!("turn {i} content"),
+                actions: vec![],
+                tokens: None,
+                thinking: None,
+                is_sidechain: false,
+            })
+            .collect();
+        let session = Session {
+            id: "batch-sess".to_string(),
+            agent: AgentKind::ClaudeCode,
+            model: None,
+            project: None,
+            cwd: None,
+            git_branch: None,
+            host: None,
+            start_time: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            end_time: None,
+            turns,
+            total_tokens: TokenUsage::default(),
+            session_type: "interactive".to_string(),
+            archived: false,
+            archived_at: None,
+        };
+        // The Phase-2 batch guard checks session_exists, so the row must be present.
+        db.insert_session(&session).unwrap();
+
+        let indexer = VectorIndexer::new(Box::new(FakeEmbedder));
+        let stats = indexer
+            .index_session(&db, &session, chrono_tz::UTC)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.chunks_embedded, n);
+        assert_eq!(db.get_session_chunk_keys(&session.id).unwrap().len(), n);
+    }
+
+    #[tokio::test]
+    async fn test_index_session_skips_when_session_row_absent() {
+        // Orphan guard (#1605): if the session row is gone (a concurrent
+        // delete_session_full mid-embed), Phase 2 must insert no vectors — else
+        // turn_vectors, which has no sessions FK, would hold orphans.
+        use crate::ingest::{AgentKind, Role, Session, TokenUsage, Turn};
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+
+        let session = Session {
+            id: "gone-sess".to_string(),
+            agent: AgentKind::ClaudeCode,
+            model: None,
+            project: None,
+            cwd: None,
+            git_branch: None,
+            host: None,
+            start_time: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            end_time: None,
+            turns: vec![Turn {
+                index: 0,
+                role: Role::User,
+                timestamp: None,
+                content: "orphan probe".to_string(),
+                actions: vec![],
+                tokens: None,
+                thinking: None,
+                is_sidechain: false,
+            }],
+            total_tokens: TokenUsage::default(),
+            session_type: "interactive".to_string(),
+            archived: false,
+            archived_at: None,
+        };
+        // Deliberately NOT inserting the session row — simulates it being deleted.
+        let indexer = VectorIndexer::new(Box::new(FakeEmbedder));
+        let stats = indexer
+            .index_session(&db, &session, chrono_tz::UTC)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.chunks_embedded, 0);
+        assert_eq!(db.get_session_chunk_keys(&session.id).unwrap().len(), 0);
+    }
 
     #[test]
     fn test_vector_indexer_with_trait_object() {
