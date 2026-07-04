@@ -4,7 +4,9 @@
 /// macOS environment (Darwin 25.4, arm64). We use BLOB-based storage with
 /// in-memory cosine similarity as a fallback. This is functionally equivalent
 /// for MVP scale (< 100k chunks).
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{anyhow, Result};
 
 #[cfg(not(target_os = "windows"))]
 use super::ann::AnnIndex;
@@ -526,6 +528,27 @@ fn resolve_pool_size(config: &crate::vault::config::Config) -> usize {
 /// prefixes are bound to the ORT model (model_manager::model_prefixes) and
 /// applied only on the ORT paths — they are a property of that model, not a
 /// user setting, so a non-e5 backend (ollama/openai) never carries them.
+/// Build an `OrtEmbedder`, converting ort's dylib-load *panic* into an `Err`.
+///
+/// ort (load-dynamic) dlopens libonnxruntime.so lazily in `lib_handle` via
+/// `libloading::Library::new(path).unwrap_or_else(|e| panic!(...))` — a panic,
+/// not a `Result::Err` — and `Session::builder()` inside `with_pool_size`
+/// triggers it synchronously on first use. Left unguarded, an absent/unloadable
+/// dylib aborts the whole process (exit 101) before any caller's no-backend
+/// branch runs, so the daemon's embed-down alert (keyed on exit 10) never fires
+/// and recall/serve crash instead of degrading to BM25. `catch_unwind` turns
+/// that into an `Err` (panic = unwind is in effect — no `panic = "abort"`).
+fn build_ort_embedder(model_dir: &Path, pool: usize) -> Result<OrtEmbedder> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        OrtEmbedder::with_pool_size(model_dir, pool)
+    })) {
+        Ok(res) => res,
+        Err(_) => Err(anyhow!(
+            "ONNX Runtime failed to load (libonnxruntime.so missing or unloadable)"
+        )),
+    }
+}
+
 /// Falls back to Ollama if ort fails; returns None if neither is available.
 pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
     let indexer = match config.embedding.backend.as_str() {
@@ -547,7 +570,7 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
             }
 
             let pool = resolve_pool_size(config);
-            match OrtEmbedder::with_pool_size(&model_dir, pool) {
+            match build_ort_embedder(&model_dir, pool) {
                 Ok(e) => {
                     tracing::info!(
                         pool_size = pool,
@@ -672,7 +695,7 @@ async fn try_ort_cpu_fallback(config: &Config) -> Option<VectorIndexer> {
         .unwrap_or_else(default_model_path);
 
     let pool = resolve_pool_size(config);
-    match OrtEmbedder::with_pool_size(&model_dir, pool) {
+    match build_ort_embedder(&model_dir, pool) {
         Ok(e) => {
             tracing::info!(
                 pool_size = pool,
