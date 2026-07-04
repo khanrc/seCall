@@ -87,6 +87,28 @@ pub fn is_noise_session(session: &Session) -> Option<&'static str> {
     None
 }
 
+/// Reason a parsed session is not an indexable standalone conversation, or `None`.
+/// Intrinsic to the parsed content — independent of the `subagents/` path skip in
+/// the ingest collector (which is only a fast pre-filter), so it still holds if CC
+/// renames that subtree (logan-cha/log#1607):
+///
+/// - **no turns** — a workflow journal (`subagents/workflows/wf_*/journal.jsonl`)
+///   is a `type:started/result` event log that parses to zero turns; lacking a
+///   content `sessionId` it would take the filename-stem id "journal" and collide
+///   across every workflow.
+/// - **subagent sidechain** — `subagents/agent-<hash>.jsonl` (all turns
+///   `isSidechain`) carries the PARENT session's `sessionId`, so ingesting it as
+///   the parent shrinks the turn count → FullRebuild → the parent's vectors wiped.
+pub fn subagent_skip_reason(session: &Session) -> Option<&'static str> {
+    if session.turns.is_empty() {
+        return Some("no turns");
+    }
+    if session.turns.iter().all(|t| t.is_sidechain) {
+        return Some("subagent sidechain");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +157,42 @@ mod tests {
     fn is_noise_linux_var_folders() {
         let s = dummy_session(Some("/var/folders/x/y/T"), None);
         assert_eq!(is_noise_session(&s), Some("tmpdir cwd"));
+    }
+
+    #[test]
+    fn subagent_skip_empty_is_no_turns() {
+        let s = dummy_session(Some("/home/u/proj"), None); // zero turns (e.g. journal)
+        assert_eq!(subagent_skip_reason(&s), Some("no turns"));
+    }
+
+    #[test]
+    fn subagent_skip_all_sidechain() {
+        let mut s = dummy_session(Some("/home/u/proj"), Some("hi"));
+        s.turns[0].is_sidechain = true;
+        assert_eq!(subagent_skip_reason(&s), Some("subagent sidechain"));
+    }
+
+    #[test]
+    fn subagent_skip_normal_session_is_none() {
+        let s = dummy_session(Some("/home/u/proj"), Some("hi"));
+        assert_eq!(subagent_skip_reason(&s), None);
+    }
+
+    #[test]
+    fn subagent_skip_mixed_turns_is_none() {
+        // A parent whose own file inlines a sidechain turn must NOT be skipped.
+        let mut s = dummy_session(Some("/home/u/proj"), Some("hi"));
+        s.turns.push(Turn {
+            index: 1,
+            role: Role::Assistant,
+            timestamp: None,
+            content: "sub".into(),
+            actions: vec![],
+            tokens: None,
+            thinking: None,
+            is_sidechain: true,
+        });
+        assert_eq!(subagent_skip_reason(&s), None);
     }
 
     #[test]

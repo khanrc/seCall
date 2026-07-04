@@ -729,12 +729,15 @@ fn ingest_path(
                 error_details,
                 hook_failures,
             );
-            // 변경 감지 기준 갱신 (#13). Advance the source snapshot only when the
-            // ingest did NOT fail — a failed ingest that advances it would make
-            // the next sweep see the source "unchanged" and skip the session,
-            // sealing the failure. A deliberate skip (min_turns/noise) still
-            // advances (its UPDATE is a 0-row no-op when there's no session row).
-            if !matches!(outcome, SessionOutcome::Failed) {
+            // 변경 감지 기준 갱신 (#13). Advance the source snapshot only on
+            // Complete. Failed must not advance (the next sweep would see the
+            // source "unchanged", skip, and seal the failure). SkippedForeign must
+            // not advance either: `sid` is a foreign id (the parent's, for a
+            // sidechain), so recording this file's meta under it would corrupt the
+            // parent's change detection (#1607). A same-identity skip (min_turns /
+            // noise) is Complete and still advances (its UPDATE is a 0-row no-op
+            // when there's no session row).
+            if matches!(outcome, SessionOutcome::Complete) {
                 if let Some((size, mtime)) = file_meta {
                     if let Err(e) = db.set_source_meta(&sid, size, mtime) {
                         tracing::warn!(session = %sid, "failed to record source meta: {}", e);
@@ -1032,11 +1035,17 @@ enum ReingestAction {
 /// the next append, or forever if it was the last). #1592 removed the
 /// delete-first path that used to self-heal this; this gate replaces it.
 enum SessionOutcome {
-    /// Indexed, or a deliberate skip (noise / min_turns / no new turns) — the
-    /// source snapshot may be recorded.
+    /// Indexed, or a deliberate skip of a session that OWNS its id (noise /
+    /// min_turns / no new turns) — the source snapshot may be recorded.
     Complete,
     /// A failure occurred — do not record the snapshot; the next sweep retries.
     Failed,
+    /// Skipped a file that does not own its parsed id — a subagent sidechain
+    /// (borrows the PARENT's sessionId) or an empty/journal transcript. The
+    /// snapshot must NOT be recorded: keyed by the parsed id it would stamp the
+    /// parent's row with this file's `(size, mtime)`, corrupting the parent's
+    /// change detection. There is no own row to record against anyway. (#1607)
+    SkippedForeign,
 }
 
 /// Decide how to re-ingest an existing session given its agent, the freshly
@@ -1094,6 +1103,17 @@ fn ingest_single_session(
     error_details: &mut Vec<IngestError>,
     hook_failures: &mut usize,
 ) -> SessionOutcome {
+    // Contract-robust guard (logan-cha/log#1607): skip files that aren't an
+    // indexable standalone conversation — empty transcripts (workflow journals)
+    // and subagent sidechains (carry the parent's sessionId). Intrinsic to the
+    // parsed content, so it holds even if the `subagents/` path pre-filter is
+    // bypassed or CC renames that subtree.
+    if let Some(reason) = secall_core::ingest::subagent_skip_reason(&session) {
+        tracing::debug!(session = &session.id, reason, "skipping non-indexable session");
+        *skipped += 1;
+        return SessionOutcome::SkippedForeign;
+    }
+
     // P49: TMPDIR / secall 자기참조 노이즈 세션 차단
     if let Some(reason) = secall_core::ingest::is_noise_session(&session) {
         tracing::info!(
