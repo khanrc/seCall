@@ -2,6 +2,7 @@ mod commands;
 mod output;
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use output::OutputFormat;
@@ -466,7 +467,7 @@ enum GraphAction {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<ExitCode> {
     // P39 — `.env` 자동 로드 (cwd 또는 부모 디렉토리). secall sync 등 명령이
     // OLLAMA_CLOUD_API_KEY 같은 env var 를 사용하기 전에 로드. 파일 없으면
     // silently skip (운영 환경에서 env var 직접 export 한 경우 문제 없음).
@@ -556,7 +557,12 @@ async fn main() -> anyhow::Result<()> {
             concurrency,
             allow_model_switch,
         } => {
-            commands::embed::run(all, batch_size, concurrency, allow_model_switch).await?;
+            // Embed maps its outcome to a dedicated exit code (no-backend /
+            // reconcile-refused / all-failed) so the daemon alert can branch on
+            // the signal instead of scraping stderr. Other commands exit 0 / 1.
+            let outcome =
+                commands::embed::run(all, batch_size, concurrency, allow_model_switch).await?;
+            return Ok(ExitCode::from(outcome.exit_code()));
         }
         Commands::Classify { dry_run } => {
             commands::classify::run_backfill(dry_run).await?;
@@ -734,5 +740,5 @@ async fn main() -> anyhow::Result<()> {
         },
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
