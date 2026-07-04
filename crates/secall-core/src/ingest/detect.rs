@@ -135,6 +135,20 @@ pub fn detect_parser(path: &Path) -> Result<Box<dyn SessionParser>> {
     Err(anyhow!("unknown session format: {}", path.display()))
 }
 
+/// True when `p` lies under a `subagents/` subtree. Subagent transcripts
+/// (…/<parent>/subagents/agent-<hash>.jsonl) carry the PARENT session's
+/// `sessionId` (isSidechain), so ingesting one lands on the parent's DB row and
+/// wipes/rebuilds its turns + vectors — the #1592 oscillating-coverage churn.
+/// Workflow journals (…/subagents/workflows/wf_*/journal.jsonl) are
+/// non-conversational event logs that all collapse to the stem id "journal".
+/// This must hold at EVERY ingest entry point, not just directory enumeration:
+/// a caller passing such a path directly (e.g. a `**/*.jsonl` catchup glob)
+/// would otherwise bypass the enumerator's skip. Indexing subagent conversations
+/// as first-class sessions needs synthesized unique ids and is tracked separately.
+pub fn is_subagent_path(p: &Path) -> bool {
+    p.components().any(|c| c.as_os_str() == "subagents")
+}
+
 /// Find all Claude Code session files under the given base directory
 pub fn find_claude_sessions(base: Option<&Path>) -> Result<Vec<std::path::PathBuf>> {
     let default_base;
@@ -159,16 +173,8 @@ pub fn find_claude_sessions(base: Option<&Path>) -> Result<Vec<std::path::PathBu
         .filter_map(|e| e.ok())
     {
         let p = entry.path();
-        // Skip the subagents/ subtree entirely. Subagent transcripts
-        // (…/<parent>/subagents/agent-<hash>.jsonl) carry the PARENT session's
-        // `sessionId` (isSidechain), so parsing them lands on the parent's DB
-        // row and fights over its turns/vectors — a driver of the #1592
-        // oscillating-coverage churn. Workflow journals
-        // (…/subagents/workflows/wf_*/journal.jsonl) are non-conversational
-        // event logs that all collapse to the filename-stem id "journal".
-        // Indexing subagent conversations as first-class sessions needs
-        // synthesized unique ids and is tracked separately.
-        if p.components().any(|c| c.as_os_str() == "subagents") {
+        // Skip the subagents/ subtree entirely (see is_subagent_path).
+        if is_subagent_path(p) {
             continue;
         }
         if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
@@ -202,6 +208,12 @@ pub fn find_codex_sessions(base: Option<&Path>) -> Result<Vec<std::path::PathBuf
         .filter_map(|e| e.ok())
     {
         let p = entry.path();
+        // Skip the subagents/ subtree (see is_subagent_path). The is_dir ingest
+        // branch runs this finder over the Claude tree too, where sidechain
+        // agent-*.jsonl files would otherwise be collected and mis-parsed.
+        if is_subagent_path(p) {
+            continue;
+        }
         if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
             paths.push(p.to_path_buf());
         }
@@ -233,6 +245,9 @@ pub fn find_gemini_sessions(base: Option<&Path>) -> Result<Vec<std::path::PathBu
         .filter_map(|e| e.ok())
     {
         let p = entry.path();
+        if is_subagent_path(p) {
+            continue;
+        }
         // session-*.json files inside chats/ subdirectories
         if p.extension().map(|e| e == "json").unwrap_or(false) {
             let fname = p.file_name().unwrap_or_default().to_string_lossy();
@@ -273,6 +288,23 @@ mod tests {
             writeln!(f, "{line}").unwrap();
         }
         p
+    }
+
+    #[test]
+    fn test_is_subagent_path() {
+        use std::path::PathBuf;
+        assert!(is_subagent_path(&PathBuf::from(
+            "/h/.claude/projects/proj/9786f1fe/subagents/agent-abc.jsonl"
+        )));
+        assert!(is_subagent_path(&PathBuf::from(
+            "/x/subagents/workflows/wf_1/journal.jsonl"
+        )));
+        assert!(!is_subagent_path(&PathBuf::from(
+            "/h/.claude/projects/proj/9786f1fe.jsonl"
+        )));
+        // Whole-component match, not substring: a plain file whose name merely
+        // contains "subagents" is not under the subtree.
+        assert!(!is_subagent_path(&PathBuf::from("/x/my-subagents-notes.jsonl")));
     }
 
     #[test]
