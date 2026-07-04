@@ -6,6 +6,7 @@ use secall_core::{
     ingest::{
         detect::{
             detect_parser, find_claude_sessions, find_codex_sessions, find_gemini_sessions,
+            is_subagent_path,
             find_sessions_for_cwd,
         },
         AgentKind,
@@ -1322,6 +1323,13 @@ fn collect_paths(path: Option<&str>, auto: bool, cwd: Option<&Path>) -> Result<V
         }
     } else if let Some(p) = path {
         let pb = PathBuf::from(p);
+        // A subagent sidechain path carries the parent's sessionId; ingesting it
+        // as the parent wipes+rebuilds the parent row (see is_subagent_path). The
+        // directory enumerators skip it, but a direct file path (e.g. a
+        // `**/*.jsonl` catchup glob) reaches here unfiltered — skip it here too.
+        if is_subagent_path(&pb) {
+            return Ok(Vec::new());
+        }
         if pb.is_file() {
             Ok(vec![pb])
         } else if pb.is_dir() {
@@ -1357,6 +1365,9 @@ fn find_session_by_id(id: &str) -> Result<Vec<PathBuf>> {
         .filter_map(|e| e.ok())
     {
         let p = entry.path();
+        if is_subagent_path(p) {
+            continue;
+        }
         if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
             let stem = p.file_stem().unwrap_or_default().to_string_lossy();
             if stem == id
