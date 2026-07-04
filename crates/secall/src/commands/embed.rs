@@ -11,6 +11,42 @@ use secall_core::{
     vault::Config,
 };
 
+/// Exit codes for a `secall embed` run, consumed by the daemon's embed-down
+/// alert (log/scheduler.py mirrors these constants). The numeric values are a
+/// cross-repo contract — keep them in sync, and avoid reserved codes: 1 (generic
+/// anyhow error), 2 (clap usage), 126+ (shell/signal).
+pub const EXIT_NO_BACKEND: u8 = 10;
+pub const EXIT_RECONCILE_REFUSED: u8 = 11;
+pub const EXIT_ALL_FAILED: u8 = 12;
+
+/// Outcome of an embed pass, mapped to a process exit code by `main`.
+///
+/// Only the states the daemon must distinguish get a dedicated code; genuine
+/// errors that propagate via `?` (db open, usage) stay on the anyhow path →
+/// exit 1, so "backend down" is never conflated with "db locked / panic".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedOutcome {
+    /// All pending chunks embedded, or nothing to do.
+    Ok,
+    /// No embedding backend could be constructed (ORT runtime / model absent).
+    NoBackend,
+    /// The store holds a foreign model and the wipe was not authorized.
+    ReconcileRefused,
+    /// Sessions were attempted but every one failed to embed.
+    AllFailed,
+}
+
+impl EmbedOutcome {
+    pub fn exit_code(self) -> u8 {
+        match self {
+            Self::Ok => 0,
+            Self::NoBackend => EXIT_NO_BACKEND,
+            Self::ReconcileRefused => EXIT_RECONCILE_REFUSED,
+            Self::AllFailed => EXIT_ALL_FAILED,
+        }
+    }
+}
+
 enum WorkItem {
     /// Default mode — pre-filter loaded the Session, embed pending chunks.
     /// Boxed so the enum size doesn't balloon to the Session size for the
@@ -35,7 +71,7 @@ pub async fn run(
     batch_size: Option<usize>,
     concurrency: usize,
     allow_model_switch: bool,
-) -> Result<()> {
+) -> Result<EmbedOutcome> {
     let config = Config::load_or_default();
     let db_path = get_default_db_path();
     let db = Database::open(&db_path)?;
@@ -45,7 +81,7 @@ pub async fn run(
         eprintln!("No embedding backend available.");
         eprintln!("  1. Download model: secall model download");
         eprintln!("  2. Check config: [embedding] section in config.toml");
-        return Ok(());
+        return Ok(EmbedOutcome::NoBackend);
     };
 
     let batch_size = batch_size.unwrap_or(32);
@@ -90,11 +126,15 @@ pub async fn run(
                      scratch with the active model.",
                 )
             };
-            anyhow::bail!(
+            // Not an anyhow error: a distinct exit code lets the daemon alert
+            // point at the right remedy instead of the generic "backend down".
+            // Print the diagnosis to stderr so the alert's output tail carries it.
+            eprintln!(
                 "refusing to embed: {reason}. The store still holds the previous model's \
                  vectors; embedding the active model now would corrupt the single-model \
                  invariant. {remedy}"
             );
+            return Ok(EmbedOutcome::ReconcileRefused);
         }
         ReconcileOutcome::Clean => {}
     }
@@ -142,7 +182,7 @@ pub async fn run(
 
     if work_items.is_empty() {
         println!("All sessions already embedded.");
-        return Ok(());
+        return Ok(EmbedOutcome::Ok);
     }
 
     let total = work_items.len();
@@ -152,6 +192,12 @@ pub async fn run(
     );
     let db_path: Arc<PathBuf> = Arc::new(db_path);
     let counter = Arc::new(AtomicUsize::new(0));
+    // AllFailed keys on embedding-level outcomes only: `embedded` counts sessions
+    // that actually wrote chunks (chunks_embedded > 0), `embed_failed` counts
+    // index_session errors. Infra errors (db open / load / delete) and chunk-empty
+    // no-ops touch neither — they must not mask nor fabricate an all-failed verdict.
+    let embedded = Arc::new(AtomicUsize::new(0));
+    let embed_failed = Arc::new(AtomicUsize::new(0));
     let total_chunks = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
 
@@ -160,6 +206,8 @@ pub async fn run(
             let indexer = Arc::clone(&indexer);
             let db_path = Arc::clone(&db_path);
             let counter = Arc::clone(&counter);
+            let embedded = Arc::clone(&embedded);
+            let embed_failed = Arc::clone(&embed_failed);
             let total_chunks = Arc::clone(&total_chunks);
             async move {
                 let sid = item.id().to_string();
@@ -197,6 +245,11 @@ pub async fn run(
                 };
                 match indexer.index_session(&db, &session, tz).await {
                     Ok(stats) => {
+                        // Only count a genuine embed; a chunk-empty no-op
+                        // (Ok(default)) is neither success nor failure.
+                        if stats.chunks_embedded > 0 {
+                            embedded.fetch_add(1, Ordering::Relaxed);
+                        }
                         let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
                         let chunks_done = total_chunks
                             .fetch_add(stats.chunks_embedded, Ordering::Relaxed)
@@ -221,6 +274,7 @@ pub async fn run(
                         );
                     }
                     Err(e) => {
+                        embed_failed.fetch_add(1, Ordering::Relaxed);
                         let i = counter.fetch_add(1, Ordering::Relaxed) + 1;
                         eprintln!("  [{i}/{total}] {short} — embedding failed: {e}");
                     }
@@ -240,8 +294,11 @@ pub async fn run(
     let mins = elapsed.as_secs() / 60;
     let secs = elapsed.as_secs() % 60;
     let total_c = total_chunks.load(Ordering::Relaxed);
+    let embedded_n = embedded.load(Ordering::Relaxed);
+    let failed_n = embed_failed.load(Ordering::Relaxed);
     eprintln!(
-        "\nDone: {} sessions, {} chunks in {}m {}s ({:.1} chunks/s)",
+        "\nDone: {}/{} sessions embedded, {} chunks in {}m {}s ({:.1} chunks/s)",
+        embedded_n,
         total,
         total_c,
         mins,
@@ -249,5 +306,37 @@ pub async fn run(
         total_c as f64 / elapsed.as_secs_f64().max(0.001),
     );
 
-    Ok(())
+    // Backend loaded but every session that reached the embedder failed (dylib
+    // drift, OOM, per-session ORT errors) — the silent-degradation mode the daemon
+    // alert exists for. Gate on embedding-level outcomes only: at least one real
+    // failure AND zero genuine embeds. A single success, an infra-only failure
+    // (db/load), or an all-no-op run does not qualify.
+    if failed_n > 0 && embedded_n == 0 {
+        return Ok(EmbedOutcome::AllFailed);
+    }
+
+    Ok(EmbedOutcome::Ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_codes_are_stable_and_distinct() {
+        // Cross-repo contract with log/scheduler.py — changing these silently
+        // breaks the daemon's embed-down alert branching.
+        assert_eq!(EmbedOutcome::Ok.exit_code(), 0);
+        assert_eq!(EmbedOutcome::NoBackend.exit_code(), 10);
+        assert_eq!(EmbedOutcome::ReconcileRefused.exit_code(), 11);
+        assert_eq!(EmbedOutcome::AllFailed.exit_code(), 12);
+    }
+
+    #[test]
+    fn nonzero_codes_avoid_reserved_values() {
+        // 1 = generic anyhow error, 2 = clap usage, 126+ = shell/signal.
+        for code in [EXIT_NO_BACKEND, EXIT_RECONCILE_REFUSED, EXIT_ALL_FAILED] {
+            assert!(code > 2 && code < 126, "reserved exit code {code}");
+        }
+    }
 }
