@@ -95,6 +95,10 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
     let mut turns: Vec<Turn> = Vec::new();
     let mut pending_calls: HashMap<String, (usize, usize)> = HashMap::new();
     let mut turn_idx: u32 = 0;
+    // Max wrapper timestamp across ALL records (messages + tool calls/outputs) —
+    // the session's last activity, used for end_time. Tracking only message turns
+    // would understate it whenever the rollout ends on a tool call/output.
+    let mut last_ts: Option<DateTime<Utc>> = None;
 
     // session_meta에서 추출
     let mut meta_id: Option<String> = None;
@@ -112,6 +116,17 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        // Fold every record's wrapper timestamp into the last-activity high-water
+        // mark, regardless of record type (message / function_call / output).
+        let wrapper_ts = jl
+            .timestamp
+            .as_deref()
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        if let Some(ts) = wrapper_ts {
+            last_ts = Some(last_ts.map_or(ts, |cur| cur.max(ts)));
+        }
 
         match jl.line_type.as_str() {
             "session_meta" => {
@@ -163,16 +178,10 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                             continue;
                         }
 
-                        // 턴 타임스탬프: 래퍼의 timestamp 필드
-                        let ts = jl
-                            .timestamp
-                            .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
-                            .map(|dt| dt.with_timezone(&Utc));
-
                         turns.push(Turn {
                             index: turn_idx,
                             role,
-                            timestamp: ts,
+                            timestamp: wrapper_ts,
                             content,
                             actions: Vec::new(),
                             tokens: None,
@@ -241,6 +250,10 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
 
     // start_time 우선순위: session_meta.timestamp > file mtime > Utc::now()
     let start_time = meta_timestamp.or(file_mtime).unwrap_or_else(Utc::now);
+    // end_time = last-activity timestamp (mirrors the claude parser). Leaving this
+    // None made every codex session look perpetually "open", which silently
+    // excluded them from downstream settle-gated consumers.
+    let end_time = last_ts;
 
     Ok(Session {
         id: final_id,
@@ -251,7 +264,7 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
         git_branch: None,
         host: Some(gethostname::gethostname().to_string_lossy().to_string()),
         start_time,
-        end_time: None,
+        end_time,
         turns,
         total_tokens: Default::default(),
         session_type: "interactive".to_string(),
@@ -323,6 +336,12 @@ mod tests {
         assert_eq!(session.turns[1].role, Role::Assistant);
         assert!(session.turns[0].content.contains("검색"));
         assert_eq!(session.agent, AgentKind::Codex);
+        // end_time = latest turn timestamp (previously always None, which made
+        // codex sessions look perpetually open to settle-gated consumers).
+        assert_eq!(
+            session.end_time.expect("end_time set").to_rfc3339(),
+            "2026-04-05T10:00:02+00:00"
+        );
     }
 
     #[test]
@@ -380,6 +399,12 @@ mod tests {
             }
             _ => panic!("expected ToolUse"),
         }
+        // end_time tracks the last activity across ALL records — here the tool
+        // output at 10:00:04, not the preceding assistant message at 10:00:02.
+        assert_eq!(
+            session.end_time.expect("end_time set").to_rfc3339(),
+            "2026-04-05T10:00:04+00:00"
+        );
     }
 
     #[test]
