@@ -80,6 +80,41 @@ impl SeCallMcpServer {
         }
     }
 
+    /// Tool names this server will advertise in `tools/list`.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect()
+    }
+
+    /// Drop `disabled` from the tool router.
+    ///
+    /// `list_all` (which builds `tools/list`) and `call` read the same map as
+    /// `remove_route`, so one removal takes the tool out of both advertisement
+    /// and dispatch — there is no separate deny check to keep in sync.
+    ///
+    /// Errors on a name that matches no tool. Callers validate once at startup
+    /// so a typo aborts the process instead of quietly leaving a tool exposed.
+    pub fn with_disabled_tools(mut self, disabled: &[String]) -> anyhow::Result<Self> {
+        for name in disabled {
+            if !self.tool_router.has_route(name) {
+                anyhow::bail!(
+                    "unknown tool in mcp.disabled_tools: '{name}' (known: {})",
+                    self.tool_router
+                        .list_all()
+                        .iter()
+                        .map(|t| t.name.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            self.tool_router.remove_route(name);
+        }
+        Ok(self)
+    }
+
     pub async fn do_recall(&self, params: RecallParams) -> anyhow::Result<serde_json::Value> {
         let limit = params.limit.unwrap_or(10).min(50);
 
@@ -1280,7 +1315,9 @@ pub async fn start_mcp_server(
     search: SearchEngine,
     vault_path: PathBuf,
 ) -> anyhow::Result<()> {
-    let server = SeCallMcpServer::new(Arc::new(Mutex::new(db)), Arc::new(search), vault_path);
+    let disabled = Config::load_or_default().mcp.disabled_tools;
+    let server = SeCallMcpServer::new(Arc::new(Mutex::new(db)), Arc::new(search), vault_path)
+        .with_disabled_tools(&disabled)?;
     let (stdin, stdout) = rmcp::transport::io::stdio();
     let service = server.serve((stdin, stdout)).await?;
     service.waiting().await?;
@@ -1302,14 +1339,28 @@ pub async fn start_mcp_http_server(
     let search_arc = Arc::new(search);
     let vault_path_arc = Arc::new(vault_path);
 
+    // Validate the denylist once here rather than inside the per-session
+    // factory below: the factory can only surface io::Error to a live request,
+    // which would turn a config typo into a runtime 500 per session instead of
+    // a startup abort.
+    let disabled = Arc::new(Config::load_or_default().mcp.disabled_tools);
+    SeCallMcpServer::new(
+        db_arc.clone(),
+        search_arc.clone(),
+        (*vault_path_arc).clone(),
+    )
+    .with_disabled_tools(&disabled)?;
+
     let service: StreamableHttpService<SeCallMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || -> Result<SeCallMcpServer, std::io::Error> {
-                Ok(SeCallMcpServer::new(
+                SeCallMcpServer::new(
                     db_arc.clone(),
                     search_arc.clone(),
                     (*vault_path_arc).clone(),
-                ))
+                )
+                .with_disabled_tools(&disabled)
+                .map_err(std::io::Error::other)
             },
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default(),

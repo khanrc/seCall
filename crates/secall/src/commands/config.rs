@@ -42,6 +42,17 @@ pub fn run_show() -> Result<()> {
 
     println!("Output");
     println!("  timezone: {}", config.output.timezone);
+    println!();
+
+    println!("MCP");
+    println!(
+        "  disabled_tools: {}",
+        if config.mcp.disabled_tools.is_empty() {
+            "(none)".to_string()
+        } else {
+            config.mcp.disabled_tools.join(", ")
+        }
+    );
 
     Ok(())
 }
@@ -593,6 +604,19 @@ fn print_backend_config(name: &str, backend: &WikiBackendConfig) {
     );
 }
 
+/// Parse a comma-separated tool list. An empty (or all-blank) value clears it.
+///
+/// Names are not validated here — the MCP server rejects an unknown one at
+/// startup, where it can see the actual tool router.
+fn parse_tool_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn run_set(key: &str, value: &str) -> Result<()> {
     let mut config = Config::load_or_default();
 
@@ -716,6 +740,9 @@ pub fn run_set(key: &str, value: &str) -> Result<()> {
             })?;
             config.output.timezone = value.to_string();
         }
+        "mcp.disabled_tools" => {
+            config.mcp.disabled_tools = parse_tool_list(value);
+        }
         _ if key.starts_with("wiki.backends.") => {
             set_wiki_backend_key(&mut config, key, value)?;
         }
@@ -800,4 +827,36 @@ fn copy_to_clipboard(path: &std::path::Path) -> Result<()> {
         "clipboard command not available (tried: {})",
         candidates.join(", ")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_tool_list;
+
+    #[test]
+    fn parses_comma_separated_names() {
+        assert_eq!(
+            parse_tool_list("wiki_search,graph_query,status"),
+            vec!["wiki_search", "graph_query", "status"]
+        );
+    }
+
+    #[test]
+    fn trims_whitespace_around_names() {
+        assert_eq!(
+            parse_tool_list(" wiki_search , graph_query "),
+            vec!["wiki_search", "graph_query"]
+        );
+    }
+
+    #[test]
+    fn empty_value_clears_the_list() {
+        assert!(parse_tool_list("").is_empty());
+        assert!(parse_tool_list("   ").is_empty());
+    }
+
+    #[test]
+    fn drops_blank_entries_from_trailing_or_doubled_commas() {
+        assert_eq!(parse_tool_list("status,,"), vec!["status"]);
+    }
 }
