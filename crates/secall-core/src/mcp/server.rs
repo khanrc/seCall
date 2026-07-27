@@ -1149,10 +1149,23 @@ fn merge_json_object(target: &mut serde_json::Value, patch: &serde_json::Value) 
 }
 
 /// MCP tool wrappers — 공통 do_*() 메서드를 CallToolResult로 래핑
+///
+/// Every tool here reads the local index and mutates nothing, so each declares
+/// read-only annotations. Beyond being accurate, the declaration is load-bearing:
+/// a client that sees no annotations must assume the tool is destructive and
+/// open-world, and some clients then demand an approval they cannot obtain —
+/// Codex's review delegate hangs forever in exactly that case (openai/codex#31565).
 #[tool_router]
 impl SeCallMcpServer {
     #[tool(
-        description = "Search agent session history. Use keyword queries for exact terms, semantic queries for conceptual search, or temporal queries for time-based filtering."
+        description = "Search agent session history. Use keyword queries for exact terms, semantic queries for conceptual search, or temporal queries for time-based filtering.",
+        annotations(
+            title = "Recall sessions",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn recall(
         &self,
@@ -1168,7 +1181,14 @@ impl SeCallMcpServer {
     }
 
     #[tool(
-        description = "Retrieve a specific session or turn. Use session_id for full session metadata, session_id:N for a specific turn."
+        description = "Retrieve a specific session or turn. Use session_id for full session metadata, session_id:N for a specific turn.",
+        annotations(
+            title = "Get session or turn",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     fn get(&self, Parameters(params): Parameters<GetParams>) -> Result<CallToolResult, McpError> {
         let json = self
@@ -1179,7 +1199,16 @@ impl SeCallMcpServer {
         )]))
     }
 
-    #[tool(description = "Show index health: session count, embedding status, recent ingests.")]
+    #[tool(
+        description = "Show index health: session count, embedding status, recent ingests.",
+        annotations(
+            title = "Index status",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     fn status(&self, _params: Parameters<StatusParams>) -> String {
         match self.do_status() {
             Ok(json) => serde_json::to_string_pretty(&json).unwrap_or_default(),
@@ -1188,7 +1217,14 @@ impl SeCallMcpServer {
     }
 
     #[tool(
-        description = "Search wiki knowledge pages. Returns matching wiki articles from projects, topics, and decisions."
+        description = "Search wiki knowledge pages. Returns matching wiki articles from projects, topics, and decisions.",
+        annotations(
+            title = "Search wiki",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     fn wiki_search(
         &self,
@@ -1203,7 +1239,14 @@ impl SeCallMcpServer {
     }
 
     #[tool(
-        description = "Query the knowledge graph. Find neighbors and relationships of a node (session, project, agent, tool). Use depth to expand traversal. Returns connected nodes and edge types."
+        description = "Query the knowledge graph. Find neighbors and relationships of a node (session, project, agent, tool). Use depth to expand traversal. Returns connected nodes and edge types.",
+        annotations(
+            title = "Query knowledge graph",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     fn graph_query(
         &self,
