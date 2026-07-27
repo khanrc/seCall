@@ -18,6 +18,23 @@ pub struct Config {
     pub wiki: WikiConfig,
     pub graph: GraphConfig,
     pub log: LogConfig,
+    pub mcp: McpConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct McpConfig {
+    /// Tool names to drop from the MCP router at startup.
+    ///
+    /// A tool's schema is loaded by every session the server is registered
+    /// with, so an unused tool costs context everywhere and invites
+    /// misrouting. Removing the route drops advertisement and dispatch
+    /// together. Empty (the default) advertises every tool.
+    ///
+    /// A name here that matches no tool aborts startup rather than being
+    /// ignored — a typo that silently leaves a tool exposed is the failure
+    /// this setting exists to prevent.
+    pub disabled_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -331,6 +348,7 @@ impl Default for Config {
             wiki: WikiConfig::default(),
             graph: GraphConfig::default(),
             log: LogConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -656,6 +674,34 @@ mod tests {
         let mut config = Config::default();
         config.output.timezone = "INVALID/TZ".to_string();
         assert_eq!(config.timezone(), chrono_tz::Tz::UTC);
+    }
+
+    #[test]
+    fn test_mcp_disabled_tools_defaults_empty() {
+        assert!(Config::default().mcp.disabled_tools.is_empty());
+    }
+
+    #[test]
+    fn test_config_without_mcp_section() {
+        let toml_str = r#"
+[vault]
+path = "/tmp/test-vault"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.mcp.disabled_tools.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_disabled_tools_parsed() {
+        let toml_str = r#"
+[vault]
+path = "/tmp/test-vault"
+
+[mcp]
+disabled_tools = ["wiki_search", "graph_query"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.mcp.disabled_tools, vec!["wiki_search", "graph_query"]);
     }
 
     #[test]
