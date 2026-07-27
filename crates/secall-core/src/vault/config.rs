@@ -531,6 +531,7 @@ fn merge_into_doc(doc: &mut toml_edit::DocumentMut, config: &Config) -> Result<(
     sync_section(doc, "wiki", &config.wiki)?;
     sync_section(doc, "graph", &config.graph)?;
     sync_section(doc, "log", &config.log)?;
+    sync_section(doc, "mcp", &config.mcp)?;
     Ok(())
 }
 
@@ -799,6 +800,33 @@ pool_size = 2
         assert_eq!(
             config.embedding.pool_size, None,
             "pool_size default should be None (auto-detect)"
+        );
+    }
+
+    #[test]
+    fn save_persists_mcp_disabled_tools() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::env::set_var("SECALL_CONFIG_PATH", &path);
+
+        let mut config = Config::default();
+        config.mcp.disabled_tools = vec!["wiki_search".to_string(), "graph_query".to_string()];
+        let saved = config.save();
+        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let reloaded = Config::load_or_default();
+
+        std::env::remove_var("SECALL_CONFIG_PATH");
+        saved.unwrap();
+
+        assert!(
+            raw.contains("disabled_tools"),
+            "[mcp] must reach the file — merge_into_doc writes section by section, \
+             so a new section is silently dropped until it is listed there. Got:\n{raw}"
+        );
+        assert_eq!(
+            reloaded.mcp.disabled_tools,
+            vec!["wiki_search", "graph_query"]
         );
     }
 
