@@ -23,7 +23,6 @@ use crate::vault::Config;
 
 #[derive(Clone)]
 pub struct SeCallMcpServer {
-    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
     db: Arc<Mutex<Database>>,
     search: Arc<SearchEngine>,
@@ -1296,7 +1295,11 @@ impl SeCallMcpServer {
     }
 }
 
-#[tool_handler]
+// `router = self.tool_router` is load-bearing. The macro's default is
+// `Self::tool_router()`, which rebuilds a fresh router on every list_tools /
+// call_tool and therefore ignores whatever this instance holds — including any
+// route removed by `with_disabled_tools`.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for SeCallMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = self
