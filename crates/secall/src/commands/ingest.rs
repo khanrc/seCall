@@ -106,11 +106,8 @@ pub async fn run(
     // Build search engine (BM25 + optional vector)
     let tok = create_tokenizer(&config.search.tokenizer)
         .map_err(|e| anyhow!("tokenizer init failed: {e}"))?;
-    let vector_indexer = if no_embed {
-        None
-    } else {
-        secall_core::search::vector::create_vector_indexer(&config).await
-    };
+    let vector_indexer =
+        secall_core::search::vector::create_vector_indexer_for_ingest(&config, no_embed).await;
     let engine = SearchEngine::new(Bm25Indexer::new(tok), vector_indexer);
 
     // Collect paths to ingest
@@ -235,11 +232,8 @@ pub async fn run_with_progress(args: IngestArgs, sink: &dyn ProgressSink) -> Res
 
     let tok = create_tokenizer(&config.search.tokenizer)
         .map_err(|e| anyhow!("tokenizer init failed: {e}"))?;
-    let vector_indexer = if no_embed {
-        None
-    } else {
-        secall_core::search::vector::create_vector_indexer(&config).await
-    };
+    let vector_indexer =
+        secall_core::search::vector::create_vector_indexer_for_ingest(&config, no_embed).await;
     let engine = SearchEngine::new(Bm25Indexer::new(tok), vector_indexer);
 
     // ── detect phase ──

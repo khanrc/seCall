@@ -538,14 +538,36 @@ fn resolve_pool_size(config: &crate::vault::config::Config) -> usize {
 /// branch runs, so the daemon's embed-down alert (keyed on exit 10) never fires
 /// and recall/serve crash instead of degrading to BM25. `catch_unwind` turns
 /// that into an `Err` (panic = unwind is in effect — no `panic = "abort"`).
+///
+/// The panic payload carries the only description of *why* the load failed —
+/// ort formats the dlopen error into it (a glibc symbol-version mismatch reads
+/// nothing like a missing file, and the two need different fixes). Discarding it
+/// for a fixed string leaves the real reason reachable only through the default
+/// panic hook's stderr, which a supervised daemon's log does not preserve.
 fn build_ort_embedder(model_dir: &Path, pool: usize) -> Result<OrtEmbedder> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         OrtEmbedder::with_pool_size(model_dir, pool)
     })) {
         Ok(res) => res,
-        Err(_) => Err(anyhow!(
-            "ONNX Runtime failed to load (libonnxruntime.so missing or unloadable)"
+        Err(payload) => Err(anyhow!(
+            "ONNX Runtime failed to load (libonnxruntime.so missing or unloadable): {}",
+            panic_message(&*payload)
         )),
+    }
+}
+
+/// Recover a panic payload as text.
+///
+/// `panic!` boxes a `&'static str` for a literal message and a `String` once the
+/// format arguments are non-empty, so both downcasts are needed; anything else is
+/// a non-standard payload we can only describe generically.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        "unknown panic payload".to_string()
     }
 }
 
@@ -683,6 +705,25 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
     #[cfg(not(target_os = "windows"))]
     let indexer = attach_ann_index(indexer);
     Some(indexer)
+}
+
+/// `create_vector_indexer` for the ingest paths, honoring their `--no-embed`.
+///
+/// Every ingest entry point (`ingest`, `ingest --auto`, `sync`'s auto-ingest)
+/// takes this shape, and skipping it is not merely wasted work: on the `ort`
+/// backend `create_vector_indexer` downloads the model *before* it attempts to
+/// load the runtime, so a caller that never embeds still pays the full model
+/// provision. Route every `no_embed`-aware caller through here rather than
+/// re-deriving the branch — `sync` open-coding it without the gate is what made
+/// `sync --no-embed` fetch a 449MB model on hosts that never embed.
+pub async fn create_vector_indexer_for_ingest(
+    config: &Config,
+    no_embed: bool,
+) -> Option<VectorIndexer> {
+    if no_embed {
+        return None;
+    }
+    create_vector_indexer(config).await
 }
 
 /// OpenVINO 실패 시 ORT CPU → Ollama 순으로 fallback.
@@ -1183,5 +1224,62 @@ mod tests {
             result.is_some(),
             "available cloud Ollama should return Some(indexer)"
         );
+    }
+
+    // ─── create_vector_indexer_for_ingest: the --no-embed gate ──────────────
+
+    /// Config deliberately chosen so the ungated call returns `Some` — otherwise
+    /// the assertion would pass with the gate removed.
+    async fn reachable_backend_config() -> (mockito::ServerGuard, crate::vault::config::Config) {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/tags")
+            .with_status(200)
+            .with_body(r#"{"models":[]}"#)
+            .expect_at_least(0)
+            .create_async()
+            .await;
+
+        let mut config = crate::vault::config::Config::default();
+        config.embedding.backend = "ollama_cloud".to_string();
+        config.embedding.cloud_host = Some(server.url());
+        config.embedding.cloud_api_key = Some("k".to_string());
+        (server, config)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn for_ingest_no_embed_skips_backend_construction() {
+        let (_server, config) = reachable_backend_config().await;
+
+        assert!(
+            create_vector_indexer(&config).await.is_some(),
+            "precondition: this config must yield Some when ungated"
+        );
+        assert!(
+            create_vector_indexer_for_ingest(&config, true).await.is_none(),
+            "--no-embed must skip backend construction entirely (on ort it would provision the model)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn for_ingest_without_no_embed_builds_the_indexer() {
+        let (_server, config) = reachable_backend_config().await;
+
+        assert!(
+            create_vector_indexer_for_ingest(&config, false)
+                .await
+                .is_some(),
+            "without --no-embed the gate must not suppress a working backend"
+        );
+    }
+
+    #[test]
+    fn panic_message_recovers_both_standard_payloads() {
+        // panic! boxes &'static str for a literal and String once it formats.
+        let literal = std::panic::catch_unwind(|| panic!("literal payload")).unwrap_err();
+        assert_eq!(panic_message(&*literal), "literal payload");
+
+        let formatted = std::panic::catch_unwind(|| panic!("formatted {}", "payload")).unwrap_err();
+        assert_eq!(panic_message(&*formatted), "formatted payload");
     }
 }

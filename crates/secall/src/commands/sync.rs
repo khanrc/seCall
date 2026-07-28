@@ -610,7 +610,8 @@ async fn run_auto_ingest(
 
     let tok = create_tokenizer(&config.search.tokenizer)
         .map_err(|e| anyhow::anyhow!("tokenizer init failed: {e}"))?;
-    let vector_indexer = secall_core::search::vector::create_vector_indexer(config).await;
+    let vector_indexer =
+        secall_core::search::vector::create_vector_indexer_for_ingest(config, no_embed).await;
     let engine = SearchEngine::new(Bm25Indexer::new(tok), vector_indexer);
 
     let mut paths = find_claude_sessions(None)?;
