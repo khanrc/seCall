@@ -82,7 +82,13 @@ pub fn detect_parser(path: &Path) -> Result<Box<dyn SessionParser>> {
                 if v["sessionId"].is_string() && v["type"].as_str() == Some("user") {
                     return Ok(Box::new(ClaudeCodeParser));
                 }
-                // Codex: has "type" string + "message" object (adjacently tagged)
+                // Current rollouts may live under a custom CODEX_HOME.
+                if v["type"].as_str() == Some("session_meta")
+                    && v["payload"]["id"].is_string()
+                {
+                    return Ok(Box::new(CodexParser));
+                }
+                // Legacy Codex: adjacently tagged type + message.
                 if v["type"].is_string() && v["message"].is_object() {
                     return Ok(Box::new(CodexParser));
                 }
@@ -370,6 +376,31 @@ mod tests {
         );
         let parser = detect_parser(&p).unwrap();
         assert_eq!(parser.agent_kind(), super::super::types::AgentKind::Codex);
+    }
+
+    #[test]
+    fn test_detect_codex_rollout_outside_default_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = make_jsonl_file(
+            dir.path(),
+            "rollout-custom.jsonl",
+            &[
+                r#"{"type":"session_meta","payload":{"id":"custom-session","cwd":"/workspace"}}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#,
+            ],
+        );
+        let parser = detect_parser(&p).unwrap();
+        assert_eq!(parser.agent_kind(), super::super::types::AgentKind::Codex);
+        let session = parser.parse(&p).unwrap();
+        assert_eq!(session.id, "custom-session");
+        assert_eq!(session.turns.len(), 1);
+
+        let unknown = make_jsonl_file(
+            dir.path(),
+            "unrelated.jsonl",
+            &[r#"{"type":"session_meta","payload":{}}"#],
+        );
+        assert!(detect_parser(&unknown).is_err());
     }
 
     #[test]
