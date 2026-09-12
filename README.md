@@ -284,6 +284,8 @@ secall ingest ~/Downloads/data-export.zip
 secall sync
 ```
 
+Codex rollout identity comes from its opening `session_meta`; inherited metadata later in a fork does not change its ID, project, or start time. When a standard `rollout-…-UUID.jsonl` filename disagrees with that header, ingest fails before writing. Renamed exports still use their opening header. Re-ingesting a fork must not replace its parent or another fork.
+
 ### Step 4. 검색
 
 ```bash
