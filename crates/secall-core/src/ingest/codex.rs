@@ -11,6 +11,17 @@ use super::SessionParser;
 
 pub struct CodexParser;
 
+#[derive(Debug, thiserror::Error)]
+#[error("incomplete Codex review: event records preserved, no response items yet")]
+pub struct DeferredReview;
+
+/// Content-derived revision invalidates receipts whenever this parser changes.
+pub fn parser_revision() -> &'static str {
+    use sha2::{Digest, Sha256};
+    static REVISION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    REVISION.get_or_init(|| format!("{:x}", Sha256::digest(include_bytes!("codex.rs"))))
+}
+
 impl SessionParser for CodexParser {
     fn can_parse(&self, path: &Path) -> bool {
         let path_str = path.to_string_lossy();
@@ -105,6 +116,8 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
     let mut meta_id: Option<String> = None;
     let mut meta_timestamp: Option<DateTime<Utc>> = None;
     let mut meta_cwd: Option<String> = None;
+    let mut review_started = false;
+    let mut review_events_only = true;
 
     for line_result in reader.lines() {
         let line = line_result?;
@@ -115,7 +128,10 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
 
         let jl: JsonlLine = match serde_json::from_str(line) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                review_events_only = false;
+                continue;
+            }
         };
 
         // Fold every record's wrapper timestamp into the last-activity high-water
@@ -154,9 +170,12 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                         .timestamp
                         .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
                         .map(|dt| dt.with_timezone(&Utc));
+                } else {
+                    review_events_only = false;
                 }
             }
             "response_item" => {
+                review_events_only = false;
                 let rp: ResponsePayload = match serde_json::from_value(jl.payload) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -243,12 +262,21 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                     _ => {}
                 }
             }
-            // "event_msg", "turn_context" 등 → skip
-            _ => {}
+            "event_msg" => match jl.payload.get("type").and_then(|v| v.as_str()) {
+                Some("entered_review_mode") => review_started = true,
+                Some("task_started" | "user_message" | "mcp_tool_call_end") => {}
+                _ => review_events_only = false,
+            },
+            // Unknown records may contain an answer we cannot parse. Do not
+            // classify them as a safely deferred, incomplete review.
+            _ => review_events_only = false,
         }
     }
 
     if turns.is_empty() {
+        if review_started && review_events_only && meta_id.is_some() {
+            return Err(DeferredReview.into());
+        }
         return Err(anyhow!(
             "codex session has no parseable turns: {}",
             path.display()

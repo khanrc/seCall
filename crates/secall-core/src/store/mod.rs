@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 pub mod db;
+pub mod deferred_source_repo;
 pub mod graph_repo;
 pub mod jobs_repo;
 pub mod schema;

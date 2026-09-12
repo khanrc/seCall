@@ -36,6 +36,9 @@ pub struct SyncOutcome {
     pub pulled: Option<usize>,
     pub reindexed: usize,
     pub ingested: usize,
+    pub deferred: usize,
+    pub skipped: usize,
+    pub errors: usize,
     pub wiki_updated: Option<usize>,
     pub pushed: Option<String>,
     /// 부분 실패 시 마지막 phase 에러 메시지. push 실패 등은 fatal로 취급하지 않는다.
@@ -175,7 +178,10 @@ pub async fn run_with_progress(args: SyncArgs, sink: &dyn ProgressSink) -> Resul
 
     if dry_run {
         // dry-run 경로: 나머지 phase는 안내만 출력하고 종료
-        let sessions_dir = config.vault.path.join(secall_core::vault::sessions_reldir());
+        let sessions_dir = config
+            .vault
+            .path
+            .join(secall_core::vault::sessions_reldir());
         let md_count = if sessions_dir.exists() {
             walkdir::WalkDir::new(&sessions_dir)
                 .into_iter()
@@ -266,20 +272,24 @@ pub async fn run_with_progress(args: SyncArgs, sink: &dyn ProgressSink) -> Resul
     sink.message("Ingesting local sessions...").await;
     let ingest_result = run_auto_ingest(&config, &db, no_semantic, no_embed, sink).await?;
     eprintln!(
-        "  -> {} ingested, {} skipped, {} errors.",
-        ingest_result.ingested, ingest_result.skipped, ingest_result.errors
+        "  -> {} ingested, {} skipped, {} deferred, {} errors.",
+        ingest_result.ingested, ingest_result.skipped, ingest_result.deferred, ingest_result.errors
     );
     sink.message(&format!(
-        "-> {} ingested, {} skipped, {} errors.",
-        ingest_result.ingested, ingest_result.skipped, ingest_result.errors
+        "-> {} ingested, {} skipped, {} deferred, {} errors.",
+        ingest_result.ingested, ingest_result.skipped, ingest_result.deferred, ingest_result.errors
     ))
     .await;
     outcome.ingested = ingest_result.ingested;
+    outcome.deferred = ingest_result.deferred;
+    outcome.skipped = ingest_result.skipped;
+    outcome.errors = ingest_result.errors;
     sink.phase_complete(
         "ingest",
         Some(serde_json::json!({
             "ingested": ingest_result.ingested,
             "skipped": ingest_result.skipped,
+            "deferred": ingest_result.deferred,
             "errors": ingest_result.errors,
         })),
     )
@@ -474,7 +484,10 @@ struct ReindexResult {
 
 /// vault/raw/sessions/ 스캔 -> DB에 없는 MD를 인덱싱
 fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
-    let sessions_dir = config.vault.path.join(secall_core::vault::sessions_reldir());
+    let sessions_dir = config
+        .vault
+        .path
+        .join(secall_core::vault::sessions_reldir());
     if !sessions_dir.exists() {
         return Ok(ReindexResult {
             indexed: 0,
@@ -565,8 +578,7 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
         // Re-entry is safe: INSERT OR IGNORE on UNIQUE(session_id, turn_index)
         // skips already-present turns, so a previously interrupted sync or a
         // session backfilled from a pre-fix index will self-heal here.
-        let parsed_turns =
-            secall_core::ingest::parse_turns_from_body(&body, &fm.date);
+        let parsed_turns = secall_core::ingest::parse_turns_from_body(&body, &fm.date);
         // Cross-check against frontmatter `turns:` count; log on mismatch but
         // still insert what parsed (best-effort, never block the sync).
         if let Some(expected) = fm.turns {
@@ -621,6 +633,7 @@ async fn run_auto_ingest(
     if paths.is_empty() {
         return Ok(IngestStats {
             ingested: 0,
+            deferred: 0,
             skipped: 0,
             errors: 0,
             skipped_min_turns: 0,

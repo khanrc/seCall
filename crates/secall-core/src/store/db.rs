@@ -212,6 +212,10 @@ impl Database {
                 )?;
             }
         }
+        if current < 14 {
+            self.conn
+                .execute_batch(super::deferred_source_repo::CREATE_DEFERRED_SOURCES)?;
+        }
         if current < CURRENT_SCHEMA_VERSION {
             self.conn.execute(
                 "INSERT OR REPLACE INTO config(key, value) VALUES ('schema_version', ?1)",
@@ -303,9 +307,9 @@ impl Database {
                 |r| r.get(0),
             )?;
             if exists > 0 {
-                let chunks: i64 = self
-                    .conn
-                    .query_row("SELECT COUNT(*) FROM turn_vectors", [], |r| r.get(0))?;
+                let chunks: i64 =
+                    self.conn
+                        .query_row("SELECT COUNT(*) FROM turn_vectors", [], |r| r.get(0))?;
                 // Distinct turns with ≥1 chunk — comparable to embeddable_turns.
                 let turns: i64 = self.conn.query_row(
                     "SELECT COUNT(*) FROM (SELECT DISTINCT session_id, turn_index FROM turn_vectors)",
