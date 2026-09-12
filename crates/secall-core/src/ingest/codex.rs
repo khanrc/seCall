@@ -74,6 +74,7 @@ struct ResponsePayload {
 }
 
 pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
+    let filename_id = rollout_filename_id(path);
     // Extract session ID from filename: rollout-<uuid>.jsonl → uuid
     let session_id = path
         .file_stem()
@@ -131,6 +132,22 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
         match jl.line_type.as_str() {
             "session_meta" => {
                 if let Ok(meta) = serde_json::from_value::<SessionMeta>(jl.payload) {
+                    // A fork can carry its parent's metadata later in the copied
+                    // history. Only the opening header owns this rollout.
+                    if meta_id.is_some() {
+                        continue;
+                    }
+                    if meta.id.trim().is_empty() {
+                        return Err(anyhow!("empty Codex session identity: {}", path.display()));
+                    }
+                    if let Some(expected) = filename_id {
+                        if uuid::Uuid::parse_str(&meta.id).ok() != Some(expected) {
+                            return Err(anyhow!(
+                                "Codex rollout identity conflict: filename={expected}, header={}",
+                                meta.id
+                            ));
+                        }
+                    }
                     meta_id = Some(meta.id);
                     meta_cwd = meta.cwd;
                     meta_timestamp = meta
@@ -239,7 +256,8 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
     }
 
     // session_meta의 id가 있으면 우선 사용 (filename fallback)
-    let final_id = meta_id.unwrap_or(session_id);
+    let final_id =
+        meta_id.unwrap_or_else(|| filename_id.map(|id| id.to_string()).unwrap_or(session_id));
 
     // cwd에서 프로젝트명 추출: "/Users/d9ng/proj/seCall" → "seCall"
     let project = meta_cwd
@@ -271,6 +289,13 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
         archived: false,
         archived_at: None,
     })
+}
+
+/// Recognize both rollout-UUID and rollout-TIMESTAMP-UUID names. Other names
+/// (copied exports, custom homes) continue to use the opening metadata.
+fn rollout_filename_id(path: &Path) -> Option<uuid::Uuid> {
+    let name = path.file_stem()?.to_str()?.strip_prefix("rollout-")?;
+    uuid::Uuid::parse_str(name.get(name.len().checked_sub(36)?..)?).ok()
 }
 
 /// Convert a serde_json::Value to String — strings pass through, others serialize to JSON.
@@ -367,7 +392,10 @@ mod tests {
             &first_user.content[..first_user.content.len().min(40)]
         );
         assert!(
-            !session.turns.iter().any(|t| t.content.starts_with("# AGENTS.md")),
+            !session
+                .turns
+                .iter()
+                .any(|t| t.content.starts_with("# AGENTS.md")),
             "AGENTS.md injection turn must be dropped"
         );
     }
