@@ -170,6 +170,8 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                         .timestamp
                         .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
                         .map(|dt| dt.with_timezone(&Utc));
+                } else {
+                    review_events_only = false;
                 }
             }
             "response_item" => {
