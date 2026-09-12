@@ -817,3 +817,5 @@ Claude Code 설정 (`~/.claude/settings.json`)에 추가:
 **Contact**: [d9ng@outlook.com](mailto:d9ng@outlook.com)
 
 </div>
+
+Codex exec reviews containing only known review events are deferred until response items arrive. The local index stores the source content hash and parser revision in `deferred_sources`; unchanged inputs avoid repeated parsing across `ingest` and `sync` processes. Changes to either trigger another check, and `--force` explicitly rechecks. Raw JSONL files remain untouched. Malformed and unknown inputs still report errors. JSON summaries expose `ingested`, `skipped`, `deferred`, and `errors` separately; these counters are also present in sync results.

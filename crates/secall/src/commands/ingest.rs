@@ -6,8 +6,7 @@ use secall_core::{
     ingest::{
         detect::{
             detect_parser, find_claude_sessions, find_codex_sessions, find_gemini_sessions,
-            is_subagent_path,
-            find_sessions_for_cwd,
+            find_sessions_for_cwd, is_subagent_path,
         },
         AgentKind,
     },
@@ -47,6 +46,7 @@ pub struct IngestArgs {
 pub struct IngestOutcome {
     pub ingested: usize,
     pub skipped: usize,
+    pub deferred: usize,
     pub errors: usize,
     pub skipped_min_turns: usize,
     pub hook_failures: usize,
@@ -78,6 +78,7 @@ pub enum IngestPhase {
 pub struct IngestStats {
     pub ingested: usize,
     pub skipped: usize,
+    pub deferred: usize,
     pub errors: usize,
     pub skipped_min_turns: usize,
     pub hook_failures: usize,
@@ -137,12 +138,13 @@ pub async fn run(
         OutputFormat::Text => {
             if stats.ingested > 0
                 || stats.skipped > 0
+                || stats.deferred > 0
                 || stats.errors > 0
                 || stats.skipped_min_turns > 0
             {
                 eprintln!(
-                    "\nSummary: {} ingested, {} skipped (duplicate), {} errors",
-                    stats.ingested, stats.skipped, stats.errors
+                    "\nSummary: {} ingested, {} skipped (duplicate), {} deferred, {} errors",
+                    stats.ingested, stats.skipped, stats.deferred, stats.errors
                 );
                 if stats.skipped_min_turns > 0 {
                     eprintln!(
@@ -168,6 +170,7 @@ pub async fn run(
                 "summary": {
                     "ingested": stats.ingested,
                     "skipped": stats.skipped,
+                    "deferred": stats.deferred,
                     "errors": stats.errors,
                     "skipped_min_turns": stats.skipped_min_turns,
                 },
@@ -271,8 +274,8 @@ pub async fn run_with_progress(args: IngestArgs, sink: &dyn ProgressSink) -> Res
     )
     .await?;
     sink.message(&format!(
-        "{} ingested, {} skipped, {} errors.",
-        stats.ingested, stats.skipped, stats.errors
+        "{} ingested, {} skipped, {} deferred, {} errors.",
+        stats.ingested, stats.skipped, stats.deferred, stats.errors
     ))
     .await;
     sink.phase_complete(
@@ -280,6 +283,7 @@ pub async fn run_with_progress(args: IngestArgs, sink: &dyn ProgressSink) -> Res
         Some(serde_json::json!({
             "ingested": stats.ingested,
             "skipped": stats.skipped,
+                    "deferred": stats.deferred,
             "errors": stats.errors,
         })),
     )
@@ -292,6 +296,7 @@ pub async fn run_with_progress(args: IngestArgs, sink: &dyn ProgressSink) -> Res
     let mut outcome = IngestOutcome {
         ingested: stats.ingested,
         skipped: stats.skipped,
+        deferred: stats.deferred,
         errors: stats.errors,
         skipped_min_turns: stats.skipped_min_turns,
         hook_failures: stats.hook_failures,
@@ -367,6 +372,7 @@ pub async fn ingest_sessions(
 ) -> Result<IngestStats> {
     let mut ingested = 0usize;
     let mut skipped = 0usize;
+    let mut deferred = 0usize;
     let mut errors = 0usize;
     let mut skipped_min_turns = 0usize;
     let mut hook_failures = 0usize;
@@ -416,6 +422,7 @@ pub async fn ingest_sessions(
                 return Ok(IngestStats {
                     ingested,
                     skipped,
+                    deferred,
                     errors,
                     skipped_min_turns,
                     hook_failures,
@@ -439,6 +446,7 @@ pub async fn ingest_sessions(
             force,
             &mut ingested,
             &mut skipped,
+            &mut deferred,
             &mut errors,
             &mut skipped_min_turns,
             &mut new_session_ids,
@@ -476,6 +484,7 @@ pub async fn ingest_sessions(
             return Ok(IngestStats {
                 ingested,
                 skipped,
+                deferred,
                 errors,
                 skipped_min_turns,
                 hook_failures,
@@ -501,6 +510,7 @@ pub async fn ingest_sessions(
             return Ok(IngestStats {
                 ingested,
                 skipped,
+                deferred,
                 errors,
                 skipped_min_turns,
                 hook_failures,
@@ -513,6 +523,7 @@ pub async fn ingest_sessions(
     Ok(IngestStats {
         ingested,
         skipped,
+        deferred,
         errors,
         skipped_min_turns,
         hook_failures,
@@ -585,6 +596,7 @@ fn ingest_path(
     force: bool,
     ingested: &mut usize,
     skipped: &mut usize,
+    deferred: &mut usize,
     errors: &mut usize,
     skipped_min_turns: &mut usize,
     new_session_ids: &mut Vec<String>,
@@ -654,6 +666,24 @@ fn ingest_path(
         return;
     }
 
+    let fingerprint = if parser.agent_kind() == AgentKind::Codex {
+        match prepare_codex_source(db, session_path, force) {
+            Ok((fingerprint, cached)) => {
+                if cached {
+                    *deferred += 1;
+                    return;
+                }
+                Some(fingerprint)
+            }
+            Err(e) => {
+                record_source_failure(session_path, e, errors, error_details);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     // 소스 파일 (size, mtime) 스냅샷 — 변경 감지(재인제스트 판정) + ingest 후 기록 (#13).
     let file_meta = source_file_meta(session_path);
 
@@ -680,7 +710,10 @@ fn ingest_path(
                     // and caused the oscillating coverage in #1592. The genuine
                     // full-rebuild cases (compaction, `--force`) still delete,
                     // inside ingest_single_session.
-                    tracing::debug!(session = session_id_hint, "re-ingesting changed session (incremental)");
+                    tracing::debug!(
+                        session = session_id_hint,
+                        "re-ingesting changed session (incremental)"
+                    );
                 } else {
                     *skipped += 1;
                     return;
@@ -739,6 +772,22 @@ fn ingest_path(
                 }
             }
         }
+        Err(secall_core::error::SecallError::Parse { ref source, .. })
+            if source.is::<secall_core::ingest::codex::DeferredReview>() =>
+        {
+            let result = (|| -> Result<()> {
+                let fingerprint = fingerprint.as_ref().expect("Codex source fingerprint");
+                // A concurrent append must not seal content the parser never saw.
+                if fingerprint.still_matches(session_path)? {
+                    db.defer_source(fingerprint, "incomplete_codex_review")?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => *deferred += 1,
+                Err(e) => record_source_failure(session_path, e, errors, error_details),
+            }
+        }
         Err(e) => {
             tracing::warn!(path = %session_path.display(), error = %e, "failed to parse session file");
             error_details.push(IngestError {
@@ -750,6 +799,39 @@ fn ingest_path(
             *errors += 1;
         }
     }
+}
+
+fn prepare_codex_source(
+    db: &Database,
+    path: &Path,
+    force: bool,
+) -> Result<(
+    secall_core::store::deferred_source_repo::SourceFingerprint,
+    bool,
+)> {
+    use secall_core::store::deferred_source_repo::SourceFingerprint;
+    let fingerprint = SourceFingerprint::read(path, secall_core::ingest::codex::parser_revision())?;
+    let cached = !force && db.is_deferred_source(&fingerprint)?;
+    if !cached {
+        db.clear_deferred_source(&fingerprint)?;
+    }
+    Ok((fingerprint, cached))
+}
+
+fn record_source_failure(
+    path: &Path,
+    error: anyhow::Error,
+    errors: &mut usize,
+    details: &mut Vec<IngestError>,
+) {
+    tracing::warn!(path = %path.display(), %error, "failed to track deferred source");
+    *errors += 1;
+    details.push(IngestError {
+        path: path.display().to_string(),
+        session_id: None,
+        phase: IngestPhase::Parsing,
+        message: error.to_string(),
+    });
 }
 
 /// 수집된 벡터 task 를 일괄 임베딩. 취소 시 `true` 반환 (caller 가 early return).
@@ -1103,7 +1185,11 @@ fn ingest_single_session(
     // parsed content, so it holds even if the `subagents/` path pre-filter is
     // bypassed or CC renames that subtree.
     if let Some(reason) = secall_core::ingest::subagent_skip_reason(&session) {
-        tracing::debug!(session = &session.id, reason, "skipping non-indexable session");
+        tracing::debug!(
+            session = &session.id,
+            reason,
+            "skipping non-indexable session"
+        );
         *skipped += 1;
         return SessionOutcome::SkippedForeign;
     }
