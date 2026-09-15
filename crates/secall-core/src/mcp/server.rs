@@ -1192,7 +1192,7 @@ fn merge_json_object(target: &mut serde_json::Value, patch: &serde_json::Value) 
 #[tool_router]
 impl SeCallMcpServer {
     #[tool(
-        description = "Search agent session history. Use keyword queries for exact terms, semantic queries for conceptual search, or temporal queries for time-based filtering.",
+        description = "Search agent session history. Call with {\"queries\": [{\"query\": \"topic to find\"}]}. The required queries array contains objects, not strings; a top-level query is invalid. Omit type for hybrid search. Use keyword for exact identifiers, semantic for vector-only search, and temporal alongside a search item for date filtering.",
         annotations(
             title = "Recall sessions",
             read_only_hint = true,

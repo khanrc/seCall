@@ -77,7 +77,9 @@ async fn post(
         .get("Mcp-Session-Id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
     (status, sid, String::from_utf8_lossy(&bytes).to_string())
 }
 
@@ -146,7 +148,11 @@ async fn advertises_every_tool_when_nothing_is_disabled() {
 
 #[tokio::test]
 async fn disabled_tools_are_not_advertised() {
-    let app = router(vec!["wiki_search".into(), "graph_query".into(), "status".into()]);
+    let app = router(vec![
+        "wiki_search".into(),
+        "graph_query".into(),
+        "status".into(),
+    ]);
     let sid = handshake(&app).await;
     assert_eq!(advertised(&app, &sid).await, ["get", "recall"]);
 }
@@ -175,7 +181,11 @@ async fn calling_a_disabled_tool_is_rejected() {
 
 #[tokio::test]
 async fn sibling_tools_still_dispatch() {
-    let app = router(vec!["wiki_search".into(), "graph_query".into(), "status".into()]);
+    let app = router(vec![
+        "wiki_search".into(),
+        "graph_query".into(),
+        "status".into(),
+    ]);
     let sid = handshake(&app).await;
 
     let (_, _, body) = post(
@@ -193,4 +203,45 @@ async fn sibling_tools_still_dispatch() {
         frame.get("result").is_some(),
         "recall must still work alongside disabled siblings, got: {frame}"
     );
+}
+
+#[tokio::test]
+async fn malformed_recall_arguments_can_be_corrected_on_the_same_session() {
+    let app = router(vec![]);
+    let sid = handshake(&app).await;
+
+    for arguments in [
+        serde_json::json!({"query": "anything"}),
+        serde_json::json!({"queries": ["anything"]}),
+    ] {
+        let (_, _, body) = post(
+            &app,
+            Some(&sid),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {"name": "recall", "arguments": arguments}
+            }),
+        )
+        .await;
+        let frame = last_frame(&body);
+        assert_eq!(frame["error"]["code"], -32602, "{frame}");
+        if arguments.get("queries").is_some() {
+            let message = frame["error"]["message"].as_str().unwrap();
+            let example_start = message.find('{').expect("query object example");
+            let query: serde_json::Value = serde_json::from_str(&message[example_start..])
+                .expect("the error provides a usable query object");
+            let (_, _, corrected) = post(
+                &app,
+                Some(&sid),
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                    "params": {"name": "recall", "arguments": {"queries": [query]}}
+                }),
+            )
+            .await;
+            let frame = last_frame(&corrected);
+            assert!(frame.get("result").is_some(), "{frame}");
+            assert_ne!(frame["result"]["isError"], true, "{frame}");
+        }
+    }
 }
