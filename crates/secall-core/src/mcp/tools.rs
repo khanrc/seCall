@@ -16,6 +16,7 @@ pub enum QueryType {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(expecting = "a query object such as {\"query\": \"topic to find\"}")]
 pub struct QueryItem {
     /// Search mode. Omit (or use "hybrid") for default RRF fusion. Use "keyword" / "semantic" only when you specifically want a single-modal lookup. "temporal" sets a date filter.
     #[serde(rename = "type", default)]
@@ -26,7 +27,7 @@ pub struct QueryItem {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RecallParams {
-    /// Search queries array. Each item defaults to "hybrid" mode (BM25 + vector merged via RRF). Mix types only when you need a specific backend or a temporal filter alongside.
+    /// Array of query objects, e.g. [{"query": "topic to find"}]. Each item defaults to hybrid search (BM25 + vector merged via RRF). Use a type override only for a specific backend or temporal filter.
     pub queries: Vec<QueryItem>,
     /// Filter by project name
     pub project: Option<String>,

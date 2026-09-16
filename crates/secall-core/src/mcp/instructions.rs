@@ -31,10 +31,10 @@ pub fn build_instructions(db: &Database) -> String {
     format!(
         r#"seCall — Agent Session Search Engine
 
-Index contains {session_count} sessions across {project_count} projects.
-Projects: {projects}
-Agents: {agents}
-Vector search: {vector_status}
+## Start here
+- Search with `recall`: {{"queries": [{{"query": "topic to find"}}]}}.
+- `queries` is an array of objects, each with a `query` string. A top-level `query` or an array of strings is not a valid recall request.
+- Read a hit with `get`: {{"id": "session_id:turn_index", "full": true}}. Use the returned session ID and turn index.
 
 ## Usage Tips
 - `recall` defaults to hybrid mode (BM25 + vector, merged via RRF). Omit `type` for the default — it's the right choice for most paraphrase / conceptual queries.
@@ -57,7 +57,13 @@ Vector search: {vector_status}
 - Multiple hybrid queries: {{"queries": [{{"query": "RRF fusion ranking"}}, {{"query": "vector similarity merge"}}]}}
 - Temporal filter: {{"queries": [{{"type": "temporal", "query": "yesterday"}}, {{"query": "bugfix"}}]}}
 - Wiki: {{"query": "tunadish", "category": "projects", "limit": 3}}
-{graph_section}"#,
+{graph_section}
+## Index
+Index contains {session_count} sessions across {project_count} projects.
+Agents: {agents}
+Vector search: {vector_status}
+Projects: {projects}
+"#,
         session_count = session_count,
         project_count = projects.len(),
         projects = if projects.is_empty() {
