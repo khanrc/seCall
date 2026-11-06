@@ -768,6 +768,49 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_backfill_reads_first_real_user_turn() {
+        let db = Database::open_memory().unwrap();
+        let turn = |index: u32, role: Role, content: &str| Turn {
+            index,
+            role,
+            content: content.to_string(),
+            timestamp: None,
+            actions: vec![],
+            thinking: None,
+            tokens: None,
+            is_sidechain: false,
+        };
+        db.insert_session(&make_test_session("sess-codex")).unwrap();
+        for t in [
+            turn(
+                0,
+                Role::User,
+                "<environment_context>\n</environment_context>",
+            ),
+            turn(1, Role::User, "<today>2026-11-06</today>\n\n<digest>"),
+            turn(2, Role::Assistant, "done"),
+        ] {
+            db.insert_turn("sess-codex", &t).unwrap();
+        }
+        db.insert_session(&make_test_session("sess-injected-only"))
+            .unwrap();
+        db.insert_turn(
+            "sess-injected-only",
+            &turn(
+                0,
+                Role::User,
+                "<recommended_plugins>\n</recommended_plugins>",
+            ),
+        )
+        .unwrap();
+
+        let rows = db.get_all_sessions_for_classify().unwrap();
+        let first = |id: &str| rows.iter().find(|r| r.0 == id).unwrap().4.clone();
+        assert_eq!(first("sess-codex"), "<today>2026-11-06</today>\n\n<digest>");
+        assert_eq!(first("sess-injected-only"), "");
+    }
+
+    #[test]
     fn test_delete_session() {
         let db = Database::open_memory().unwrap();
         db.insert_session(&make_test_session("sess-del")).unwrap();

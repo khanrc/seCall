@@ -32,6 +32,33 @@ const SECALL_SUMMARY_PROMPT_PREFIX: &str =
 /// (이전엔 `wiki::WIKI_INVOCATION_MARKER` 로 정의되어 ingest → wiki 역참조였음.)
 pub const WIKI_INVOCATION_MARKER: &str = "<!-- secall:wiki-update -->";
 
+/// Openings of user turns a harness injects ahead of the real task. Codex sends
+/// the repo's AGENTS.md, an `<environment_context>` block and, with apps enabled,
+/// `<recommended_plugins>` as *user* messages, so whatever keys on "the first user
+/// turn" (classification, noise detection, the session summary) must look past
+/// them. The codex parser already drops the AGENTS.md turn; it stays listed here
+/// so sessions ingested before that skip still classify correctly on backfill.
+pub const INJECTED_USER_CONTEXT_PREFIXES: &[&str] = &[
+    "# AGENTS.md instructions",
+    "<environment_context>",
+    "<recommended_plugins>",
+];
+
+/// Whether a user turn's content is harness-injected context, not a user message.
+pub fn is_injected_user_context(content: &str) -> bool {
+    let head = content.trim_start();
+    INJECTED_USER_CONTEXT_PREFIXES
+        .iter()
+        .any(|prefix| head.starts_with(prefix))
+}
+
+/// The first user turn that is not harness-injected context.
+pub fn first_real_user_turn(turns: &[Turn]) -> Option<&Turn> {
+    turns
+        .iter()
+        .find(|t| t.role == Role::User && !is_injected_user_context(&t.content))
+}
+
 pub trait SessionParser: Send + Sync {
     /// Check if this parser can handle the given path
     fn can_parse(&self, path: &Path) -> bool;
@@ -71,7 +98,7 @@ pub fn is_noise_session(session: &Session) -> Option<&'static str> {
         }
     }
 
-    if let Some(first_user) = session.turns.iter().find(|t| t.role == Role::User) {
+    if let Some(first_user) = first_real_user_turn(&session.turns) {
         let content_trimmed = first_user.content.trim_start();
         if content_trimmed.starts_with(SECALL_SUMMARY_PROMPT_PREFIX) {
             return Some("secall summary prompt");
@@ -145,6 +172,52 @@ mod tests {
             archived: false,
             archived_at: None,
         }
+    }
+
+    fn user_turn(content: &str) -> Turn {
+        Turn {
+            index: 0,
+            role: Role::User,
+            timestamp: None,
+            content: content.to_string(),
+            actions: vec![],
+            tokens: None,
+            thinking: None,
+            is_sidechain: false,
+        }
+    }
+
+    #[test]
+    fn first_real_user_turn_skips_codex_injected_context() {
+        let task = "<today>2026-11-06</today>\n\n<digest>\n</digest>";
+        let turns = vec![
+            user_turn("<environment_context>\n  <cwd>/home/u/log</cwd>\n</environment_context>"),
+            user_turn("\n<recommended_plugins>\n- github\n</recommended_plugins>"),
+            user_turn("# AGENTS.md instructions for /home/u/log"),
+            user_turn(task),
+        ];
+        assert_eq!(
+            first_real_user_turn(&turns).map(|t| t.content.as_str()),
+            Some(task)
+        );
+    }
+
+    #[test]
+    fn first_real_user_turn_is_none_when_only_injected_context() {
+        let turns = vec![user_turn("<environment_context></environment_context>")];
+        assert!(first_real_user_turn(&turns).is_none());
+    }
+
+    #[test]
+    fn noise_marker_behind_injected_context_is_detected() {
+        let mut s = dummy_session(
+            Some("/home/u/proj"),
+            Some("<environment_context></environment_context>"),
+        );
+        s.turns.push(user_turn(&format!(
+            "{WIKI_INVOCATION_MARKER}\nupdate the wiki"
+        )));
+        assert_eq!(is_noise_session(&s), Some("secall wiki invocation"));
     }
 
     #[test]
