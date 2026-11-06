@@ -32,6 +32,9 @@ const SECALL_SUMMARY_PROMPT_PREFIX: &str =
 /// (이전엔 `wiki::WIKI_INVOCATION_MARKER` 로 정의되어 ingest → wiki 역참조였음.)
 pub const WIKI_INVOCATION_MARKER: &str = "<!-- secall:wiki-update -->";
 
+/// Opening of the user turn in which Codex sends the repo's AGENTS.md.
+pub const AGENTS_MD_TURN_PREFIX: &str = "# AGENTS.md instructions";
+
 /// Openings of user turns a harness injects ahead of the real task. Codex sends
 /// the repo's AGENTS.md, an `<environment_context>` block and, with apps enabled,
 /// `<recommended_plugins>` as *user* messages, so whatever keys on "the first user
@@ -39,12 +42,16 @@ pub const WIKI_INVOCATION_MARKER: &str = "<!-- secall:wiki-update -->";
 /// them. The codex parser already drops the AGENTS.md turn; it stays listed here
 /// so sessions ingested before that skip still classify correctly on backfill.
 pub const INJECTED_USER_CONTEXT_PREFIXES: &[&str] = &[
-    "# AGENTS.md instructions",
+    AGENTS_MD_TURN_PREFIX,
     "<environment_context>",
     "<recommended_plugins>",
 ];
 
 /// Whether a user turn's content is harness-injected context, not a user message.
+///
+/// Matches the opening only: Codex often packs several blocks into one turn
+/// (`<recommended_plugins>` then the AGENTS.md block, or AGENTS.md then
+/// `<environment_context>`), so a whole-turn shape check would miss them.
 pub fn is_injected_user_context(content: &str) -> bool {
     let head = content.trim_start();
     INJECTED_USER_CONTEXT_PREFIXES
