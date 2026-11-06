@@ -1214,10 +1214,7 @@ fn ingest_single_session(
 
     // 세션 분류: 첫 번째 user turn의 내용 또는 project 이름을 규칙과 매칭
     {
-        let first_user_content = session
-            .turns
-            .iter()
-            .find(|t| t.role == secall_core::ingest::Role::User)
+        let first_user_content = secall_core::ingest::first_real_user_turn(&session.turns)
             .map(|t| t.content.as_str())
             .unwrap_or("");
         session.session_type = apply_classification(

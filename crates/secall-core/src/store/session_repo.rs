@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::error::{Result, SecallError};
-use crate::ingest::{Session, Turn};
+use crate::ingest::{is_injected_user_context, Session, Turn};
 use crate::search::bm25::SessionMeta;
 use crate::store::db::{Database, SessionMeta as WikiSessionMeta, TurnRow};
 
@@ -691,32 +691,51 @@ impl Database {
         })
     }
 
-    /// 전체 세션의 (id, cwd, project, agent, 첫 user turn content) 반환 (backfill용)
+    /// 전체 세션의 (id, cwd, project, agent, 첫 실제 user turn content) 반환 (backfill용).
+    ///
+    /// Harness-injected user turns are skipped (`first_real_user_turn`'s rule), so
+    /// backfill classifies on the same turn ingest does instead of reverting it.
+    /// User turns are read lazily per session and the scan stops at the first real
+    /// one, so long transcripts after it are never loaded.
     #[allow(clippy::type_complexity)]
     pub fn get_all_sessions_for_classify(
         &self,
     ) -> Result<Vec<(String, Option<String>, Option<String>, String, String)>> {
-        let mut stmt = self.conn().prepare(
-            "SELECT s.id, s.cwd, s.project, s.agent, COALESCE(t.content, '')
-             FROM sessions s
-             LEFT JOIN turns t ON t.session_id = s.id AND t.turn_index = (
-                 SELECT MIN(t2.turn_index) FROM turns t2
-                 WHERE t2.session_id = s.id AND t2.role = 'user'
-             )",
-        )?;
-        let rows = stmt
+        let mut sessions_stmt = self
+            .conn()
+            .prepare("SELECT id, cwd, project, agent FROM sessions")?;
+        let sessions: Vec<(String, Option<String>, Option<String>, String)> = sessions_stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
                 ))
             })?
             .filter_map(|r| r.ok())
             .collect();
-        Ok(rows)
+
+        let mut user_turns = self.conn().prepare(
+            "SELECT content FROM turns
+             WHERE session_id = ?1 AND role = 'user'
+             ORDER BY turn_index",
+        )?;
+        let mut out = Vec::with_capacity(sessions.len());
+        for (id, cwd, project, agent) in sessions {
+            let mut first_real = String::new();
+            let mut rows = user_turns.query([&id])?;
+            while let Some(row) = rows.next()? {
+                let content = row.get::<_, Option<String>>(0)?.unwrap_or_default();
+                if !is_injected_user_context(&content) {
+                    first_real = content;
+                    break;
+                }
+            }
+            drop(rows);
+            out.push((id, cwd, project, agent, first_real));
+        }
+        Ok(out)
     }
 
     /// 특정 날짜의 세션 목록 조회 (일기 생성용)

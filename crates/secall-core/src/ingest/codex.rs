@@ -209,7 +209,9 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                         // a user utterance. Brittle to codex renaming the header,
                         // but benign — falls back to prior behaviour.
                         if role == Role::User
-                            && content.trim_start().starts_with("# AGENTS.md instructions")
+                            && content
+                                .trim_start()
+                                .starts_with(super::AGENTS_MD_TURN_PREFIX)
                         {
                             continue;
                         }

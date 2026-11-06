@@ -306,10 +306,7 @@ fn escape_yaml_string(s: &str) -> String {
 
 /// 세션의 첫 User 턴에서 비어있지 않은 첫 줄을 80자로 truncate하여 반환.
 pub(crate) fn extract_summary(session: &super::types::Session) -> Option<String> {
-    let first_user_turn = session
-        .turns
-        .iter()
-        .find(|t| t.role == super::types::Role::User)?;
+    let first_user_turn = super::first_real_user_turn(&session.turns)?;
     let first_line = first_user_turn
         .content
         .lines()
@@ -628,6 +625,18 @@ mod tests {
         // 80 chars + "..."
         assert_eq!(s.len(), 83);
         assert!(s.ends_with("..."));
+    }
+
+    #[test]
+    fn test_summary_skips_codex_injected_context() {
+        let session = make_session(vec![
+            make_turn(Role::User, "<environment_context>\n  <cwd>/x</cwd>"),
+            make_turn(Role::User, "실제 작업 요청"),
+        ]);
+        assert_eq!(
+            extract_summary(&session),
+            Some("실제 작업 요청".to_string())
+        );
     }
 
     #[test]
