@@ -285,12 +285,16 @@ impl Database {
         if !self.has_vector_table()? {
             return Ok(Vec::new());
         }
+        // Sorted here rather than with ORDER BY: rowid order makes SQLite walk
+        // the table and its embedding BLOBs (110s cold for 774k vectors), while
+        // without it a covering index answers (11s).
         let mut stmt = self
             .conn()
-            .prepare("SELECT id FROM turn_vectors WHERE model = ?1 ORDER BY id")?;
-        let ids = stmt
+            .prepare("SELECT id FROM turn_vectors WHERE model = ?1")?;
+        let mut ids = stmt
             .query_map([model], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<i64>>>()?;
+        ids.sort_unstable();
         Ok(ids)
     }
 
