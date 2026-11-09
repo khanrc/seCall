@@ -219,18 +219,12 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                             continue;
                         }
 
-                        // Codex emits a response's text after the tool calls that
-                        // precede it. When a call already opened this response's
-                        // assistant turn, the text belongs to that turn.
-                        if role == Role::Assistant {
-                            if let Some(last) = turns.last_mut() {
-                                if last.role == Role::Assistant && last.content.is_empty() {
-                                    last.content = content;
-                                    continue;
-                                }
-                            }
-                        }
-
+                        // Every message opens its own turn, including assistant
+                        // text that follows a turn opened by a tool call. Folding
+                        // the text into that turn would leave the turn count
+                        // unchanged, and re-ingest treats an unchanged count as
+                        // nothing new: a response's final answer would never be
+                        // indexed or rendered.
                         turns.push(Turn {
                             index: turn_idx,
                             role,
@@ -690,9 +684,11 @@ mod tests {
 
     #[test]
     fn test_codex_tool_call_before_text_opens_assistant_turn() {
-        // A response can call a tool before any assistant text. The call opens
-        // the assistant turn, and the text that follows joins it.
-        let f = make_codex_file(&[
+        // A response can call a tool before any assistant text. The call opens an
+        // assistant turn, and the text that follows opens its own turn, so a
+        // rollout ingested mid-response grows when its final answer arrives:
+        // re-ingest only picks up a session whose turn count grew.
+        let lines = [
             r#"{"type":"session_meta","payload":{"id":"call-first"}}"#,
             r#"{"timestamp":"2026-11-08T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"list files"}]}}"#,
             r#"{"timestamp":"2026-11-08T10:00:02Z","type":"response_item","payload":{"type":"reasoning","summary":[]}}"#,
@@ -700,31 +696,39 @@ mod tests {
             r#"{"timestamp":"2026-11-08T10:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":[{"type":"input_text","text":"a.rs"}]}}"#,
             r#"{"timestamp":"2026-11-08T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"One file: a.rs"}]}}"#,
             r#"{"timestamp":"2026-11-08T10:00:06Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Anything else?"}]}}"#,
-        ]);
-        let session = parse_codex_jsonl(f.path()).unwrap();
-        let shape: Vec<_> = session
-            .turns
-            .iter()
-            .map(|turn| {
-                (
-                    turn.index,
-                    turn.role,
-                    turn.content.as_str(),
-                    turn.actions.len(),
-                )
-            })
-            .collect();
+        ];
+        let shape = |session: &Session| -> Vec<(u32, Role, String, usize)> {
+            session
+                .turns
+                .iter()
+                .map(|turn| {
+                    (
+                        turn.index,
+                        turn.role,
+                        turn.content.clone(),
+                        turn.actions.len(),
+                    )
+                })
+                .collect()
+        };
+
+        let complete = parse_codex_jsonl(make_codex_file(&lines).path()).unwrap();
         assert_eq!(
-            shape,
+            shape(&complete),
             vec![
-                (0, Role::User, "list files", 0),
-                (1, Role::Assistant, "One file: a.rs", 1),
-                (2, Role::Assistant, "Anything else?", 0),
+                (0, Role::User, "list files".to_string(), 0),
+                (1, Role::Assistant, String::new(), 1),
+                (2, Role::Assistant, "One file: a.rs".to_string(), 0),
+                (3, Role::Assistant, "Anything else?".to_string(), 0),
             ]
         );
         assert_eq!(
-            session.turns[1].timestamp.expect("timestamp").to_rfc3339(),
+            complete.turns[1].timestamp.expect("timestamp").to_rfc3339(),
             "2026-11-08T10:00:03+00:00"
         );
+
+        // The same rollout read before the final answer was written.
+        let partial = parse_codex_jsonl(make_codex_file(&lines[..5]).path()).unwrap();
+        assert_eq!(shape(&partial), shape(&complete)[..2]);
     }
 }
