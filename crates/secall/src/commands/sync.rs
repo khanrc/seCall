@@ -1,15 +1,18 @@
+use std::path::Path;
+
 use anyhow::Result;
 use secall_core::{
-    ingest::markdown::{extract_body_text, parse_session_frontmatter},
+    ingest::markdown::{extract_body_text, parse_session_frontmatter, SessionFrontmatter},
+    ingest::parse_turns_from_body,
     jobs::ProgressSink,
     search::{tokenizer::create_tokenizer, Bm25Indexer, SearchEngine},
-    store::{get_default_db_path, Database, SessionRepo},
+    store::{get_default_db_path, session_repo::VaultRefresh, Database, SessionRepo},
     vault::{git::VaultGit, Config, Vault},
 };
 
 use crate::output::OutputFormat;
 
-use super::ingest::{ingest_sessions, IngestStats};
+use super::ingest::{ingest_sessions, source_file_meta, IngestStats};
 use super::wiki;
 
 /// `sync` 명령 인자 — REST DTO/Job 어댑터에서 동일 구조 사용.
@@ -240,20 +243,22 @@ pub async fn run_with_progress(args: SyncArgs, sink: &dyn ProgressSink) -> Resul
     sink.message("Reindexing vault...").await;
     let db = Database::open(&get_default_db_path())?;
     let reindex_result = reindex_vault(&config, &db)?;
-    eprintln!(
-        "  {} new sessions indexed, {} skipped.",
-        reindex_result.indexed, reindex_result.skipped
+    let reindex_summary = format!(
+        "{} new sessions indexed, {} appended, {} with replaced turns, {} skipped.",
+        reindex_result.indexed,
+        reindex_result.appended,
+        reindex_result.replaced,
+        reindex_result.skipped
     );
-    sink.message(&format!(
-        "{} new sessions indexed, {} skipped.",
-        reindex_result.indexed, reindex_result.skipped
-    ))
-    .await;
+    eprintln!("  {reindex_summary}");
+    sink.message(&reindex_summary).await;
     outcome.reindexed = reindex_result.indexed;
     sink.phase_complete(
         "reindex",
         Some(serde_json::json!({
             "indexed": reindex_result.indexed,
+            "appended": reindex_result.appended,
+            "replaced": reindex_result.replaced,
             "skipped": reindex_result.skipped,
         })),
     )
@@ -477,25 +482,31 @@ pub async fn run_with_progress(args: SyncArgs, sink: &dyn ProgressSink) -> Resul
     Ok(outcome)
 }
 
+#[derive(Default)]
 struct ReindexResult {
     indexed: usize,
+    /// Another host's sessions whose changed Markdown only added turns.
+    appended: usize,
+    /// Another host's sessions whose changed Markdown changed stored turns.
+    replaced: usize,
     skipped: usize,
 }
 
-/// vault/raw/sessions/ 스캔 -> DB에 없는 MD를 인덱싱
+/// vault/raw/sessions/ 스캔 -> DB에 없는 MD를 인덱싱하고, 다른 host 세션은
+/// MD가 바뀌었으면 갱신
 fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
     let sessions_dir = config
         .vault
         .path
         .join(secall_core::vault::sessions_reldir());
     if !sessions_dir.exists() {
-        return Ok(ReindexResult {
-            indexed: 0,
-            skipped: 0,
-        });
+        return Ok(ReindexResult::default());
     }
 
+    let local_host = gethostname::gethostname().to_string_lossy().to_string();
     let mut indexed = 0usize;
+    let mut appended = 0usize;
+    let mut replaced = 0usize;
     let mut skipped = 0usize;
 
     for entry in walkdir::WalkDir::new(&sessions_dir)
@@ -541,6 +552,22 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
         let body = extract_body_text(&content);
 
         if session_already_exists {
+            match sync_foreign_markdown(db, &fm, &body, &vault_path, path, &local_host) {
+                Ok(Some(VaultRefresh::Appended)) => {
+                    appended += 1;
+                    continue;
+                }
+                Ok(Some(VaultRefresh::Replaced)) => {
+                    replaced += 1;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(session_id = %fm.session_id, error = %e, "vault refresh failed");
+                    skipped += 1;
+                    continue;
+                }
+            }
             // Session row exists. Check whether turns are missing or incomplete
             // so we can backfill them idempotently. `insert_turn` uses
             // INSERT OR IGNORE and `turns` has UNIQUE(session_id, turn_index),
@@ -568,6 +595,10 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
                     continue;
                 }
             }
+            // Records the snapshot that the next sync compares against.
+            if let Err(e) = sync_foreign_markdown(db, &fm, &body, &vault_path, path, &local_host) {
+                tracing::warn!(session_id = %fm.session_id, error = %e, "vault snapshot failed");
+            }
         }
 
         // #1021: vault-pulled md only got `sessions` + `turns_fts` before this.
@@ -578,7 +609,7 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
         // Re-entry is safe: INSERT OR IGNORE on UNIQUE(session_id, turn_index)
         // skips already-present turns, so a previously interrupted sync or a
         // session backfilled from a pre-fix index will self-heal here.
-        let parsed_turns = secall_core::ingest::parse_turns_from_body(&body, &fm.date);
+        let parsed_turns = parse_turns_from_body(&body, &fm.date);
         // Cross-check against frontmatter `turns:` count; log on mismatch but
         // still insert what parsed (best-effort, never block the sync).
         if let Some(expected) = fm.turns {
@@ -603,7 +634,51 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
         }
     }
 
-    Ok(ReindexResult { indexed, skipped })
+    Ok(ReindexResult {
+        indexed,
+        appended,
+        replaced,
+        skipped,
+    })
+}
+
+/// Keep a session built from another host's Markdown in step with that
+/// Markdown: record its first `(size, mtime)` snapshot, and refresh the
+/// session when the snapshot changes. Returns `None` when nothing was
+/// refreshed, so the caller only backfills missing turns.
+///
+/// The other host rewrites the Markdown whenever it re-renders the session,
+/// for instance after a parser change moved turn boundaries
+/// (khanrc/seCall#43). The missing-turn backfill alone would keep the stale
+/// turns and mix them with the new ones.
+fn sync_foreign_markdown(
+    db: &Database,
+    fm: &SessionFrontmatter,
+    body: &str,
+    vault_path: &str,
+    md_path: &Path,
+    local_host: &str,
+) -> Result<Option<VaultRefresh>> {
+    if !db.is_foreign_vault_session(&fm.session_id, local_host)? {
+        return Ok(None);
+    }
+    let Some(current) = source_file_meta(md_path) else {
+        return Ok(None);
+    };
+    match db.get_source_meta(&fm.session_id)? {
+        Some(stored) if stored != current => {
+            let turns = parse_turns_from_body(body, &fm.date);
+            let refresh = db.refresh_session_from_vault(fm, body, vault_path, &turns, current)?;
+            Ok(Some(refresh))
+        }
+        Some(_) => Ok(None),
+        // Indexed before snapshots were recorded: start from the current
+        // Markdown instead of re-embedding every such session at once.
+        None => {
+            db.set_source_meta(&fm.session_id, current.0, current.1)?;
+            Ok(None)
+        }
+    }
 }
 
 /// ingest --auto 로직 재사용
@@ -660,4 +735,110 @@ async fn run_auto_ingest(
         Some(sink),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_md(id: &str, host: &str, turns: &[(&str, &str)]) -> String {
+        let mut md = format!(
+            "---\ntype: session\nagent: codex\nproject: log\nsession_id: {id}\ndate: 2026-11-09\n\
+             start_time: \"2026-11-09T10:00:00+00:00\"\nturns: {}\nhost: {host}\nstatus: raw\n---\n\n\
+             # codex 세션: log\n",
+            turns.len()
+        );
+        for (i, (role, text)) in turns.iter().enumerate() {
+            md.push_str(&format!("\n## Turn {} — {role} (10:00)\n\n{text}\n", i + 1));
+        }
+        md
+    }
+
+    fn turn_contents(db: &Database, id: &str) -> Vec<String> {
+        db.get_session_for_embedding(id)
+            .unwrap()
+            .turns
+            .into_iter()
+            .map(|t| t.content)
+            .collect()
+    }
+
+    fn reindex_counts(config: &Config, db: &Database) -> (usize, usize, usize, usize) {
+        let r = reindex_vault(config, db).unwrap();
+        (r.indexed, r.appended, r.replaced, r.skipped)
+    }
+
+    #[test]
+    fn reindex_vault_follows_changed_markdown_of_other_hosts() {
+        let vault = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.vault.path = vault.path().to_path_buf();
+        let day = vault
+            .path()
+            .join(secall_core::vault::sessions_reldir())
+            .join("2026-11-09");
+        std::fs::create_dir_all(&day).unwrap();
+        let md_path = day.join("codex_log_sess-mac.md");
+        let db = Database::open_memory().unwrap();
+
+        let v1 = [("User", "list files"), ("Assistant", "One file: a.rs")];
+        std::fs::write(&md_path, session_md("sess-mac", "macbook", &v1)).unwrap();
+        assert_eq!(reindex_counts(&config, &db), (1, 0, 0, 0));
+        assert_eq!(
+            reindex_counts(&config, &db),
+            (0, 0, 0, 1),
+            "unchanged Markdown"
+        );
+
+        // Re-rendered: a stored turn changed, so turns from it on are replaced.
+        let v2 = [
+            ("User", "list files"),
+            ("Assistant", "Two files: a.rs, b.rs"),
+        ];
+        std::fs::write(&md_path, session_md("sess-mac", "macbook", &v2)).unwrap();
+        assert_eq!(reindex_counts(&config, &db), (0, 0, 1, 0));
+        assert_eq!(
+            turn_contents(&db, "sess-mac"),
+            ["list files", "Two files: a.rs, b.rs"]
+        );
+
+        // The session went on: only the new turn is added.
+        let v3 = [v2[0], v2[1], ("User", "thanks")];
+        std::fs::write(&md_path, session_md("sess-mac", "macbook", &v3)).unwrap();
+        assert_eq!(reindex_counts(&config, &db), (0, 1, 0, 0));
+        assert_eq!(
+            turn_contents(&db, "sess-mac"),
+            ["list files", "Two files: a.rs, b.rs", "thanks"]
+        );
+    }
+
+    #[test]
+    fn reindex_vault_leaves_this_hosts_sessions_to_ingest() {
+        let vault = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.vault.path = vault.path().to_path_buf();
+        let day = vault
+            .path()
+            .join(secall_core::vault::sessions_reldir())
+            .join("2026-11-09");
+        std::fs::create_dir_all(&day).unwrap();
+        let md_path = day.join("codex_log_sess-own.md");
+        let db = Database::open_memory().unwrap();
+        let host = gethostname::gethostname().to_string_lossy().to_string();
+
+        let v1 = [("User", "list files"), ("Assistant", "One file: a.rs")];
+        std::fs::write(&md_path, session_md("sess-own", &host, &v1)).unwrap();
+        assert_eq!(reindex_counts(&config, &db), (1, 0, 0, 0));
+
+        let v2 = [
+            ("User", "list files"),
+            ("Assistant", "Two files: a.rs, b.rs"),
+        ];
+        std::fs::write(&md_path, session_md("sess-own", &host, &v2)).unwrap();
+        assert_eq!(reindex_counts(&config, &db), (0, 0, 0, 1));
+        assert_eq!(
+            turn_contents(&db, "sess-own"),
+            ["list files", "One file: a.rs"]
+        );
+    }
 }

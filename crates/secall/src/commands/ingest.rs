@@ -558,7 +558,7 @@ fn compile_classification_rules(config: &Config) -> Result<Vec<CompiledRule>> {
 }
 
 /// 소스 파일의 `(size, mtime_secs)` 스냅샷. stat 실패 시 `None` (#13).
-fn source_file_meta(path: &Path) -> Option<(i64, i64)> {
+pub(crate) fn source_file_meta(path: &Path) -> Option<(i64, i64)> {
     let m = std::fs::metadata(path).ok()?;
     let mtime = m
         .modified()
