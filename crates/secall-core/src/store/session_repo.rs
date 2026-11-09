@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use rusqlite::OptionalExtension;
+
 use crate::error::{Result, SecallError};
 use crate::ingest::{is_injected_user_context, Session, Turn};
 use crate::search::bm25::SessionMeta;
@@ -556,6 +558,167 @@ impl Database {
             )?;
         }
 
+        Ok(())
+    }
+
+    /// The vault path of a session built from another host's vault Markdown,
+    /// or `None` for any other session.
+    ///
+    /// That Markdown is the session's only source here, so its `source_size` /
+    /// `source_mtime` snapshot tracks the Markdown. Sessions built from this
+    /// host's own Markdown are excluded, and so are rows ingest has recorded a
+    /// local source for ([`Self::record_ingested_source`]): their snapshot is
+    /// of that local file.
+    pub fn foreign_vault_path(&self, session_id: &str, local_host: &str) -> Result<Option<String>> {
+        let path = self
+            .conn()
+            .query_row(
+                "SELECT COALESCE(vault_path, '') FROM sessions
+                 WHERE id = ?1 AND status = 'reindexed' AND host IS NOT NULL AND host <> ?2",
+                rusqlite::params![session_id, local_host],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(path)
+    }
+
+    /// Record the snapshot of the local source file ingest just processed.
+    ///
+    /// A row first built from vault Markdown becomes an ingested row here, so
+    /// `secall sync` no longer refreshes it from Markdown and the two snapshots
+    /// never overwrite each other.
+    pub fn record_ingested_source(&self, session_id: &str, size: i64, mtime: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE sessions SET source_size = ?1, source_mtime = ?2,
+                 status = CASE status WHEN 'reindexed' THEN 'indexed' ELSE status END
+             WHERE id = ?3",
+            rusqlite::params![size, mtime, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Bring a vault-built session up to date with its changed Markdown.
+    ///
+    /// The session row, the whole-body FTS row, and the source snapshot always
+    /// follow the Markdown. Stored turns that still equal the leading turns of
+    /// `turns` keep their rows and vectors. From the first turn that differs
+    /// on, turns are replaced and their vectors dropped for the embed pass to
+    /// rebuild. A session that is still running then re-embeds only the turn
+    /// whose tool output arrived since the last render, while a re-render
+    /// that moved turn boundaries replaces everything after the first move.
+    pub fn refresh_session_from_vault(
+        &self,
+        fm: &crate::ingest::markdown::SessionFrontmatter,
+        body_text: &str,
+        vault_path: &str,
+        turns: &[Turn],
+        snapshot: (i64, i64),
+    ) -> Result<VaultRefresh> {
+        let id = fm.session_id.as_str();
+        self.with_transaction(|| {
+            let stored = self.count_turns_for_session(id)?;
+            let kept = self.unchanged_turn_prefix(id, turns)?;
+            let refresh = if kept == stored {
+                VaultRefresh::TurnsKept
+            } else {
+                // The kept turns are the stored turns with the lowest indices,
+                // so every stored turn after the last kept one goes.
+                let from_index = kept
+                    .checked_sub(1)
+                    .map_or(0, |last| i64::from(turns[last].index) + 1);
+                self.delete_turns_from(id, from_index)?;
+                VaultRefresh::TurnsReplaced
+            };
+
+            self.conn()
+                .execute("DELETE FROM turns_fts WHERE session_id = ?1", [id])?;
+            if !body_text.trim().is_empty() {
+                self.conn().execute(
+                    "INSERT INTO turns_fts(content, session_id, turn_id) VALUES (?1, ?2, 0)",
+                    rusqlite::params![body_text, id],
+                )?;
+            }
+
+            // Favorites, notes, tags, and classification belong to this host
+            // and are left as they are.
+            self.conn().execute(
+                "UPDATE sessions SET
+                     model = ?1, project = ?2, cwd = ?3, start_time = ?4, end_time = ?5,
+                     turn_count = ?6, tokens_in = ?7, tokens_out = ?8, tools_used = ?9,
+                     vault_path = ?10, summary = ?11, is_archived = ?12, archived_at = ?13,
+                     source_size = ?14, source_mtime = ?15
+                 WHERE id = ?16",
+                rusqlite::params![
+                    fm.model,
+                    fm.project,
+                    fm.cwd,
+                    fm.start_time,
+                    fm.end_time,
+                    fm.turns.unwrap_or(0),
+                    fm.tokens_in.unwrap_or(0),
+                    fm.tokens_out.unwrap_or(0),
+                    fm.tools_used.as_ref().map(|t| t.join(",")),
+                    vault_path,
+                    fm.summary,
+                    fm.archived.unwrap_or(false),
+                    fm.archived_at,
+                    snapshot.0,
+                    snapshot.1,
+                    id,
+                ],
+            )?;
+
+            for turn in &turns[kept..] {
+                self.insert_turn(id, turn)?;
+            }
+            Ok(refresh)
+        })
+    }
+
+    /// How many of the session's stored turns, in order, equal the leading
+    /// turns of `turns`.
+    fn unchanged_turn_prefix(&self, session_id: &str, turns: &[Turn]) -> Result<usize> {
+        let mut stmt = self.conn().prepare(
+            "SELECT turn_index, role, content FROM turns
+             WHERE session_id = ?1 ORDER BY turn_index ASC",
+        )?;
+        let stored = stmt
+            .query_map([session_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(stored
+            .iter()
+            .zip(turns)
+            .take_while(|((index, role, content), turn)| {
+                *index == i64::from(turn.index)
+                    && role == turn.role.as_str()
+                    && *content == turn.content
+            })
+            .count())
+    }
+
+    /// Delete the session's turns at `from_index` and after, with their vectors.
+    fn delete_turns_from(&self, session_id: &str, from_index: i64) -> Result<()> {
+        let vectors_exist: bool = self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='turn_vectors')",
+            [],
+            |r| r.get(0),
+        )?;
+        if vectors_exist {
+            self.conn().execute(
+                "DELETE FROM turn_vectors WHERE session_id = ?1 AND turn_index >= ?2",
+                rusqlite::params![session_id, from_index],
+            )?;
+        }
+        self.conn().execute(
+            "DELETE FROM turns WHERE session_id = ?1 AND turn_index >= ?2",
+            rusqlite::params![session_id, from_index],
+        )?;
         Ok(())
     }
 
@@ -1362,6 +1525,16 @@ impl Database {
     }
 }
 
+/// How [`Database::refresh_session_from_vault`] updated a session's turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultRefresh {
+    /// No stored turn changed; turns new in the Markdown were added.
+    TurnsKept,
+    /// A stored turn changed; turns from the first change on were replaced
+    /// and their vectors dropped.
+    TurnsReplaced,
+}
+
 // ─── REST listing types ────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Clone)]
@@ -1741,5 +1914,189 @@ mod tests {
             8,
             "reindex 시 turn_count 가 frontmatter 값으로 동기화돼야 함"
         );
+    }
+
+    fn vault_turn(index: u32, role: crate::ingest::Role, content: &str) -> crate::ingest::Turn {
+        crate::ingest::Turn {
+            index,
+            role,
+            timestamp: None,
+            content: content.to_string(),
+            actions: Vec::new(),
+            tokens: None,
+            thinking: None,
+            is_sidechain: false,
+        }
+    }
+
+    /// A MacBook session indexed from the vault with two embedded turns,
+    /// marked as a favorite with a note.
+    fn indexed_foreign_session(db: &Database) -> SessionFrontmatter {
+        use crate::ingest::Role;
+        use crate::store::{SessionRepo, VectorRepo};
+
+        let mut fm = make_fm("sess-mac", None);
+        fm.host = Some("macbook".to_string());
+        fm.turns = Some(2);
+        db.insert_session_from_vault(&fm, "old body", "raw/.sessions/mac.md")
+            .unwrap();
+        db.insert_turn("sess-mac", &vault_turn(0, Role::User, "list files"))
+            .unwrap();
+        db.insert_turn("sess-mac", &vault_turn(1, Role::Assistant, "One file"))
+            .unwrap();
+        db.init_vector_table().unwrap();
+        for turn_index in 0..2 {
+            db.insert_vector(&[0.1; 4], "sess-mac", turn_index, 0, "m")
+                .unwrap();
+        }
+        db.conn()
+            .execute(
+                "UPDATE sessions SET is_favorite = 1, notes = 'keep' WHERE id = 'sess-mac'",
+                [],
+            )
+            .unwrap();
+        fm
+    }
+
+    fn count(db: &Database, sql: &str) -> i64 {
+        db.conn().query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn test_refresh_session_from_vault_keeps_unchanged_turns() {
+        use crate::ingest::Role;
+        use crate::store::session_repo::VaultRefresh;
+
+        let db = Database::open_memory().unwrap();
+        let mut fm = indexed_foreign_session(&db);
+        fm.turns = Some(3);
+        let turns = [
+            vault_turn(0, Role::User, "list files"),
+            vault_turn(1, Role::Assistant, "One file"),
+            vault_turn(2, Role::User, "thanks"),
+        ];
+
+        let refresh = db
+            .refresh_session_from_vault(&fm, "new body", "raw/.sessions/mac.md", &turns, (10, 20))
+            .unwrap();
+
+        assert_eq!(refresh, VaultRefresh::TurnsKept);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM turns WHERE session_id = 'sess-mac'"
+            ),
+            3
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM turn_vectors WHERE session_id = 'sess-mac'"
+            ),
+            2,
+            "vectors of unchanged turns are kept"
+        );
+        assert_eq!(
+            count(&db, "SELECT turn_count FROM sessions WHERE id = 'sess-mac'"),
+            3
+        );
+        let fts: Vec<String> = db
+            .conn()
+            .prepare("SELECT content FROM turns_fts WHERE session_id = 'sess-mac'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(fts, ["new body"]);
+        assert_eq!(db.get_source_meta("sess-mac").unwrap(), Some((10, 20)));
+    }
+
+    #[test]
+    fn test_refresh_session_from_vault_replaces_changed_turns() {
+        use crate::ingest::Role;
+        use crate::store::session_repo::VaultRefresh;
+
+        let db = Database::open_memory().unwrap();
+        let mut fm = indexed_foreign_session(&db);
+        fm.turns = Some(3);
+        // Re-rendered by a parser that opens an assistant turn at the tool call.
+        let turns = [
+            vault_turn(0, Role::User, "list files"),
+            vault_turn(1, Role::Assistant, ""),
+            vault_turn(2, Role::Assistant, "One file"),
+        ];
+
+        let refresh = db
+            .refresh_session_from_vault(&fm, "new body", "raw/.sessions/mac.md", &turns, (10, 20))
+            .unwrap();
+
+        assert_eq!(refresh, VaultRefresh::TurnsReplaced);
+        let stored: Vec<(i64, String)> = db
+            .conn()
+            .prepare("SELECT turn_index, content FROM turns WHERE session_id = 'sess-mac' ORDER BY turn_index")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            stored,
+            [
+                (0, "list files".to_string()),
+                (1, String::new()),
+                (2, "One file".to_string())
+            ]
+        );
+        let embedded: Vec<i64> = db
+            .conn()
+            .prepare("SELECT turn_index FROM turn_vectors WHERE session_id = 'sess-mac'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            embedded,
+            [0],
+            "the unchanged first turn keeps its vector; replaced turns lose theirs"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM sessions WHERE id = 'sess-mac' AND is_favorite = 1 AND notes = 'keep'"),
+            1,
+            "user metadata survives the refresh"
+        );
+    }
+
+    #[test]
+    fn test_foreign_vault_path_requires_vault_row_from_other_host() {
+        let db = Database::open_memory().unwrap();
+        let mut fm = make_fm("sess-mac", None);
+        fm.host = Some("macbook".to_string());
+        db.insert_session_from_vault(&fm, "body", "raw/.sessions/mac.md")
+            .unwrap();
+
+        assert_eq!(
+            db.foreign_vault_path("sess-mac", "pod").unwrap().as_deref(),
+            Some("raw/.sessions/mac.md")
+        );
+        assert_eq!(db.foreign_vault_path("sess-mac", "macbook").unwrap(), None);
+        assert_eq!(db.foreign_vault_path("missing", "pod").unwrap(), None);
+    }
+
+    #[test]
+    fn test_record_ingested_source_takes_the_row_from_vault_refresh() {
+        let db = Database::open_memory().unwrap();
+        let mut fm = make_fm("sess-mac", None);
+        fm.host = Some("macbook".to_string());
+        db.insert_session_from_vault(&fm, "body", "raw/.sessions/mac.md")
+            .unwrap();
+
+        // The session's source file turned up on this host, e.g. after a
+        // hostname change, and ingest skipped it as unchanged.
+        db.record_ingested_source("sess-mac", 1234, 99).unwrap();
+
+        assert_eq!(db.get_source_meta("sess-mac").unwrap(), Some((1234, 99)));
+        assert_eq!(db.foreign_vault_path("sess-mac", "pod").unwrap(), None);
     }
 }

@@ -558,7 +558,7 @@ fn compile_classification_rules(config: &Config) -> Result<Vec<CompiledRule>> {
 }
 
 /// 소스 파일의 `(size, mtime_secs)` 스냅샷. stat 실패 시 `None` (#13).
-fn source_file_meta(path: &Path) -> Option<(i64, i64)> {
+pub(crate) fn source_file_meta(path: &Path) -> Option<(i64, i64)> {
     let m = std::fs::metadata(path).ok()?;
     let mtime = m
         .modified()
@@ -763,10 +763,11 @@ fn ingest_path(
             // sidechain), so recording this file's meta under it would corrupt the
             // parent's change detection (#1607). A same-identity skip (min_turns /
             // noise) is Complete and still advances (its UPDATE is a 0-row no-op
-            // when there's no session row).
+            // when there's no session row). Recording it also takes a row first
+            // built from vault Markdown away from `secall sync`'s refresh.
             if matches!(outcome, SessionOutcome::Complete) {
                 if let Some((size, mtime)) = file_meta {
-                    if let Err(e) = db.set_source_meta(&sid, size, mtime) {
+                    if let Err(e) = db.record_ingested_source(&sid, size, mtime) {
                         tracing::warn!(session = %sid, "failed to record source meta: {}", e);
                     }
                 }
