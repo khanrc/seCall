@@ -5,6 +5,13 @@
 //! rename. Search processes hold an [`AnnReader`], which memory-maps the file
 //! and maps it again when the file is replaced, so they neither copy the index
 //! into their heap nor keep serving the one they started with.
+//!
+//! Search scans the mapped vectors exhaustively instead of walking the HNSW
+//! graph. On the deployment's 861k vectors (18.7% exact duplicates, e5 query
+//! embeddings against passage embeddings) the graph found about half of the
+//! true top 10 at the default expansion and 0.82 at 1024, with some queries
+//! missing every true neighbor; the exhaustive pass is exact at ~0.1s per
+//! query with a warm page cache.
 
 #[cfg(not(target_os = "windows"))]
 mod inner {
@@ -204,8 +211,9 @@ mod inner {
             };
         }
 
-        /// The `limit` nearest keys with their distances, or `None` when no
-        /// index is mapped or it lacks `newest`, the highest stored vector id.
+        /// The `limit` nearest keys with their distances, found by an exhaustive
+        /// scan of the mapped vectors, or `None` when no index is mapped or it
+        /// lacks `newest`, the highest stored vector id.
         ///
         /// Vector ids only grow, so an index holding the newest vector holds
         /// every vector that existed when it was synced. Keys of vectors deleted
@@ -228,7 +236,9 @@ mod inner {
                 );
                 return Ok(None);
             }
-            let found = index.search(query, limit).map_err(|e| anyhow!("{e}"))?;
+            let found = index
+                .exact_search(query, limit)
+                .map_err(|e| anyhow!("{e}"))?;
             Ok(Some(found.keys.into_iter().zip(found.distances).collect()))
         }
     }
@@ -528,6 +538,63 @@ mod inner {
             sync_ann(&db, "m", DIM, &path).unwrap();
             let hits = reader.search(&[0.0, 1.0, 0.0], 1, new_id).unwrap().unwrap();
             assert_eq!(hits[0].0, new_id);
+        }
+
+        #[test]
+        fn reader_returns_the_true_nearest_neighbors() {
+            // Random 64-dimensional vectors: an HNSW walk at the default
+            // expansion misses some of their true neighbors.
+            const D: usize = 64;
+            let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            };
+            let mut random_vector = || (0..D).map(|_| next()).collect::<Vec<f32>>();
+            let vectors: Vec<Vec<f32>> = (0..10_000).map(|_| random_vector()).collect();
+            let db = Database::open_memory().unwrap();
+            db.init_vector_table().unwrap();
+            let ids: Vec<u64> = vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    db.insert_vector(v, &format!("s{i}"), 0, 0, "m")
+                        .unwrap()
+                        .unwrap() as u64
+                })
+                .collect();
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("ann.usearch");
+            sync_ann(&db, "m", D, &path).unwrap();
+            let reader = AnnReader::open(&path, D);
+
+            let cosine = |a: &[f32], b: &[f32]| {
+                let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+                let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                dot / (norm(a) * norm(b))
+            };
+            for _ in 0..20 {
+                let query = random_vector();
+                let mut ranked: Vec<(f32, u64)> = vectors
+                    .iter()
+                    .zip(&ids)
+                    .map(|(v, &id)| (cosine(&query, v), id))
+                    .collect();
+                ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+                let mut expected: Vec<u64> = ranked[..10].iter().map(|&(_, id)| id).collect();
+                let mut found: Vec<u64> = reader
+                    .search(&query, 10, *ids.last().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .iter()
+                    .map(|&(key, _)| key)
+                    .collect();
+                expected.sort_unstable();
+                found.sort_unstable();
+                assert_eq!(found, expected);
+            }
         }
 
         #[test]
