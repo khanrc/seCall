@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::{anyhow, Result};
 
 #[cfg(not(target_os = "windows"))]
-use super::ann::AnnIndex;
+use super::ann::{ann_path, AnnReader};
 use super::bm25::{IndexStats, SearchFilters, SearchResult, SessionMeta};
 use super::chunker::chunk_session;
 use super::embedding::{Embedder, OllamaEmbedder, OpenAIEmbedder, OrtEmbedder};
@@ -41,9 +41,11 @@ pub struct VectorRow {
 
 pub struct VectorIndexer {
     embedder: Box<dyn Embedder>,
-    /// HNSW ANN 인덱스. None이면 기존 BLOB 선형 스캔으로 fallback.
+    /// Read-only HNSW index for search. None (and any search the index cannot
+    /// serve) falls back to the BLOB linear scan. Indexers that write vectors
+    /// never carry one; `secall embed` syncs the index file after its pass.
     #[cfg(not(target_os = "windows"))]
-    ann_index: Option<AnnIndex>,
+    ann_reader: Option<AnnReader>,
     batch_size: usize,
     /// e5-style prefixes (dragonkue). Empty for bge-m3. Applied symmetrically:
     /// passage_prefix on indexed chunks, query_prefix on search queries.
@@ -61,7 +63,7 @@ impl VectorIndexer {
         VectorIndexer {
             embedder,
             #[cfg(not(target_os = "windows"))]
-            ann_index: None,
+            ann_reader: None,
             batch_size: 32,
             query_prefix: String::new(),
             passage_prefix: String::new(),
@@ -89,12 +91,6 @@ impl VectorIndexer {
         self
     }
 
-    #[cfg(not(target_os = "windows"))]
-    pub fn with_ann(mut self, ann_index: AnnIndex) -> Self {
-        self.ann_index = Some(ann_index);
-        self
-    }
-
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size.max(1);
         self
@@ -107,13 +103,9 @@ impl VectorIndexer {
         self.embedder.model_name()
     }
 
-    /// ANN 인덱스를 파일에 저장. 존재하지 않으면 no-op.
-    pub fn save_ann_if_present(&self) -> Result<()> {
-        #[cfg(not(target_os = "windows"))]
-        if let Some(ref ann) = self.ann_index {
-            ann.save()?;
-        }
-        Ok(())
+    /// The embedding dimension, or 0 when the backend cannot tell.
+    pub fn dimensions(&self) -> usize {
+        self.embedder.dimensions()
     }
 
     /// Index a session's vectors, turn-incrementally.
@@ -273,9 +265,7 @@ impl VectorIndexer {
 
         let mut chunks_embedded = 0usize;
         for batch in embedded.chunks(COMMIT_BATCH_CHUNKS) {
-            // rowids go to the in-memory ANN only after the batch commits — a
-            // rolled-back insert must not leave a phantom rowid in the index.
-            let mut committed: Vec<(i64, &Vec<f32>)> = Vec::new();
+            let mut inserted = 0usize;
             // Re-check existence inside the write transaction. A concurrent
             // delete_session_full (rebuild / --force) between batches must not
             // leave later batches orphaned against a deleted session (turn_vectors
@@ -292,14 +282,17 @@ impl VectorIndexer {
                 }
                 for &(chunk, embedding) in batch {
                     // None → an identical chunk row already existed (idempotent insert).
-                    if let Some(rowid) = db.insert_vector(
-                        embedding,
-                        &chunk.session_id,
-                        chunk.turn_index,
-                        chunk.seq,
-                        self.embedder.model_name(),
-                    )? {
-                        committed.push((rowid, embedding));
+                    if db
+                        .insert_vector(
+                            embedding,
+                            &chunk.session_id,
+                            chunk.turn_index,
+                            chunk.seq,
+                            self.embedder.model_name(),
+                        )?
+                        .is_some()
+                    {
+                        inserted += 1;
                     }
                 }
                 Ok(true)
@@ -309,15 +302,7 @@ impl VectorIndexer {
             if !session_live {
                 break;
             }
-            chunks_embedded += committed.len();
-            #[cfg(not(target_os = "windows"))]
-            if let Some(ref ann) = self.ann_index {
-                for (rowid, embedding) in &committed {
-                    if let Err(e) = ann.add(*rowid as u64, embedding) {
-                        tracing::warn!(error = %e, "ANN index add failed");
-                    }
-                }
-            }
+            chunks_embedded += inserted;
         }
 
         Ok(IndexStats {
@@ -360,65 +345,10 @@ impl VectorIndexer {
         filters: &SearchFilters,
         candidate_session_ids: Option<&[String]>,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        // ANN 경로: session_ids 필터 없고 ANN 인덱스 사용 가능할 때
         #[cfg(not(target_os = "windows"))]
         if candidate_session_ids.is_none() {
-            if let Some(ref ann) = self.ann_index {
-                // Stale guard (크기 기반): ANN이 DB보다 작으면 새 벡터가 ANN에 없음 → BLOB 스캔
-                let db_count = db.count_vectors().unwrap_or(0);
-                if ann.size() < db_count {
-                    tracing::info!(
-                        ann_size = ann.size(),
-                        db_count,
-                        "ANN index stale (size < db_count), falling back to BLOB scan"
-                    );
-                    // fall through to BLOB scan
-                } else {
-                    // Stale guard (rowid 기반): ANN은 add-only라 re-embed/--all 후
-                    // 삭제된 옛 rowid가 남아 size >= db_count를 통과할 수 있음.
-                    // get_vector_meta 실패(DB에 없는 rowid)가 하나라도 나오면 stale로 판단.
-                    let ann_results = ann.search(embedding, limit)?;
-                    let mut stale_found = false;
-                    let mut results = Vec::with_capacity(ann_results.len());
-
-                    for (key, distance) in &ann_results {
-                        match db.get_vector_meta(*key as i64) {
-                            Ok((session_id, turn_index, _chunk_seq)) => {
-                                if let Ok(meta) = db.get_session_meta(&session_id) {
-                                    if passes_filters(&meta, filters) {
-                                        // P89 (#100): snippet 은 루프 후 batch 로 채움
-                                        // (Gemini PR #101: N+1 회피).
-                                        results.push(SearchResult {
-                                            session_id,
-                                            turn_index,
-                                            score: 1.0 - *distance as f64,
-                                            bm25_score: None,
-                                            vector_score: Some(1.0 - *distance as f64),
-                                            snippet: String::new(),
-                                            metadata: meta,
-                                        });
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                // rowid가 DB에 없음: re-embed/--all 후 DELETE된 row의 잔재
-                                stale_found = true;
-                            }
-                        }
-                    }
-
-                    if stale_found {
-                        tracing::info!(
-                            ann_size = ann.size(),
-                            db_count,
-                            "stale ANN entries detected (post-reembed rowids), falling back to BLOB scan"
-                        );
-                        // fall through to BLOB scan
-                    } else {
-                        fill_snippets(db, &mut results);
-                        return Ok(results);
-                    }
-                }
+            if let Some(results) = self.search_ann(db, embedding, limit, filters)? {
+                return Ok(results);
             }
         }
 
@@ -446,6 +376,74 @@ impl VectorIndexer {
         fill_snippets(db, &mut results);
         Ok(results)
     }
+
+    /// Search through the ANN index, or `None` when the index cannot serve the
+    /// query and the caller should scan the stored vectors instead.
+    #[cfg(not(target_os = "windows"))]
+    fn search_ann(
+        &self,
+        db: &Database,
+        embedding: &[f32],
+        limit: usize,
+        filters: &SearchFilters,
+    ) -> anyhow::Result<Option<Vec<SearchResult>>> {
+        let Some(reader) = self.ann_reader.as_ref() else {
+            return Ok(None);
+        };
+        // Over-fetch: keys of vectors deleted since the last `secall embed`
+        // stay in the index until its sync, and are skipped below.
+        let Some(found) = reader.search(embedding, limit.saturating_mul(2))? else {
+            return Ok(None);
+        };
+        // Vectors embedded since the last sync are not in the index yet. The
+        // sync that ends each embed run adds them; until then a scan finds them.
+        let db_count = db.count_vectors().unwrap_or(0);
+        if found.size < db_count {
+            tracing::info!(
+                ann_size = found.size,
+                db_count,
+                "ANN index behind the stored vectors, falling back to BLOB scan"
+            );
+            return Ok(None);
+        }
+
+        let mut results = Vec::with_capacity(limit);
+        for (key, distance) in found.hits {
+            if results.len() == limit {
+                break;
+            }
+            let (session_id, turn_index, _chunk_seq) = match db.get_vector_meta(key as i64) {
+                Ok(row) => row,
+                Err(e) if is_missing_row(&e) => continue,
+                Err(e) => return Err(e),
+            };
+            let Ok(meta) = db.get_session_meta(&session_id) else {
+                continue;
+            };
+            if passes_filters(&meta, filters) {
+                // P89 (#100): snippet 은 루프 후 batch 로 채움 (Gemini PR #101: N+1 회피).
+                results.push(SearchResult {
+                    session_id,
+                    turn_index,
+                    score: 1.0 - distance as f64,
+                    bm25_score: None,
+                    vector_score: Some(1.0 - distance as f64),
+                    snippet: String::new(),
+                    metadata: meta,
+                });
+            }
+        }
+        fill_snippets(db, &mut results);
+        Ok(Some(results))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_missing_row(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::QueryReturnedNoRows)
+    )
 }
 
 /// P89 (#100, Gemini PR #101): vector 결과들의 snippet 을 단일 batch 쿼리로 채운다.
@@ -524,10 +522,6 @@ fn resolve_pool_size(config: &crate::vault::config::Config) -> usize {
     }
 }
 
-/// Create a VectorIndexer for the configured backend. The e5 query/passage
-/// prefixes are bound to the ORT model (model_manager::model_prefixes) and
-/// applied only on the ORT paths — they are a property of that model, not a
-/// user setting, so a non-e5 backend (ollama/openai) never carries them.
 /// Build an `OrtEmbedder`, converting ort's dylib-load *panic* into an `Err`.
 ///
 /// ort (load-dynamic) dlopens libonnxruntime.so lazily in `lib_handle` via
@@ -571,8 +565,26 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// Falls back to Ollama if ort fails; returns None if neither is available.
+/// The indexer for search: the configured embedder plus a read-only view of
+/// its ANN index. Falls back to Ollama if ort fails; returns None if neither is
+/// available.
 pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
+    let indexer = create_embedding_indexer(config).await?;
+    #[cfg(not(target_os = "windows"))]
+    let indexer = attach_ann_reader(indexer);
+    Some(indexer)
+}
+
+/// The indexer for writing vectors (`secall embed`, ingest): the configured
+/// backend's embedder without the ANN index, which only `secall embed` updates,
+/// from the stored vectors, after its pass. Loading the index here would hold
+/// it in memory for the whole run.
+///
+/// The e5 query/passage prefixes are bound to the ORT model
+/// (model_manager::model_prefixes) and applied only on the ORT paths — they are
+/// a property of that model, not a user setting, so a non-e5 backend
+/// (ollama/openai) never carries them.
+pub async fn create_embedding_indexer(config: &Config) -> Option<VectorIndexer> {
     let indexer = match config.embedding.backend.as_str() {
         "ort" => {
             let model_dir = config
@@ -587,7 +599,7 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                 tracing::warn!("ONNX model not found, downloading");
                 if let Err(e) = mgr.download(false).await {
                     tracing::warn!(error = %e, "download failed, trying Ollama fallback");
-                    return try_ollama_fallback_with_ann(config, true).await;
+                    return try_ollama_fallback(config, true).await;
                 }
             }
 
@@ -603,7 +615,7 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "ort load failed, trying Ollama fallback");
-                    return try_ollama_fallback_with_ann(config, true).await;
+                    return try_ollama_fallback(config, true).await;
                 }
             }
         }
@@ -648,7 +660,7 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                 VectorIndexer::new(Box::new(embedder))
             } else {
                 tracing::warn!("OPENAI_API_KEY not set, trying Ollama fallback");
-                return try_ollama_fallback_with_ann(config, true).await;
+                return try_ollama_fallback(config, true).await;
             }
         }
         "ollama_cloud" => {
@@ -667,7 +679,7 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                 tracing::warn!(
                     "OLLAMA_CLOUD_API_KEY not set — set it via env to enable cloud embedding, falling back to local Ollama"
                 );
-                return try_ollama_fallback_with_ann(config, true).await;
+                return try_ollama_fallback(config, true).await;
             }
             let embedder = OllamaEmbedder::new(Some(base_url), model).with_api_key(api_key);
             if embedder.is_available().await {
@@ -675,13 +687,13 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                 VectorIndexer::new(Box::new(embedder))
             } else {
                 tracing::warn!("Ollama Cloud unreachable, falling back to local Ollama");
-                return try_ollama_fallback_with_ann(config, true).await;
+                return try_ollama_fallback(config, true).await;
             }
         }
         "ollama" => {
             // Configured local Ollama — the real backend, so it may authorize a
             // deliberate model-switch reconcile (is_fallback = false).
-            return try_ollama_fallback_with_ann(config, false).await;
+            return try_ollama_fallback(config, false).await;
         }
         "none" => {
             // Vector search explicitly disabled (BM25-only). Return no indexer so
@@ -698,20 +710,17 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
                 backend = other,
                 "unknown embedding backend — falling back to local Ollama (a model-switch wipe is never authorized through it)"
             );
-            return try_ollama_fallback_with_ann(config, true).await;
+            return try_ollama_fallback(config, true).await;
         }
     };
-
-    #[cfg(not(target_os = "windows"))]
-    let indexer = attach_ann_index(indexer);
     Some(indexer)
 }
 
-/// `create_vector_indexer` for the ingest paths, honoring their `--no-embed`.
+/// `create_embedding_indexer` for the ingest paths, honoring their `--no-embed`.
 ///
 /// Every ingest entry point (`ingest`, `ingest --auto`, `sync`'s auto-ingest)
 /// takes this shape, and skipping it is not merely wasted work: on the `ort`
-/// backend `create_vector_indexer` downloads the model *before* it attempts to
+/// backend `create_embedding_indexer` downloads the model *before* it attempts to
 /// load the runtime, so a caller that never embeds still pays the full model
 /// provision. Route every `no_embed`-aware caller through here rather than
 /// re-deriving the branch — `sync` open-coding it without the gate is what made
@@ -723,7 +732,7 @@ pub async fn create_vector_indexer_for_ingest(
     if no_embed {
         return None;
     }
-    create_vector_indexer(config).await
+    create_embedding_indexer(config).await
 }
 
 /// OpenVINO 실패 시 ORT CPU → Ollama 순으로 fallback.
@@ -743,14 +752,11 @@ async fn try_ort_cpu_fallback(config: &Config) -> Option<VectorIndexer> {
                 "ORT CPU fallback loaded, vector search enabled"
             );
             let (qp, pp) = super::model_manager::installed_prefixes(&model_dir);
-            let indexer = VectorIndexer::new(Box::new(e)).with_prefixes(qp, pp);
-            #[cfg(not(target_os = "windows"))]
-            let indexer = attach_ann_index(indexer);
-            Some(indexer)
+            Some(VectorIndexer::new(Box::new(e)).with_prefixes(qp, pp))
         }
         Err(e) => {
             tracing::warn!(error = %e, "ORT CPU fallback also failed, trying Ollama");
-            try_ollama_fallback_with_ann(config, true).await
+            try_ollama_fallback(config, true).await
         }
     }
 }
@@ -761,54 +767,31 @@ async fn try_ort_cpu_fallback(config: &Config) -> Option<VectorIndexer> {
 /// model name than the configured one, so it must be flagged so it can never
 /// authorize a destructive vector-store reconcile. It is false only when
 /// `backend = "ollama"` is the configured backend itself.
-async fn try_ollama_fallback_with_ann(config: &Config, is_fallback: bool) -> Option<VectorIndexer> {
+async fn try_ollama_fallback(config: &Config, is_fallback: bool) -> Option<VectorIndexer> {
     let base_url = config.embedding.ollama_url.as_deref();
     let model = config.embedding.ollama_model.as_deref();
     let embedder = OllamaEmbedder::new(base_url, model);
     if embedder.is_available().await {
         tracing::info!("Ollama available, vector search enabled");
         let indexer = VectorIndexer::new(Box::new(embedder));
-        let indexer = if is_fallback { indexer.as_fallback() } else { indexer };
-        #[cfg(not(target_os = "windows"))]
-        let indexer = attach_ann_index(indexer);
-        Some(indexer)
+        Some(if is_fallback { indexer.as_fallback() } else { indexer })
     } else {
         tracing::warn!("Ollama not available, vector search disabled, BM25-only mode");
         None
     }
 }
 
+/// Attach a read-only view of the model's ANN index. A missing file only means
+/// BLOB scans until `secall embed` writes one; the reader maps it then.
 #[cfg(not(target_os = "windows"))]
-/// ANN 인덱스 파일을 로드(또는 생성)하여 VectorIndexer에 붙임.
-/// 로드 실패 시 ANN 없이 반환 (graceful degradation).
-fn attach_ann_index(indexer: VectorIndexer) -> VectorIndexer {
-    let dimensions = indexer.embedder.dimensions();
+fn attach_ann_reader(mut indexer: VectorIndexer) -> VectorIndexer {
+    let dimensions = indexer.dimensions();
     if dimensions == 0 {
-        // 차원을 알 수 없으면 ANN 인덱스 생성 불가
         return indexer;
     }
-
-    let model_name = indexer.embedder.model_name().replace(['/', ':'], "_");
-    let file_name = format!("ann_{}_{}.usearch", model_name, dimensions);
-    let ann_path = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("secall")
-        .join(file_name);
-
-    match AnnIndex::open_or_create(&ann_path, dimensions) {
-        Ok(ann) => {
-            tracing::info!(
-                dimensions,
-                path = %ann_path.display(),
-                "ANN index attached to VectorIndexer"
-            );
-            indexer.with_ann(ann)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "ANN index unavailable, falling back to BLOB scan");
-            indexer
-        }
-    }
+    let path = ann_path(indexer.model_name(), dimensions);
+    indexer.ann_reader = Some(AnnReader::open(&path, dimensions));
+    indexer
 }
 
 #[cfg(test)]
@@ -935,6 +918,62 @@ mod tests {
 
         assert_eq!(stats.chunks_embedded, 0);
         assert_eq!(db.get_session_chunk_keys(&session.id).unwrap().len(), 0);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn ann_search_skips_deleted_keys_and_yields_to_newer_vectors() {
+        use crate::ingest::{AgentKind, Session, TokenUsage};
+        use crate::search::ann::sync_ann;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ann.usearch");
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+        let add = |id: &str, vector: &[f32]| {
+            let session = Session {
+                id: id.to_string(),
+                agent: AgentKind::ClaudeCode,
+                model: None,
+                project: None,
+                cwd: None,
+                git_branch: None,
+                host: None,
+                start_time: chrono::Utc::now(),
+                end_time: None,
+                turns: vec![],
+                total_tokens: TokenUsage::default(),
+                session_type: "interactive".to_string(),
+                archived: false,
+                archived_at: None,
+            };
+            db.insert_session(&session).unwrap();
+            db.insert_vector(vector, id, 0, 0, "fake").unwrap();
+        };
+        add("s0", &[1.0, 0.0, 0.0]);
+        add("s1", &[0.9, 0.1, 0.0]);
+        add("s2", &[0.0, 1.0, 0.0]);
+        sync_ann(&db, "fake", 3, &path).unwrap();
+
+        let mut indexer = VectorIndexer::new(Box::new(FakeEmbedder));
+        indexer.ann_reader = Some(AnnReader::open(&path, 3));
+        let query = [1.0, 0.0, 0.0];
+        let filters = SearchFilters::default();
+
+        // s0's key outlives its vector until the next sync: skipped, and the
+        // index still serves the query.
+        db.delete_session_vectors("s0").unwrap();
+        let results = indexer
+            .search_ann(&db, &query, 2, &filters)
+            .unwrap()
+            .expect("the index serves a query despite a deleted key");
+        let sessions: Vec<&str> = results.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(sessions, ["s1", "s2"]);
+
+        // A vector embedded after the sync is not in the index: scan instead.
+        add("s3", &[1.0, 0.0, 0.0]);
+        add("s4", &[1.0, 0.0, 0.0]);
+        assert!(indexer.search_ann(&db, &query, 2, &filters).unwrap().is_none());
     }
 
     #[test]
@@ -1122,7 +1161,7 @@ mod tests {
         config.embedding.ollama_url = Some("http://127.0.0.1:1".to_string());
 
         let result = create_vector_indexer(&config).await;
-        // api_key None → warn + try_ollama_fallback_with_ann → local unreachable → None
+        // api_key None → warn + try_ollama_fallback → local unreachable → None
         assert!(
             result.is_none(),
             "no api_key + unreachable local Ollama should return None"

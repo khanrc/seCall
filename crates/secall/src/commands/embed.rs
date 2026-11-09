@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use secall_core::{
-    ingest::Session,
+    search::vector::VectorIndexer,
     store::{get_default_db_path, Database, ReconcileOutcome},
     vault::Config,
 };
@@ -47,25 +47,6 @@ impl EmbedOutcome {
     }
 }
 
-enum WorkItem {
-    /// Default mode — pre-filter loaded the Session, embed pending chunks.
-    /// Boxed so the enum size doesn't balloon to the Session size for the
-    /// `Rebuild` variant too (clippy `large_enum_variant`).
-    Cached(Box<Session>),
-    /// `--all` mode — only sid; the worker reloads the Session after deleting
-    /// existing vectors for wholesale rebuild.
-    Rebuild(String),
-}
-
-impl WorkItem {
-    fn id(&self) -> &str {
-        match self {
-            Self::Cached(s) => &s.id,
-            Self::Rebuild(sid) => sid,
-        }
-    }
-}
-
 pub async fn run(
     all: bool,
     batch_size: Option<usize>,
@@ -76,7 +57,7 @@ pub async fn run(
     let db_path = get_default_db_path();
     let db = Database::open(&db_path)?;
 
-    let vector_indexer = secall_core::search::vector::create_vector_indexer(&config).await;
+    let vector_indexer = secall_core::search::vector::create_embedding_indexer(&config).await;
     let Some(indexer) = vector_indexer else {
         eprintln!("No embedding backend available.");
         eprintln!("  1. Download model: secall model download");
@@ -139,58 +120,82 @@ pub async fn run(
         ReconcileOutcome::Clean => {}
     }
 
+    let model = indexer.model_name().to_string();
+    let dimensions = indexer.dimensions();
     let tz = config.timezone();
     let candidate_ids: Vec<String> = db.list_all_session_ids()?;
 
     // Pre-filter pass — sessions whose chunks are all already embedded (or
     // whose every turn is chunker-skip) are dropped, so [i/N] progress reflects
-    // actual work. Loaded Session values are reused by the embed pass to avoid
-    // a second `get_session_for_embedding` round-trip.
+    // actual work. Only ids are kept: holding every pending Session until its
+    // turn in the embed pass grows with the backlog, and the worker reloads one
+    // session at a time instead.
     //
-    // `--all` skips the pre-filter and only carries sids — wholesale rebuild
-    // deletes vectors and reloads inside the worker.
-    let work_items: Vec<WorkItem> = if all {
-        candidate_ids.into_iter().map(WorkItem::Rebuild).collect()
+    // `--all` skips the pre-filter — the worker deletes each session's vectors
+    // before re-embedding it.
+    let work: Vec<String> = if all {
+        candidate_ids
     } else {
         let scan_start = Instant::now();
         let total_candidates = candidate_ids.len();
         eprintln!("Scanning {total_candidates} session(s) for pending chunks...");
-        let mut filtered: Vec<WorkItem> = Vec::new();
-        for sid in &candidate_ids {
-            let session = match db.get_session_for_embedding(sid) {
-                Ok(s) => s,
-                Err(_) => {
-                    // surface failure in the embed pass (worker reload path)
-                    filtered.push(WorkItem::Rebuild(sid.clone()));
-                    continue;
-                }
+        let mut pending: Vec<String> = Vec::new();
+        for sid in candidate_ids {
+            // A session that fails to load or check stays queued, so the embed
+            // pass reports the failure.
+            let needs_embedding = match db.get_session_for_embedding(&sid) {
+                Ok(session) => indexer
+                    .has_pending_chunks(&db, &session, tz)
+                    .unwrap_or(true),
+                Err(_) => true,
             };
-            match indexer.has_pending_chunks(&db, &session, tz) {
-                Ok(true) => filtered.push(WorkItem::Cached(Box::new(session))),
-                Ok(false) => {} // silent skip
-                Err(_) => filtered.push(WorkItem::Rebuild(sid.clone())),
+            if needs_embedding {
+                pending.push(sid);
             }
         }
         eprintln!(
             "  Scan: {} session(s) need embedding, {} skipped no-op (in {:.2}s)",
-            filtered.len(),
-            total_candidates - filtered.len(),
+            pending.len(),
+            total_candidates - pending.len(),
             scan_start.elapsed().as_secs_f64(),
         );
-        filtered
+        pending
     };
 
-    if work_items.is_empty() {
+    let outcome = if work.is_empty() {
+        drop(indexer);
         println!("All sessions already embedded.");
-        return Ok(EmbedOutcome::Ok);
-    }
+        EmbedOutcome::Ok
+    } else {
+        embed_sessions(indexer, work, &db_path, all, tz, batch_size, concurrency).await
+    };
 
-    let total = work_items.len();
+    // The pass wrote vectors without touching the ANN index, so the embedder
+    // and the index are never in memory together. A sync failure leaves search
+    // on the BLOB scan, slower but complete, so it does not fail the run.
+    #[cfg(not(target_os = "windows"))]
+    sync_ann_index(&db, &model, dimensions);
+
+    Ok(outcome)
+}
+
+/// Embed `work`'s pending chunks, `concurrency` sessions at a time. Takes the
+/// indexer by value so the embedder is released when the pass ends.
+async fn embed_sessions(
+    indexer: Arc<VectorIndexer>,
+    work: Vec<String>,
+    db_path: &std::path::Path,
+    all: bool,
+    tz: chrono_tz::Tz,
+    batch_size: usize,
+    concurrency: usize,
+) -> EmbedOutcome {
+    let total = work.len();
     eprintln!(
         "Embedding {} session(s) [batch_size={}, concurrency={}]...",
         total, batch_size, concurrency
     );
-    let db_path: Arc<PathBuf> = Arc::new(db_path);
+    let db_path: Arc<PathBuf> = Arc::new(db_path.to_path_buf());
     let counter = Arc::new(AtomicUsize::new(0));
     // AllFailed keys on embedding-level outcomes only: `embedded` counts sessions
     // that actually wrote chunks (chunks_embedded > 0), `embed_failed` counts
@@ -201,8 +206,8 @@ pub async fn run(
     let total_chunks = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
 
-    stream::iter(work_items)
-        .map(|item| {
+    stream::iter(work)
+        .map(|sid| {
             let indexer = Arc::clone(&indexer);
             let db_path = Arc::clone(&db_path);
             let counter = Arc::clone(&counter);
@@ -210,7 +215,6 @@ pub async fn run(
             let embed_failed = Arc::clone(&embed_failed);
             let total_chunks = Arc::clone(&total_chunks);
             async move {
-                let sid = item.id().to_string();
                 let short = &sid[..sid.len().min(8)];
                 let db = match Database::open(db_path.as_path()) {
                     Ok(d) => d,
@@ -220,27 +224,19 @@ pub async fn run(
                         return;
                     }
                 };
-                let session: Session = match item {
-                    WorkItem::Cached(s) => *s,
-                    WorkItem::Rebuild(sid) => {
-                        // --all (또는 pre-filter 로드 실패) — 기존 vector drop 후 reload
-                        if all {
-                            if let Err(e) = db.delete_session_vectors(&sid) {
-                                let i = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                                eprintln!(
-                                    "  [{i}/{total}] {short} — delete-before-rebuild failed: {e}"
-                                );
-                                return;
-                            }
-                        }
-                        match db.get_session_for_embedding(&sid) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                let i = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                                eprintln!("  [{i}/{total}] {short} — load failed: {e}");
-                                return;
-                            }
-                        }
+                if all {
+                    if let Err(e) = db.delete_session_vectors(&sid) {
+                        let i = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        eprintln!("  [{i}/{total}] {short} — delete-before-rebuild failed: {e}");
+                        return;
+                    }
+                }
+                let session = match db.get_session_for_embedding(&sid) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let i = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        eprintln!("  [{i}/{total}] {short} — load failed: {e}");
+                        return;
                     }
                 };
                 match indexer.index_session(&db, &session, tz).await {
@@ -285,11 +281,6 @@ pub async fn run(
         .collect::<()>()
         .await;
 
-    // 모든 세션 완료 후 ANN 인덱스 1회 저장
-    if let Err(e) = indexer.save_ann_if_present() {
-        eprintln!("Warning: ANN index save failed: {e}");
-    }
-
     let elapsed = start.elapsed();
     let mins = elapsed.as_secs() / 60;
     let secs = elapsed.as_secs() % 60;
@@ -312,10 +303,38 @@ pub async fn run(
     // failure AND zero genuine embeds. A single success, an infra-only failure
     // (db/load), or an all-no-op run does not qualify.
     if failed_n > 0 && embedded_n == 0 {
-        return Ok(EmbedOutcome::AllFailed);
+        return EmbedOutcome::AllFailed;
     }
+    EmbedOutcome::Ok
+}
 
-    Ok(EmbedOutcome::Ok)
+/// Bring the ANN index file in line with the stored vectors.
+#[cfg(not(target_os = "windows"))]
+fn sync_ann_index(db: &Database, model: &str, dimensions: usize) {
+    use secall_core::search::ann::{ann_path, sync_ann, AnnSync};
+
+    if dimensions == 0 {
+        return;
+    }
+    let start = Instant::now();
+    match sync_ann(db, model, dimensions, &ann_path(model, dimensions)) {
+        Ok(AnnSync::Unchanged { vectors }) => {
+            eprintln!("ANN index up to date ({vectors} vectors).");
+        }
+        Ok(AnnSync::Updated {
+            vectors,
+            added,
+            removed,
+        }) => eprintln!(
+            "ANN index updated: {added} added, {removed} removed, {vectors} vectors ({:.1}s).",
+            start.elapsed().as_secs_f64()
+        ),
+        Ok(AnnSync::Rebuilt { vectors }) => eprintln!(
+            "ANN index rebuilt: {vectors} vectors ({:.1}s).",
+            start.elapsed().as_secs_f64()
+        ),
+        Err(e) => eprintln!("Warning: ANN index sync failed; search uses the BLOB scan: {e}"),
+    }
 }
 
 #[cfg(test)]

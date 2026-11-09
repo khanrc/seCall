@@ -271,6 +271,83 @@ impl Database {
         Ok(count as usize)
     }
 
+    fn has_vector_table(&self) -> Result<bool> {
+        let exists: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='turn_vectors'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(exists > 0)
+    }
+
+    /// Ids of `model`'s vectors, ascending. These are the ANN index keys.
+    pub fn vector_ids(&self, model: &str) -> Result<Vec<i64>> {
+        if !self.has_vector_table()? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT id FROM turn_vectors WHERE model = ?1 ORDER BY id")?;
+        let ids = stmt
+            .query_map([model], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
+    }
+
+    /// The highest id `turn_vectors` has ever assigned. The table is
+    /// AUTOINCREMENT, so no id is reused and every key an ANN index built from
+    /// it can hold lies at or below this.
+    pub fn vector_id_ceiling(&self) -> Result<i64> {
+        if !self.has_vector_table()? {
+            return Ok(0);
+        }
+        let ceiling: i64 = self.conn().query_row(
+            "SELECT MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'turn_vectors'), 0), \
+                        COALESCE((SELECT MAX(id) FROM turn_vectors), 0))",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(ceiling)
+    }
+
+    /// `model`'s vectors with id above `after`, ascending, at most `limit` of
+    /// them. Paging by id keeps each read short instead of holding one
+    /// statement open across a whole index build.
+    pub fn vectors_after(
+        &self,
+        model: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, Vec<f32>)>> {
+        if !self.has_vector_table()? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn().prepare(
+            "SELECT id, embedding FROM turn_vectors WHERE model = ?1 AND id > ?2 \
+             ORDER BY id LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![model, after, limit as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, bytes_to_floats(&row.get::<_, Vec<u8>>(1)?)))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// One vector by id, or `None` when no such row exists.
+    pub fn vector_by_id(&self, id: i64) -> Result<Option<Vec<f32>>> {
+        let row = self.conn().query_row(
+            "SELECT embedding FROM turn_vectors WHERE id = ?1",
+            [id],
+            |row| row.get::<_, Vec<u8>>(0),
+        );
+        match row {
+            Ok(bytes) => Ok(Some(bytes_to_floats(&bytes))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Sessions with at least one turn missing a vector row.
     ///
     /// Anti-joins `turns` against `turn_vectors` on `(session_id, turn_index)`,
