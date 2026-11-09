@@ -763,10 +763,11 @@ fn ingest_path(
             // sidechain), so recording this file's meta under it would corrupt the
             // parent's change detection (#1607). A same-identity skip (min_turns /
             // noise) is Complete and still advances (its UPDATE is a 0-row no-op
-            // when there's no session row).
+            // when there's no session row). Recording it also takes a row first
+            // built from vault Markdown away from `secall sync`'s refresh.
             if matches!(outcome, SessionOutcome::Complete) {
                 if let Some((size, mtime)) = file_meta {
-                    if let Err(e) = db.set_source_meta(&sid, size, mtime) {
+                    if let Err(e) = db.record_ingested_source(&sid, size, mtime) {
                         tracing::warn!(session = %sid, "failed to record source meta: {}", e);
                     }
                 }

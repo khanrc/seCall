@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use rusqlite::OptionalExtension;
+
 use crate::error::{Result, SecallError};
 use crate::ingest::{is_injected_user_context, Session, Turn};
 use crate::search::bm25::SessionMeta;
@@ -559,20 +561,40 @@ impl Database {
         Ok(())
     }
 
-    /// Whether the session was built from another host's vault Markdown.
+    /// The vault path of a session built from another host's vault Markdown,
+    /// or `None` for any other session.
     ///
     /// That Markdown is the session's only source here, so its `source_size` /
     /// `source_mtime` snapshot tracks the Markdown. Sessions built from this
-    /// host's own Markdown are excluded: ingest also writes them from the
-    /// local source file, and its snapshot is of that file.
-    pub fn is_foreign_vault_session(&self, session_id: &str, local_host: &str) -> Result<bool> {
-        let found = self.conn().query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions
-             WHERE id = ?1 AND status = 'reindexed' AND host IS NOT NULL AND host <> ?2)",
-            rusqlite::params![session_id, local_host],
-            |r| r.get(0),
+    /// host's own Markdown are excluded, and so are rows ingest has recorded a
+    /// local source for ([`Self::record_ingested_source`]): their snapshot is
+    /// of that local file.
+    pub fn foreign_vault_path(&self, session_id: &str, local_host: &str) -> Result<Option<String>> {
+        let path = self
+            .conn()
+            .query_row(
+                "SELECT COALESCE(vault_path, '') FROM sessions
+                 WHERE id = ?1 AND status = 'reindexed' AND host IS NOT NULL AND host <> ?2",
+                rusqlite::params![session_id, local_host],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(path)
+    }
+
+    /// Record the snapshot of the local source file ingest just processed.
+    ///
+    /// A row first built from vault Markdown becomes an ingested row here, so
+    /// `secall sync` no longer refreshes it from Markdown and the two snapshots
+    /// never overwrite each other.
+    pub fn record_ingested_source(&self, session_id: &str, size: i64, mtime: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE sessions SET source_size = ?1, source_mtime = ?2,
+                 status = CASE status WHEN 'reindexed' THEN 'indexed' ELSE status END
+             WHERE id = ?3",
+            rusqlite::params![size, mtime, session_id],
         )?;
-        Ok(found)
+        Ok(())
     }
 
     /// Bring a vault-built session up to date with its changed Markdown.
@@ -597,7 +619,7 @@ impl Database {
             let stored = self.count_turns_for_session(id)?;
             let kept = self.unchanged_turn_prefix(id, turns)?;
             let refresh = if kept == stored {
-                VaultRefresh::Appended
+                VaultRefresh::TurnsKept
             } else {
                 // The kept turns are the stored turns with the lowest indices,
                 // so every stored turn after the last kept one goes.
@@ -605,7 +627,7 @@ impl Database {
                     .checked_sub(1)
                     .map_or(0, |last| i64::from(turns[last].index) + 1);
                 self.delete_turns_from(id, from_index)?;
-                VaultRefresh::Replaced
+                VaultRefresh::TurnsReplaced
             };
 
             self.conn()
@@ -1507,10 +1529,10 @@ impl Database {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VaultRefresh {
     /// No stored turn changed; turns new in the Markdown were added.
-    Appended,
+    TurnsKept,
     /// A stored turn changed; turns from the first change on were replaced
     /// and their vectors dropped.
-    Replaced,
+    TurnsReplaced,
 }
 
 // ─── REST listing types ────────────────────────────────────────────────────
@@ -1958,7 +1980,7 @@ mod tests {
             .refresh_session_from_vault(&fm, "new body", "raw/.sessions/mac.md", &turns, (10, 20))
             .unwrap();
 
-        assert_eq!(refresh, VaultRefresh::Appended);
+        assert_eq!(refresh, VaultRefresh::TurnsKept);
         assert_eq!(
             count(
                 &db,
@@ -2009,7 +2031,7 @@ mod tests {
             .refresh_session_from_vault(&fm, "new body", "raw/.sessions/mac.md", &turns, (10, 20))
             .unwrap();
 
-        assert_eq!(refresh, VaultRefresh::Replaced);
+        assert_eq!(refresh, VaultRefresh::TurnsReplaced);
         let stored: Vec<(i64, String)> = db
             .conn()
             .prepare("SELECT turn_index, content FROM turns WHERE session_id = 'sess-mac' ORDER BY turn_index")
@@ -2047,24 +2069,34 @@ mod tests {
     }
 
     #[test]
-    fn test_is_foreign_vault_session_requires_vault_row_from_other_host() {
+    fn test_foreign_vault_path_requires_vault_row_from_other_host() {
         let db = Database::open_memory().unwrap();
         let mut fm = make_fm("sess-mac", None);
         fm.host = Some("macbook".to_string());
         db.insert_session_from_vault(&fm, "body", "raw/.sessions/mac.md")
             .unwrap();
 
-        assert!(db.is_foreign_vault_session("sess-mac", "pod").unwrap());
-        assert!(!db.is_foreign_vault_session("sess-mac", "macbook").unwrap());
-        assert!(!db.is_foreign_vault_session("missing", "pod").unwrap());
+        assert_eq!(
+            db.foreign_vault_path("sess-mac", "pod").unwrap().as_deref(),
+            Some("raw/.sessions/mac.md")
+        );
+        assert_eq!(db.foreign_vault_path("sess-mac", "macbook").unwrap(), None);
+        assert_eq!(db.foreign_vault_path("missing", "pod").unwrap(), None);
+    }
 
-        // Ingested rows track their source file, even under another host name.
-        db.conn()
-            .execute(
-                "UPDATE sessions SET status = 'indexed' WHERE id = 'sess-mac'",
-                [],
-            )
+    #[test]
+    fn test_record_ingested_source_takes_the_row_from_vault_refresh() {
+        let db = Database::open_memory().unwrap();
+        let mut fm = make_fm("sess-mac", None);
+        fm.host = Some("macbook".to_string());
+        db.insert_session_from_vault(&fm, "body", "raw/.sessions/mac.md")
             .unwrap();
-        assert!(!db.is_foreign_vault_session("sess-mac", "pod").unwrap());
+
+        // The session's source file turned up on this host, e.g. after a
+        // hostname change, and ingest skipped it as unchanged.
+        db.record_ingested_source("sess-mac", 1234, 99).unwrap();
+
+        assert_eq!(db.get_source_meta("sess-mac").unwrap(), Some((1234, 99)));
+        assert_eq!(db.foreign_vault_path("sess-mac", "pod").unwrap(), None);
     }
 }
