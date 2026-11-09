@@ -80,6 +80,9 @@ struct ResponsePayload {
     call_id: Option<String>,
     #[serde(default)]
     arguments: serde_json::Value,
+    /// Free-form input of a `custom_tool_call`, such as the script an `exec` call runs.
+    #[serde(default)]
+    input: serde_json::Value,
     #[serde(default)]
     output: serde_json::Value,
 }
@@ -216,6 +219,18 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                             continue;
                         }
 
+                        // Codex emits a response's text after the tool calls that
+                        // precede it. When a call already opened this response's
+                        // assistant turn, the text belongs to that turn.
+                        if role == Role::Assistant {
+                            if let Some(last) = turns.last_mut() {
+                                if last.role == Role::Assistant && last.content.is_empty() {
+                                    last.content = content;
+                                    continue;
+                                }
+                            }
+                        }
+
                         turns.push(Turn {
                             index: turn_idx,
                             role,
@@ -228,35 +243,36 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                         });
                         turn_idx += 1;
                     }
-                    "function_call" => {
-                        let name = rp.name.unwrap_or_else(|| "unknown".to_string());
+                    // `function_call` carries JSON `arguments`; `custom_tool_call`
+                    // (`exec`, `apply_patch`) carries free-form `input`.
+                    "function_call" | "custom_tool_call" => {
+                        let input = if rp.item_type == "custom_tool_call" {
+                            rp.input
+                        } else {
+                            rp.arguments
+                        };
                         let call_id = rp.call_id.unwrap_or_default();
-                        let arguments = value_to_string(rp.arguments);
-
-                        if let Some(last) = turns.last_mut() {
-                            let action_idx = last.actions.len();
-                            last.actions.push(Action::ToolUse {
-                                name,
-                                input_summary: arguments,
-                                output_summary: String::new(),
-                                tool_use_id: Some(call_id.clone()),
-                            });
-                            if !call_id.is_empty() {
-                                pending_calls.insert(call_id, (turns.len() - 1, action_idx));
-                            }
+                        let turn_pos = assistant_turn(&mut turns, &mut turn_idx, wrapper_ts);
+                        let actions = &mut turns[turn_pos].actions;
+                        let action_idx = actions.len();
+                        actions.push(Action::ToolUse {
+                            name: rp.name.unwrap_or_else(|| "unknown".to_string()),
+                            input_summary: value_to_string(input),
+                            output_summary: String::new(),
+                            tool_use_id: Some(call_id.clone()),
+                        });
+                        if !call_id.is_empty() {
+                            pending_calls.insert(call_id, (turn_pos, action_idx));
                         }
                     }
-                    "function_call_output" => {
+                    "function_call_output" | "custom_tool_call_output" => {
                         let call_id = rp.call_id.unwrap_or_default();
-                        let output = value_to_string(rp.output);
-
                         if let Some((turn_pos, action_idx)) = pending_calls.remove(&call_id) {
-                            if let Some(turn) = turns.get_mut(turn_pos) {
-                                if let Some(Action::ToolUse { output_summary, .. }) =
-                                    turn.actions.get_mut(action_idx)
-                                {
-                                    *output_summary = output;
-                                }
+                            if let Some(Action::ToolUse { output_summary, .. }) = turns
+                                .get_mut(turn_pos)
+                                .and_then(|turn| turn.actions.get_mut(action_idx))
+                            {
+                                *output_summary = tool_output_text(rp.output);
                             }
                         }
                     }
@@ -326,6 +342,39 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
 fn rollout_filename_id(path: &Path) -> Option<uuid::Uuid> {
     let name = path.file_stem()?.to_str()?.strip_prefix("rollout-")?;
     uuid::Uuid::parse_str(name.get(name.len().checked_sub(36)?..)?).ok()
+}
+
+/// Position of the assistant turn a tool call belongs to. Codex can call a tool
+/// before any assistant text, when the last turn is still the user's; attaching
+/// the call there would credit the user with it.
+fn assistant_turn(turns: &mut Vec<Turn>, turn_idx: &mut u32, ts: Option<DateTime<Utc>>) -> usize {
+    if turns.last().map(|turn| turn.role) != Some(Role::Assistant) {
+        turns.push(Turn {
+            index: *turn_idx,
+            role: Role::Assistant,
+            timestamp: ts,
+            content: String::new(),
+            actions: Vec::new(),
+            tokens: None,
+            thinking: None,
+            is_sidechain: false,
+        });
+        *turn_idx += 1;
+    }
+    turns.len() - 1
+}
+
+/// Tool output is a string or a list of typed content parts. A part list keeps
+/// only its text parts; image parts would store base64 data.
+fn tool_output_text(output: serde_json::Value) -> String {
+    let content_parts = output
+        .as_array()
+        .is_some_and(|items| items.iter().all(|item| item.get("type").is_some()));
+    if content_parts {
+        extract_content(&output)
+    } else {
+        value_to_string(output)
+    }
 }
 
 /// Convert a serde_json::Value to String — strings pass through, others serialize to JSON.
@@ -581,5 +630,101 @@ mod tests {
             }
             _ => panic!("expected ToolUse"),
         }
+    }
+
+    #[test]
+    fn test_codex_custom_tool_call_matching() {
+        // Current Codex records its `exec` and `apply_patch` tools as
+        // custom_tool_call items with a free-form `input`, and their output as
+        // a list of content parts.
+        let f = make_codex_file(&[
+            r#"{"type":"session_meta","payload":{"id":"custom-tools"}}"#,
+            r#"{"timestamp":"2026-11-08T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"read the note"}]}}"#,
+            r#"{"timestamp":"2026-11-08T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reading it."}]}}"#,
+            r#"{"timestamp":"2026-11-08T10:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call-exec","name":"exec","input":"const r = await tools.exec_command({cmd: \"cat knowledge/notes/a.md\"});\ntext(r.output);"}}"#,
+            r##"{"timestamp":"2026-11-08T10:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-exec","output":[{"type":"input_text","text":"Script completed\nOutput:"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo"},{"type":"input_text","text":"# Note A"}]}}"##,
+            r#"{"timestamp":"2026-11-08T10:00:05Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call-patch","name":"apply_patch","input":"*** Begin Patch\n*** Add File: b.md\n+B\n*** End Patch"}}"#,
+            r#"{"timestamp":"2026-11-08T10:00:06Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-patch","output":"Success. Updated the following files:\nA b.md"}}"#,
+        ]);
+        let session = parse_codex_jsonl(f.path()).unwrap();
+        assert_eq!(session.turns.len(), 2);
+        let assistant = &session.turns[1];
+        assert_eq!(assistant.role, Role::Assistant);
+        let calls: Vec<_> = assistant
+            .actions
+            .iter()
+            .map(|action| match action {
+                Action::ToolUse {
+                    name,
+                    input_summary,
+                    output_summary,
+                    ..
+                } => (
+                    name.as_str(),
+                    input_summary.as_str(),
+                    output_summary.as_str(),
+                ),
+                _ => panic!("expected ToolUse"),
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "exec",
+                    "const r = await tools.exec_command({cmd: \"cat knowledge/notes/a.md\"});\ntext(r.output);",
+                    "Script completed\nOutput:\n# Note A",
+                ),
+                (
+                    "apply_patch",
+                    "*** Begin Patch\n*** Add File: b.md\n+B\n*** End Patch",
+                    "Success. Updated the following files:\nA b.md",
+                ),
+            ]
+        );
+        // The script is what makes the call searchable.
+        assert!(assistant
+            .index_text()
+            .contains("[Tool: exec] const r = await tools.exec_command"));
+    }
+
+    #[test]
+    fn test_codex_tool_call_before_text_opens_assistant_turn() {
+        // A response can call a tool before any assistant text. The call opens
+        // the assistant turn, and the text that follows joins it.
+        let f = make_codex_file(&[
+            r#"{"type":"session_meta","payload":{"id":"call-first"}}"#,
+            r#"{"timestamp":"2026-11-08T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"list files"}]}}"#,
+            r#"{"timestamp":"2026-11-08T10:00:02Z","type":"response_item","payload":{"type":"reasoning","summary":[]}}"#,
+            r#"{"timestamp":"2026-11-08T10:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-1","name":"exec","input":"text(await tools.exec_command({cmd: \"ls\"}))"}}"#,
+            r#"{"timestamp":"2026-11-08T10:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":[{"type":"input_text","text":"a.rs"}]}}"#,
+            r#"{"timestamp":"2026-11-08T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"One file: a.rs"}]}}"#,
+            r#"{"timestamp":"2026-11-08T10:00:06Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Anything else?"}]}}"#,
+        ]);
+        let session = parse_codex_jsonl(f.path()).unwrap();
+        let shape: Vec<_> = session
+            .turns
+            .iter()
+            .map(|turn| {
+                (
+                    turn.index,
+                    turn.role,
+                    turn.content.as_str(),
+                    turn.actions.len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, Role::User, "list files", 0),
+                (1, Role::Assistant, "One file: a.rs", 1),
+                (2, Role::Assistant, "Anything else?", 0),
+            ]
+        );
+        assert_eq!(
+            session.turns[1].timestamp.expect("timestamp").to_rfc3339(),
+            "2026-11-08T10:00:03+00:00"
+        );
     }
 }
