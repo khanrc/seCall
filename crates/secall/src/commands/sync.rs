@@ -901,12 +901,19 @@ mod tests {
     fn reindex_vault_follows_one_file_of_a_duplicated_session() {
         let f = Fixture::new();
         f.write("2026-11-09", "sess-mac", "macbook", &V1);
-        f.write("2026-11-10", "sess-mac", "macbook", &V2);
-        assert_eq!(f.reindex(), (1, 0, 0, 1));
-        let followed = f.turns("sess-mac");
+        assert_eq!(f.reindex(), (1, 0, 0, 0));
 
+        // The session rendered again under another date, with a turn more.
+        // The row keeps following its own file, and the other file's turns
+        // are not backfilled into it.
+        f.write(
+            "2026-11-10",
+            "sess-mac",
+            "macbook",
+            &[V2[0], V2[1], ("User", "thanks")],
+        );
         assert_eq!(f.reindex(), (0, 0, 0, 2));
-        assert_eq!(f.turns("sess-mac"), followed);
+        assert_eq!(f.turns("sess-mac"), ["list files", "One file: a.rs"]);
     }
 
     #[test]
