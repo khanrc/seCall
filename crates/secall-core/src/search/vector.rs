@@ -390,31 +390,29 @@ impl VectorIndexer {
         let Some(reader) = self.ann_reader.as_ref() else {
             return Ok(None);
         };
-        // Over-fetch: keys of vectors deleted since the last `secall embed`
-        // stay in the index until its sync, and are skipped below.
-        let Some(found) = reader.search(embedding, limit.saturating_mul(2))? else {
+        let Some(newest) = db.newest_vector_id()? else {
             return Ok(None);
         };
-        // Vectors embedded since the last sync are not in the index yet. The
-        // sync that ends each embed run adds them; until then a scan finds them.
-        let db_count = db.count_vectors().unwrap_or(0);
-        if found.size < db_count {
-            tracing::info!(
-                ann_size = found.size,
-                db_count,
-                "ANN index behind the stored vectors, falling back to BLOB scan"
-            );
+        // Vectors embedded since the last sync are not in the index yet: the
+        // reader declines, and the scan finds them until the sync that ends
+        // each embed run adds them. Keys of vectors deleted since the sync are
+        // still in the index; over-fetch to make up for skipping them.
+        let Some(hits) = reader.search(embedding, limit.saturating_mul(2), newest as u64)? else {
             return Ok(None);
-        }
+        };
 
         let mut results = Vec::with_capacity(limit);
-        for (key, distance) in found.hits {
+        let mut skipped = 0usize;
+        for (key, distance) in hits {
             if results.len() == limit {
                 break;
             }
             let (session_id, turn_index, _chunk_seq) = match db.get_vector_meta(key as i64) {
                 Ok(row) => row,
-                Err(e) if is_missing_row(&e) => continue,
+                Err(e) if is_missing_row(&e) => {
+                    skipped += 1;
+                    continue;
+                }
                 Err(e) => return Err(e),
             };
             let Ok(meta) = db.get_session_meta(&session_id) else {
@@ -432,6 +430,17 @@ impl VectorIndexer {
                     metadata: meta,
                 });
             }
+        }
+        // Deleted keys crowded out the live ones (a mass delete such as
+        // `embed --all`): the index cannot reach past them until the next sync.
+        if skipped > 0 && results.len() < limit {
+            tracing::info!(
+                skipped,
+                found = results.len(),
+                limit,
+                "ANN hits mostly deleted vectors, falling back to BLOB scan"
+            );
+            return Ok(None);
         }
         fill_snippets(db, &mut results);
         Ok(Some(results))
@@ -774,7 +783,11 @@ async fn try_ollama_fallback(config: &Config, is_fallback: bool) -> Option<Vecto
     if embedder.is_available().await {
         tracing::info!("Ollama available, vector search enabled");
         let indexer = VectorIndexer::new(Box::new(embedder));
-        Some(if is_fallback { indexer.as_fallback() } else { indexer })
+        Some(if is_fallback {
+            indexer.as_fallback()
+        } else {
+            indexer
+        })
     } else {
         tracing::warn!("Ollama not available, vector search disabled, BM25-only mode");
         None
@@ -922,7 +935,7 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn ann_search_skips_deleted_keys_and_yields_to_newer_vectors() {
+    fn ann_search_skips_deleted_keys_and_declines_when_behind() {
         use crate::ingest::{AgentKind, Session, TokenUsage};
         use crate::search::ann::sync_ann;
 
@@ -960,20 +973,43 @@ mod tests {
         let query = [1.0, 0.0, 0.0];
         let filters = SearchFilters::default();
 
-        // s0's key outlives its vector until the next sync: skipped, and the
-        // index still serves the query.
-        db.delete_session_vectors("s0").unwrap();
-        let results = indexer
-            .search_ann(&db, &query, 2, &filters)
-            .unwrap()
-            .expect("the index serves a query despite a deleted key");
-        let sessions: Vec<&str> = results.iter().map(|r| r.session_id.as_str()).collect();
-        assert_eq!(sessions, ["s1", "s2"]);
+        let sessions = |results: Option<Vec<SearchResult>>| -> Option<Vec<String>> {
+            results.map(|rs| rs.into_iter().map(|r| r.session_id).collect())
+        };
 
-        // A vector embedded after the sync is not in the index: scan instead.
+        // s0's key outlives its vector until the next sync: skipped, and the
+        // index still serves the query from the live hits behind it.
+        db.delete_session_vectors("s0").unwrap();
+        assert_eq!(
+            sessions(indexer.search_ann(&db, &query, 1, &filters).unwrap()),
+            Some(vec!["s1".to_string()])
+        );
+
+        // Every fetched hit deleted: the index cannot reach past them, scan.
+        db.delete_session_vectors("s1").unwrap();
+        assert_eq!(
+            indexer
+                .search_ann(&db, &query, 1, &filters)
+                .unwrap()
+                .map(|r| r.len()),
+            None
+        );
+
+        // Replacing a vector keeps the count but the new one is not indexed
+        // until the next sync: scan until then.
+        sync_ann(&db, "fake", 3, &path).unwrap();
+        db.delete_session_vectors("s2").unwrap();
         add("s3", &[1.0, 0.0, 0.0]);
-        add("s4", &[1.0, 0.0, 0.0]);
-        assert!(indexer.search_ann(&db, &query, 2, &filters).unwrap().is_none());
+        assert_eq!(db.count_vectors().unwrap(), 1);
+        assert!(indexer
+            .search_ann(&db, &query, 1, &filters)
+            .unwrap()
+            .is_none());
+        sync_ann(&db, "fake", 3, &path).unwrap();
+        assert_eq!(
+            sessions(indexer.search_ann(&db, &query, 1, &filters).unwrap()),
+            Some(vec!["s3".to_string()])
+        );
     }
 
     #[test]

@@ -294,6 +294,17 @@ impl Database {
         Ok(ids)
     }
 
+    /// The highest id among stored vectors, or `None` when there are none.
+    pub fn newest_vector_id(&self) -> Result<Option<i64>> {
+        if !self.has_vector_table()? {
+            return Ok(None);
+        }
+        let newest = self
+            .conn()
+            .query_row("SELECT MAX(id) FROM turn_vectors", [], |r| r.get(0))?;
+        Ok(newest)
+    }
+
     /// The highest id `turn_vectors` has ever assigned. The table is
     /// AUTOINCREMENT, so no id is reused and every key an ANN index built from
     /// it can hold lies at or below this.
@@ -328,7 +339,10 @@ impl Database {
         )?;
         let rows = stmt
             .query_map(rusqlite::params![model, after, limit as i64], |row| {
-                Ok((row.get::<_, i64>(0)?, bytes_to_floats(&row.get::<_, Vec<u8>>(1)?)))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    bytes_to_floats(&row.get::<_, Vec<u8>>(1)?),
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)

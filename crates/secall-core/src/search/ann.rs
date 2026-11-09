@@ -11,7 +11,7 @@ mod inner {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::RwLock;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     use anyhow::{anyhow, bail, Result};
     use usearch::{new_index, Index, IndexOptions, MetricKind, ScalarKind};
@@ -25,6 +25,8 @@ mod inner {
     /// fraction of the stored vectors. usearch's `remove` leaves the slot in
     /// memory and in the file, so only a rebuild gives the space back.
     const REBUILD_DEAD_FRACTION: f64 = 0.25;
+    /// A temporary index file this old belongs to a run that died while saving.
+    const STALE_TEMP_AGE: Duration = Duration::from_secs(3600);
 
     fn options(dimensions: usize) -> IndexOptions {
         IndexOptions {
@@ -84,6 +86,37 @@ mod inner {
         Ok(())
     }
 
+    /// Remove temporary files that runs killed mid-save left next to `path`.
+    /// Each carries its writer's pid, so no later save overwrites them.
+    fn remove_stale_temps(path: &Path) {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        else {
+            return;
+        };
+        let prefix = format!("{name}.");
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let file = entry.file_name();
+            let Some(file) = file.to_str() else {
+                continue;
+            };
+            if !file.starts_with(&prefix) || !file.ends_with(".tmp") {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_TEMP_AGE);
+            if stale {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
     /// Where the index for an embedding model lives. Keyed by model and
     /// dimensions, so a model switch starts a fresh file.
     pub fn ann_path(model_name: &str, dimensions: usize) -> PathBuf {
@@ -117,12 +150,6 @@ mod inner {
     struct Mapped {
         stamp: Option<Stamp>,
         index: Option<Index>,
-    }
-
-    /// One ANN search: the hits, and how many keys the searched index holds.
-    pub struct AnnHits {
-        pub size: usize,
-        pub hits: Vec<(u64, f32)>,
     }
 
     /// Read-only, memory-mapped ANN index for search processes.
@@ -177,18 +204,32 @@ mod inner {
             };
         }
 
-        /// The `limit` nearest keys, or `None` when no index is mapped.
-        pub fn search(&self, query: &[f32], limit: usize) -> Result<Option<AnnHits>> {
+        /// The `limit` nearest keys with their distances, or `None` when no
+        /// index is mapped or it lacks `newest`, the highest stored vector id.
+        ///
+        /// Vector ids only grow, so an index holding the newest vector holds
+        /// every vector that existed when it was synced. Keys of vectors deleted
+        /// since then are still returned; skipping them is the caller's job.
+        pub fn search(
+            &self,
+            query: &[f32],
+            limit: usize,
+            newest: u64,
+        ) -> Result<Option<Vec<(u64, f32)>>> {
             self.refresh();
             let mapped = self.mapped.read().unwrap_or_else(|e| e.into_inner());
             let Some(index) = mapped.index.as_ref() else {
                 return Ok(None);
             };
+            if !index.contains(newest) {
+                tracing::info!(
+                    newest,
+                    "ANN index predates the newest stored vector, using BLOB scan"
+                );
+                return Ok(None);
+            }
             let found = index.search(query, limit).map_err(|e| anyhow!("{e}"))?;
-            Ok(Some(AnnHits {
-                size: index.size(),
-                hits: found.keys.into_iter().zip(found.distances).collect(),
-            }))
+            Ok(Some(found.keys.into_iter().zip(found.distances).collect()))
         }
     }
 
@@ -212,6 +253,7 @@ mod inner {
     /// Patches the index in place when it is close, and rebuilds it from the
     /// stored vectors when there is no usable file or too many dead slots.
     pub fn sync_ann(db: &Database, model: &str, dimensions: usize, path: &Path) -> Result<AnnSync> {
+        remove_stale_temps(path);
         let ids = db.vector_ids(model)?;
         let existing = if path.exists() {
             match view(path, dimensions) {
@@ -448,7 +490,11 @@ mod inner {
                 AnnSync::Rebuilt { vectors: 4 }
             );
             let index = view(&path, DIM).unwrap();
-            assert_eq!(index.capacity(), index.size(), "a rebuild leaves no dead slots");
+            assert_eq!(
+                index.capacity(),
+                index.size(),
+                "a rebuild leaves no dead slots"
+            );
             assert_eq!(keys(&path, &ids), ids[4..].to_vec());
         }
 
@@ -457,23 +503,60 @@ mod inner {
             let dir = tempdir().unwrap();
             let path = dir.path().join("ann.usearch");
             let reader = AnnReader::open(&path, DIM);
-            assert!(reader.search(&[1.0, 0.0, 0.0], 1).unwrap().is_none());
+            assert!(reader.search(&[1.0, 0.0, 0.0], 1, 1).unwrap().is_none());
 
             let (db, ids) = db_with(&[[1.0, 0.0, 0.0]]);
+            let first_id = ids[0] as u64;
             sync_ann(&db, "m", DIM, &path).unwrap();
-            let first = reader.search(&[1.0, 0.0, 0.0], 1).unwrap().unwrap();
-            assert_eq!((first.size, first.hits[0].0), (1, ids[0] as u64));
+            let hits = reader
+                .search(&[1.0, 0.0, 0.0], 1, first_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(hits[0].0, first_id);
 
             let new_id = db
                 .insert_vector(&[0.0, 1.0, 0.0], "s-new", 0, 0, "m")
                 .unwrap()
-                .unwrap();
+                .unwrap() as u64;
+            assert!(
+                reader
+                    .search(&[0.0, 1.0, 0.0], 1, new_id)
+                    .unwrap()
+                    .is_none(),
+                "an index synced before the newest vector declines"
+            );
             sync_ann(&db, "m", DIM, &path).unwrap();
-            let second = reader.search(&[0.0, 1.0, 0.0], 1).unwrap().unwrap();
-            assert_eq!((second.size, second.hits[0].0), (2, new_id as u64));
+            let hits = reader.search(&[0.0, 1.0, 0.0], 1, new_id).unwrap().unwrap();
+            assert_eq!(hits[0].0, new_id);
+        }
+
+        #[test]
+        fn sync_removes_temp_files_left_by_killed_runs() {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("ann.usearch");
+            let stale = dir.path().join("ann.usearch.4242.tmp");
+            let fresh = dir.path().join("ann.usearch.4343.tmp");
+            for tmp in [&stale, &fresh] {
+                fs::write(tmp, b"partial").unwrap();
+            }
+            fs::File::options()
+                .write(true)
+                .open(&stale)
+                .unwrap()
+                .set_modified(SystemTime::now() - 2 * STALE_TEMP_AGE)
+                .unwrap();
+
+            let (db, _) = db_with(&[[1.0, 0.0, 0.0]]);
+            sync_ann(&db, "m", DIM, &path).unwrap();
+
+            assert!(!stale.exists(), "a temp file past the age limit is removed");
+            assert!(
+                fresh.exists(),
+                "a temp file another run may be writing stays"
+            );
         }
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-pub use inner::{ann_path, sync_ann, AnnHits, AnnReader, AnnSync};
+pub use inner::{ann_path, sync_ann, AnnReader, AnnSync};
