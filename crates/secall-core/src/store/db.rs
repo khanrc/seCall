@@ -1572,6 +1572,25 @@ mod tests {
     }
 
     #[test]
+    fn test_get_session_with_turns_skips_turns_without_text() {
+        let db = Database::open_memory().unwrap();
+        db.insert_session(&make_test_session("wiki")).unwrap();
+        db.insert_turn("wiki", &make_turn(0, Role::User, "list files", &[]))
+            .unwrap();
+        db.insert_turn("wiki", &make_turn(1, Role::Assistant, "", &["exec"]))
+            .unwrap();
+        db.insert_turn("wiki", &make_turn(2, Role::Assistant, "One file", &[]))
+            .unwrap();
+
+        let (_, turns) = db.get_session_with_turns("wiki").unwrap();
+        let texts: Vec<_> = turns
+            .iter()
+            .map(|turn| (turn.turn_index, turn.content.as_str()))
+            .collect();
+        assert_eq!(texts, vec![(0, "list files"), (2, "One file")]);
+    }
+
+    #[test]
     fn test_get_stats_embeddable_turns_excludes_legacy_tool_turns() {
         // Coverage denominator counts only turns index_text() renders non-empty:
         // real content, or a tool call whose actions_json was persisted. A legacy
