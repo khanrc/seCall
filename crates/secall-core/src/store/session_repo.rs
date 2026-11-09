@@ -836,9 +836,11 @@ impl Database {
             _ => SecallError::Database(e),
         })?;
 
+        // Callers read only the text and cap how many turns they take, so a turn
+        // that only carries tool calls would use up the cap with nothing to show.
         let mut stmt = self.conn().prepare(
             "SELECT turn_index, role, content FROM turns
-             WHERE session_id = ?1 ORDER BY turn_index ASC",
+             WHERE session_id = ?1 AND trim(content) <> '' ORDER BY turn_index ASC",
         )?;
         let turns = stmt
             .query_map([session_id], |row| {
