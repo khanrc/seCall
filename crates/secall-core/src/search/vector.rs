@@ -403,6 +403,7 @@ impl VectorIndexer {
 
         let mut results = Vec::with_capacity(limit);
         let mut skipped = 0usize;
+        let mut live = 0usize;
         for (key, distance) in hits {
             if results.len() == limit {
                 break;
@@ -415,6 +416,7 @@ impl VectorIndexer {
                 }
                 Err(e) => return Err(e),
             };
+            live += 1;
             let Ok(meta) = db.get_session_meta(&session_id) else {
                 continue;
             };
@@ -433,10 +435,12 @@ impl VectorIndexer {
         }
         // Deleted keys crowded out the live ones (a mass delete such as
         // `embed --all`): the index cannot reach past them until the next sync.
-        if skipped > 0 && results.len() < limit {
+        // Count live candidates, not results: hits the filters reject would
+        // also leave results short, and the scan cannot do better for them.
+        if skipped > 0 && live < limit {
             tracing::info!(
                 skipped,
-                found = results.len(),
+                live,
                 limit,
                 "ANN hits mostly deleted vectors, falling back to BLOB scan"
             );
@@ -933,36 +937,41 @@ mod tests {
         assert_eq!(db.get_session_chunk_keys(&session.id).unwrap().len(), 0);
     }
 
+    /// Stores a session with one turn vector under the "fake" model.
+    #[cfg(not(target_os = "windows"))]
+    fn add_session_vector(db: &Database, id: &str, project: Option<&str>, vector: &[f32]) {
+        use crate::ingest::{AgentKind, Session, TokenUsage};
+
+        let session = Session {
+            id: id.to_string(),
+            agent: AgentKind::ClaudeCode,
+            model: None,
+            project: project.map(str::to_string),
+            cwd: None,
+            git_branch: None,
+            host: None,
+            start_time: chrono::Utc::now(),
+            end_time: None,
+            turns: vec![],
+            total_tokens: TokenUsage::default(),
+            session_type: "interactive".to_string(),
+            archived: false,
+            archived_at: None,
+        };
+        db.insert_session(&session).unwrap();
+        db.insert_vector(vector, id, 0, 0, "fake").unwrap();
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn ann_search_skips_deleted_keys_and_declines_when_behind() {
-        use crate::ingest::{AgentKind, Session, TokenUsage};
         use crate::search::ann::sync_ann;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ann.usearch");
         let db = Database::open_memory().unwrap();
         db.init_vector_table().unwrap();
-        let add = |id: &str, vector: &[f32]| {
-            let session = Session {
-                id: id.to_string(),
-                agent: AgentKind::ClaudeCode,
-                model: None,
-                project: None,
-                cwd: None,
-                git_branch: None,
-                host: None,
-                start_time: chrono::Utc::now(),
-                end_time: None,
-                turns: vec![],
-                total_tokens: TokenUsage::default(),
-                session_type: "interactive".to_string(),
-                archived: false,
-                archived_at: None,
-            };
-            db.insert_session(&session).unwrap();
-            db.insert_vector(vector, id, 0, 0, "fake").unwrap();
-        };
+        let add = |id: &str, vector: &[f32]| add_session_vector(&db, id, None, vector);
         add("s0", &[1.0, 0.0, 0.0]);
         add("s1", &[0.9, 0.1, 0.0]);
         add("s2", &[0.0, 1.0, 0.0]);
@@ -1010,6 +1019,40 @@ mod tests {
             sessions(indexer.search_ann(&db, &query, 1, &filters).unwrap()),
             Some(vec!["s3".to_string()])
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn ann_search_keeps_filtered_results_behind_a_deleted_key() {
+        use crate::search::ann::sync_ann;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ann.usearch");
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+        // Nearest first: a deleted key, two hits the project filter rejects,
+        // then the one it keeps.
+        add_session_vector(&db, "gone", Some("p"), &[1.0, 0.0, 0.0]);
+        add_session_vector(&db, "other1", Some("q"), &[0.95, 0.05, 0.0]);
+        add_session_vector(&db, "other2", Some("q"), &[0.9, 0.1, 0.0]);
+        add_session_vector(&db, "kept", Some("p"), &[0.8, 0.2, 0.0]);
+        sync_ann(&db, "fake", 3, &path).unwrap();
+        db.delete_session_vectors("gone").unwrap();
+
+        let mut indexer = VectorIndexer::new(Box::new(FakeEmbedder));
+        indexer.ann_reader = Some(AnnReader::open(&path, 3));
+        let filters = SearchFilters {
+            project: Some("p".to_string()),
+            ..SearchFilters::default()
+        };
+        // Three live candidates cover the limit; the filter, not the deleted
+        // key, leaves one result, which the scan would not improve on.
+        let results = indexer
+            .search_ann(&db, &[1.0, 0.0, 0.0], 2, &filters)
+            .unwrap()
+            .expect("the index serves the query");
+        let sessions: Vec<_> = results.into_iter().map(|r| r.session_id).collect();
+        assert_eq!(sessions, vec!["kept".to_string()]);
     }
 
     #[test]
