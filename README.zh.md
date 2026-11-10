@@ -90,7 +90,7 @@ seCall 是一款面向 AI 代理对话的本地优先（local-first）工具。�
 ### 混合搜索
 
 - **BM25 全文搜索**: SQLite FTS5 + 韩语形态素分析（[Lindera](https://github.com/lindera/lindera) ko-dic / [Kiwi-rs](https://github.com/bab2min/kiwi) 可选）
-- **向量语义搜索**: [Ollama](https://ollama.com/) BGE-M3 嵌入（1024 维）+ **HNSW ANN 索引**（[usearch](https://github.com/unum-cloud/usearch)），实现 O(log n) 检索
+- **向量语义搜索**: [Ollama](https://ollama.com/) BGE-M3 嵌入（1024 维）+ 对 mmap 向量文件逐一比较，精确检索最近邻
 - **Reciprocal Rank Fusion (RRF)**: BM25/向量独立执行后融合（k=60）+ **强制会话多样性**（每个会话最多 2 个 turn）
 - **LLM 查询扩展**: 通过 Claude Code 进行自然语言查询扩展
 
@@ -246,7 +246,7 @@ brew install hang-in/tap/secall
 ```
 
 > **Windows 用户**: 核心功能（解析、BM25 搜索、vault、MCP）行为一致。以下功能因 MSVC 不支持而禁用:
-> - **HNSW ANN 索引** (`usearch`) — 退化为 BLOB 余弦扫描
+> - **mmap 向量文件** — 退化为 BLOB 余弦扫描
 > - **Kiwi-rs 形态素分析** — 退化为 Lindera ko-dic
 
 ### Step 2. 初始化
@@ -748,7 +748,7 @@ secall serve --port 8080 --allow-config-edit
 | 韩语 NLP | Lindera ko-dic + Kiwi-rs 形态素分析 (macOS/Linux) |
 | 平台 | macOS、Windows (x86_64)、Linux (CI) |
 | 嵌入 | Ollama BGE-M3（1024 维）/ ONNX Runtime（可选） |
-| ANN 索引 | usearch HNSW (macOS/Linux) |
+| 向量检索 | mmap 向量文件全量比较 (macOS/Linux) |
 | MCP 服务器 | rmcp (stdio + Streamable HTTP / axum) |
 | 知识库 | Obsidian 兼容 Markdown |
 | REST API | axum（支持 CORS） |

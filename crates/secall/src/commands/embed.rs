@@ -170,11 +170,12 @@ pub async fn run(
         embed_sessions(indexer, work, &db_path, all, tz, batch_size, concurrency).await
     };
 
-    // The pass wrote vectors without touching the ANN index, so the embedder
-    // and the index are never in memory together. A sync failure leaves search
-    // on the BLOB scan, slower but complete, so it does not fail the run.
+    // The pass wrote vectors without touching the vector file, so the embedder
+    // and the file are never in memory together. Until this sync, search
+    // scores the run's new vectors from the database. A sync failure leaves
+    // search on the BLOB scan, slower but complete, so it does not fail the run.
     #[cfg(not(target_os = "windows"))]
-    sync_ann_index(&db, &model, dimensions);
+    sync_vector_file(&db, &model, dimensions);
 
     Ok(outcome)
 }
@@ -308,32 +309,33 @@ async fn embed_sessions(
     EmbedOutcome::Ok
 }
 
-/// Bring the ANN index file in line with the stored vectors.
+/// Bring the vector file in line with the stored vectors.
 #[cfg(not(target_os = "windows"))]
-fn sync_ann_index(db: &Database, model: &str, dimensions: usize) {
-    use secall_core::search::ann::{ann_path, sync_ann, AnnSync};
+fn sync_vector_file(db: &Database, model: &str, dimensions: usize) {
+    use secall_core::search::vector_file::{self, vector_file_path, VectorFileSync};
 
     if dimensions == 0 {
         return;
     }
+    let path = vector_file_path(model, dimensions);
     let start = Instant::now();
-    match sync_ann(db, model, dimensions, &ann_path(model, dimensions)) {
-        Ok(AnnSync::Unchanged { vectors }) => {
-            eprintln!("ANN index up to date ({vectors} vectors).");
+    match vector_file::sync_vector_file(db, model, dimensions, &path) {
+        Ok(VectorFileSync::Unchanged { vectors }) => {
+            eprintln!("Vector file up to date ({vectors} vectors).");
         }
-        Ok(AnnSync::Updated {
+        Ok(VectorFileSync::Updated {
             vectors,
             added,
             removed,
         }) => eprintln!(
-            "ANN index updated: {added} added, {removed} removed, {vectors} vectors ({:.1}s).",
+            "Vector file updated: {added} added, {removed} removed, {vectors} vectors ({:.1}s).",
             start.elapsed().as_secs_f64()
         ),
-        Ok(AnnSync::Rebuilt { vectors }) => eprintln!(
-            "ANN index rebuilt: {vectors} vectors ({:.1}s).",
+        Ok(VectorFileSync::Rebuilt { vectors }) => eprintln!(
+            "Vector file rebuilt: {vectors} vectors ({:.1}s).",
             start.elapsed().as_secs_f64()
         ),
-        Err(e) => eprintln!("Warning: ANN index sync failed; search uses the BLOB scan: {e}"),
+        Err(e) => eprintln!("Warning: vector file sync failed; search uses the BLOB scan: {e}"),
     }
 }
 

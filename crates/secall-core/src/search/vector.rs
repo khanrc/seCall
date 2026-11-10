@@ -8,14 +8,16 @@ use std::path::Path;
 
 use anyhow::{anyhow, Result};
 
-#[cfg(not(target_os = "windows"))]
-use super::ann::{ann_path, AnnReader};
 use super::bm25::{IndexStats, SearchFilters, SearchResult, SessionMeta};
 use super::chunker::chunk_session;
 use super::embedding::{Embedder, OllamaEmbedder, OpenAIEmbedder, OrtEmbedder};
 use super::model_manager::{default_model_path, ModelManager};
+#[cfg(not(target_os = "windows"))]
+use super::vector_file::{vector_file_path, VectorFileReader};
 use crate::ingest::Session;
 use crate::store::db::Database;
+#[cfg(not(target_os = "windows"))]
+use crate::store::vector_repo::cosine_distance;
 use crate::store::{SessionRepo, VectorRepo};
 use crate::vault::config::Config;
 
@@ -41,11 +43,11 @@ pub struct VectorRow {
 
 pub struct VectorIndexer {
     embedder: Box<dyn Embedder>,
-    /// Read-only HNSW index for search. None (and any search the index cannot
+    /// Read-only vector file for search. None (and any search the file cannot
     /// serve) falls back to the BLOB linear scan. Indexers that write vectors
-    /// never carry one; `secall embed` syncs the index file after its pass.
+    /// never carry one; `secall embed` syncs the file after its pass.
     #[cfg(not(target_os = "windows"))]
-    ann_reader: Option<AnnReader>,
+    vector_file: Option<VectorFileReader>,
     batch_size: usize,
     /// e5-style prefixes (dragonkue). Empty for bge-m3. Applied symmetrically:
     /// passage_prefix on indexed chunks, query_prefix on search queries.
@@ -63,7 +65,7 @@ impl VectorIndexer {
         VectorIndexer {
             embedder,
             #[cfg(not(target_os = "windows"))]
-            ann_reader: None,
+            vector_file: None,
             batch_size: 32,
             query_prefix: String::new(),
             passage_prefix: String::new(),
@@ -320,7 +322,7 @@ impl VectorIndexer {
         candidate_session_ids: Option<&[String]>,
     ) -> Result<Vec<SearchResult>> {
         let query_embedding = self.embed_query(query).await?;
-        // ANN-aware 경로를 공통으로 사용
+        // Shares the vector-file path with callers that embed the query themselves.
         self.search_with_embedding(db, &query_embedding, limit, filters, candidate_session_ids)
     }
 
@@ -347,13 +349,14 @@ impl VectorIndexer {
     ) -> anyhow::Result<Vec<SearchResult>> {
         #[cfg(not(target_os = "windows"))]
         if candidate_session_ids.is_none() {
-            if let Some(results) = self.search_ann(db, embedding, limit, filters)? {
+            if let Some(results) = self.search_vector_file(db, embedding, limit, filters)? {
                 return Ok(results);
             }
         }
 
         // BLOB 선형 스캔 fallback
-        let rows = db.search_vectors(embedding, limit, candidate_session_ids)?;
+        let window = limit.saturating_mul(CANDIDATES_PER_RESULT);
+        let rows = db.search_vectors(embedding, window, candidate_session_ids)?;
         let mut results: Vec<SearchResult> = rows
             .into_iter()
             .filter_map(|row| {
@@ -372,83 +375,117 @@ impl VectorIndexer {
                     metadata: meta,
                 })
             })
+            .take(limit)
             .collect();
         fill_snippets(db, &mut results);
         Ok(results)
     }
 
-    /// Search through the ANN index, or `None` when the index cannot serve the
-    /// query and the caller should scan the stored vectors instead.
+    /// Search the vector file, plus the vectors stored since it was written,
+    /// or `None` when the file cannot serve the query and the caller should
+    /// scan the stored vectors instead.
     #[cfg(not(target_os = "windows"))]
-    fn search_ann(
+    fn search_vector_file(
         &self,
         db: &Database,
         embedding: &[f32],
         limit: usize,
         filters: &SearchFilters,
     ) -> anyhow::Result<Option<Vec<SearchResult>>> {
-        let Some(reader) = self.ann_reader.as_ref() else {
+        let Some(reader) = self.vector_file.as_ref() else {
             return Ok(None);
         };
-        let Some(newest) = db.newest_vector_id()? else {
+        let window = limit.saturating_mul(CANDIDATES_PER_RESULT);
+        let Some(found) = reader.search(embedding, window) else {
             return Ok(None);
         };
-        // Vectors embedded since the last sync are not in the index yet: the
-        // reader declines, and the scan finds them until the sync that ends
-        // each embed run adds them. Keys of vectors deleted since the sync are
-        // still in the index; over-fetch to make up for skipping them.
-        let Some(hits) = reader.search(embedding, limit.saturating_mul(2), newest as u64)? else {
-            return Ok(None);
-        };
+        // Vectors embedded since the last sync (an embed run in progress) are
+        // not in the file until the sync that ends the run: score them from
+        // the database.
+        let mut hits = found.hits;
+        hits.extend(nearest_stored_after(
+            db,
+            self.model_name(),
+            found.newest_key,
+            embedding,
+            window,
+        )?);
+        hits.sort_by(|a, b| a.1.total_cmp(&b.1));
+        hits.truncate(window);
+        let exhausted = hits.len() < window;
 
-        let mut results = Vec::with_capacity(limit);
-        let mut skipped = 0usize;
-        let mut live = 0usize;
-        for (key, distance) in hits {
-            if results.len() == limit {
-                break;
-            }
-            let (session_id, turn_index, _chunk_seq) = match db.get_vector_meta(key as i64) {
-                Ok(row) => row,
-                Err(e) if is_missing_row(&e) => {
-                    skipped += 1;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            live += 1;
-            let Ok(meta) = db.get_session_meta(&session_id) else {
-                continue;
-            };
-            if passes_filters(&meta, filters) {
-                // P89 (#100): snippet 은 루프 후 batch 로 채움 (Gemini PR #101: N+1 회피).
-                results.push(SearchResult {
-                    session_id,
-                    turn_index,
-                    score: 1.0 - distance as f64,
-                    bm25_score: None,
-                    vector_score: Some(1.0 - distance as f64),
-                    snippet: String::new(),
-                    metadata: meta,
-                });
-            }
-        }
-        // Deleted keys crowded out the live ones (a mass delete such as
-        // `embed --all`): the index cannot reach past them until the next sync.
-        // Count live candidates, not results: hits the filters reject would
-        // also leave results short, and the scan cannot do better for them.
-        if skipped > 0 && live < limit {
+        let resolved = resolve_hits(db, hits, limit, filters)?;
+        // Keys of vectors deleted since the last sync are still in the file and
+        // take window slots. When the results come up short, live vectors just
+        // past the window may belong in them; the scan's window holds only live
+        // vectors, so it reaches them.
+        if resolved.results.len() < limit && resolved.skipped > 0 && !exhausted {
             tracing::info!(
-                skipped,
-                live,
+                skipped = resolved.skipped,
                 limit,
-                "ANN hits mostly deleted vectors, falling back to BLOB scan"
+                "deleted vectors crowd the vector file window, falling back to BLOB scan"
             );
             return Ok(None);
         }
+        let mut results = resolved.results;
         fill_snippets(db, &mut results);
         Ok(Some(results))
     }
+}
+
+/// Candidates a vector search ranks per requested result. Results are the
+/// nearest candidates that pass the filters, so a window wider than the limit
+/// keeps sessions the filters exclude from crowding out the rest.
+const CANDIDATES_PER_RESULT: usize = 32;
+
+#[cfg(not(target_os = "windows"))]
+struct ResolvedHits {
+    results: Vec<SearchResult>,
+    /// Hits whose vector row is gone: deleted since the file was written.
+    skipped: usize,
+}
+
+/// Turn `(vector id, distance)` hits, nearest first, into at most `limit`
+/// results that pass `filters`. Snippets stay empty for the caller to fill.
+#[cfg(not(target_os = "windows"))]
+fn resolve_hits(
+    db: &Database,
+    hits: Vec<(u64, f32)>,
+    limit: usize,
+    filters: &SearchFilters,
+) -> anyhow::Result<ResolvedHits> {
+    let mut resolved = ResolvedHits {
+        results: Vec::with_capacity(limit),
+        skipped: 0,
+    };
+    for (key, distance) in hits {
+        if resolved.results.len() == limit {
+            break;
+        }
+        let (session_id, turn_index, _chunk_seq) = match db.get_vector_meta(key as i64) {
+            Ok(row) => row,
+            Err(e) if is_missing_row(&e) => {
+                resolved.skipped += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let Ok(meta) = db.get_session_meta(&session_id) else {
+            continue;
+        };
+        if passes_filters(&meta, filters) {
+            resolved.results.push(SearchResult {
+                session_id,
+                turn_index,
+                score: 1.0 - distance as f64,
+                bm25_score: None,
+                vector_score: Some(1.0 - distance as f64),
+                snippet: String::new(),
+                metadata: meta,
+            });
+        }
+    }
+    Ok(resolved)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -579,19 +616,18 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// The indexer for search: the configured embedder plus a read-only view of
-/// its ANN index. Falls back to Ollama if ort fails; returns None if neither is
+/// its vector file. Falls back to Ollama if ort fails; returns None if neither is
 /// available.
 pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
     let indexer = create_embedding_indexer(config).await?;
     #[cfg(not(target_os = "windows"))]
-    let indexer = attach_ann_reader(indexer);
+    let indexer = attach_vector_file(indexer);
     Some(indexer)
 }
 
 /// The indexer for writing vectors (`secall embed`, ingest): the configured
-/// backend's embedder without the ANN index, which only `secall embed` updates,
-/// from the stored vectors, after its pass. Loading the index here would hold
-/// it in memory for the whole run.
+/// backend's embedder without the vector file, which only `secall embed`
+/// rewrites, from the stored vectors, after its pass.
 ///
 /// The e5 query/passage prefixes are bound to the ORT model
 /// (model_manager::model_prefixes) and applied only on the ORT paths — they are
@@ -798,17 +834,47 @@ async fn try_ollama_fallback(config: &Config, is_fallback: bool) -> Option<Vecto
     }
 }
 
-/// Attach a read-only view of the model's ANN index. A missing file only means
-/// BLOB scans until `secall embed` writes one; the reader maps it then.
+/// Attach a read-only view of the model's vector file. A missing file only
+/// means BLOB scans until `secall embed` writes one; the reader maps it then.
 #[cfg(not(target_os = "windows"))]
-fn attach_ann_reader(mut indexer: VectorIndexer) -> VectorIndexer {
+fn attach_vector_file(mut indexer: VectorIndexer) -> VectorIndexer {
     let dimensions = indexer.dimensions();
     if dimensions == 0 {
         return indexer;
     }
-    let path = ann_path(indexer.model_name(), dimensions);
-    indexer.ann_reader = Some(AnnReader::open(&path, dimensions));
+    let path = vector_file_path(indexer.model_name(), dimensions);
+    indexer.vector_file = Some(VectorFileReader::open(&path, dimensions));
     indexer
+}
+
+/// The `limit` stored vectors with id above `after` nearest to `query`, as
+/// `(id, cosine distance)`, nearest first. Pages through them so a long
+/// backlog never sits in memory at once.
+#[cfg(not(target_os = "windows"))]
+fn nearest_stored_after(
+    db: &Database,
+    model: &str,
+    after: u64,
+    query: &[f32],
+    limit: usize,
+) -> Result<Vec<(u64, f32)>> {
+    const PAGE: usize = 8192;
+    let mut best: Vec<(u64, f32)> = Vec::new();
+    let mut after = i64::try_from(after)?;
+    loop {
+        let page = db.vectors_after(model, after, PAGE)?;
+        let Some(&(last, _)) = page.last() else {
+            break;
+        };
+        after = last;
+        best.extend(
+            page.iter()
+                .map(|(id, vector)| (*id as u64, cosine_distance(query, vector))),
+        );
+        best.sort_by(|a, b| a.1.total_cmp(&b.1));
+        best.truncate(limit);
+    }
+    Ok(best)
 }
 
 #[cfg(test)]
@@ -964,21 +1030,21 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn ann_search_skips_deleted_keys_and_declines_when_behind() {
-        use crate::search::ann::sync_ann;
+    fn vector_file_search_skips_deleted_keys_and_scores_newer_vectors() {
+        use crate::search::vector_file::sync_vector_file;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ann.usearch");
+        let path = dir.path().join("vectors.f32");
         let db = Database::open_memory().unwrap();
         db.init_vector_table().unwrap();
         let add = |id: &str, vector: &[f32]| add_session_vector(&db, id, None, vector);
         add("s0", &[1.0, 0.0, 0.0]);
         add("s1", &[0.9, 0.1, 0.0]);
         add("s2", &[0.0, 1.0, 0.0]);
-        sync_ann(&db, "fake", 3, &path).unwrap();
+        sync_vector_file(&db, "fake", 3, &path).unwrap();
 
         let mut indexer = VectorIndexer::new(Box::new(FakeEmbedder));
-        indexer.ann_reader = Some(AnnReader::open(&path, 3));
+        indexer.vector_file = Some(VectorFileReader::open(&path, 3));
         let query = [1.0, 0.0, 0.0];
         let filters = SearchFilters::default();
 
@@ -987,47 +1053,119 @@ mod tests {
         };
 
         // s0's key outlives its vector until the next sync: skipped, and the
-        // index still serves the query from the live hits behind it.
+        // file still serves the query from the live hits behind it.
         db.delete_session_vectors("s0").unwrap();
         assert_eq!(
-            sessions(indexer.search_ann(&db, &query, 1, &filters).unwrap()),
+            sessions(
+                indexer
+                    .search_vector_file(&db, &query, 1, &filters)
+                    .unwrap()
+            ),
             Some(vec!["s1".to_string()])
         );
 
-        // Every fetched hit deleted: the index cannot reach past them, scan.
-        db.delete_session_vectors("s1").unwrap();
-        assert_eq!(
-            indexer
-                .search_ann(&db, &query, 1, &filters)
-                .unwrap()
-                .map(|r| r.len()),
-            None
-        );
-
-        // Replacing a vector keeps the count but the new one is not indexed
-        // until the next sync: scan until then.
-        sync_ann(&db, "fake", 3, &path).unwrap();
-        db.delete_session_vectors("s2").unwrap();
+        // A vector stored after the sync is scored from the database and
+        // ranked with the file's hits.
+        sync_vector_file(&db, "fake", 3, &path).unwrap();
         add("s3", &[1.0, 0.0, 0.0]);
-        assert_eq!(db.count_vectors().unwrap(), 1);
-        assert!(indexer
-            .search_ann(&db, &query, 1, &filters)
-            .unwrap()
-            .is_none());
-        sync_ann(&db, "fake", 3, &path).unwrap();
         assert_eq!(
-            sessions(indexer.search_ann(&db, &query, 1, &filters).unwrap()),
-            Some(vec!["s3".to_string()])
+            sessions(
+                indexer
+                    .search_vector_file(&db, &query, 2, &filters)
+                    .unwrap()
+            ),
+            Some(vec!["s3".to_string(), "s1".to_string()])
+        );
+        sync_vector_file(&db, "fake", 3, &path).unwrap();
+        assert_eq!(
+            sessions(
+                indexer
+                    .search_vector_file(&db, &query, 2, &filters)
+                    .unwrap()
+            ),
+            Some(vec!["s3".to_string(), "s1".to_string()])
         );
     }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn ann_search_keeps_filtered_results_behind_a_deleted_key() {
-        use crate::search::ann::sync_ann;
+    fn vector_search_fills_the_limit_past_candidates_the_filters_exclude() {
+        use crate::search::vector_file::sync_vector_file;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ann.usearch");
+        let path = dir.path().join("vectors.f32");
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+        // Nearest first: three sessions the project filter excludes, then the
+        // two it keeps.
+        add_session_vector(&db, "q1", Some("q"), &[1.0, 0.0, 0.0]);
+        add_session_vector(&db, "q2", Some("q"), &[0.99, 0.01, 0.0]);
+        add_session_vector(&db, "q3", Some("q"), &[0.98, 0.02, 0.0]);
+        add_session_vector(&db, "p1", Some("p"), &[0.97, 0.03, 0.0]);
+        add_session_vector(&db, "p2", Some("p"), &[0.96, 0.04, 0.0]);
+        let filters = SearchFilters {
+            project: Some("p".to_string()),
+            ..SearchFilters::default()
+        };
+        let query = [1.0, 0.0, 0.0];
+        let sessions = |results: Vec<SearchResult>| -> Vec<String> {
+            results.into_iter().map(|r| r.session_id).collect()
+        };
+        let expected = vec!["p1".to_string(), "p2".to_string()];
+
+        let mut indexer = VectorIndexer::new(Box::new(FakeEmbedder));
+        let scanned = indexer
+            .search_with_embedding(&db, &query, 2, &filters, None)
+            .unwrap();
+        assert_eq!(sessions(scanned), expected);
+
+        sync_vector_file(&db, "fake", 3, &path).unwrap();
+        indexer.vector_file = Some(VectorFileReader::open(&path, 3));
+        let from_file = indexer
+            .search_vector_file(&db, &query, 2, &filters)
+            .unwrap()
+            .expect("the file serves the query");
+        assert_eq!(sessions(from_file), expected);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn vector_file_search_scans_when_deleted_keys_fill_the_window() {
+        use crate::search::vector_file::sync_vector_file;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vectors.f32");
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+        for i in 0..CANDIDATES_PER_RESULT + 1 {
+            add_session_vector(&db, &format!("gone{i}"), None, &[1.0, 0.0, 0.0]);
+        }
+        add_session_vector(&db, "kept", None, &[0.0, 1.0, 0.0]);
+        sync_vector_file(&db, "fake", 3, &path).unwrap();
+        for i in 0..CANDIDATES_PER_RESULT + 1 {
+            db.delete_session_vectors(&format!("gone{i}")).unwrap();
+        }
+
+        let mut indexer = VectorIndexer::new(Box::new(FakeEmbedder));
+        indexer.vector_file = Some(VectorFileReader::open(&path, 3));
+        let filters = SearchFilters::default();
+        assert!(indexer
+            .search_vector_file(&db, &[1.0, 0.0, 0.0], 1, &filters)
+            .unwrap()
+            .is_none());
+        let results = indexer
+            .search_with_embedding(&db, &[1.0, 0.0, 0.0], 1, &filters, None)
+            .unwrap();
+        assert_eq!(results[0].session_id, "kept");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn vector_file_search_keeps_filtered_results_behind_a_deleted_key() {
+        use crate::search::vector_file::sync_vector_file;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vectors.f32");
         let db = Database::open_memory().unwrap();
         db.init_vector_table().unwrap();
         // Nearest first: a deleted key, two hits the project filter rejects,
@@ -1036,21 +1174,21 @@ mod tests {
         add_session_vector(&db, "other1", Some("q"), &[0.95, 0.05, 0.0]);
         add_session_vector(&db, "other2", Some("q"), &[0.9, 0.1, 0.0]);
         add_session_vector(&db, "kept", Some("p"), &[0.8, 0.2, 0.0]);
-        sync_ann(&db, "fake", 3, &path).unwrap();
+        sync_vector_file(&db, "fake", 3, &path).unwrap();
         db.delete_session_vectors("gone").unwrap();
 
         let mut indexer = VectorIndexer::new(Box::new(FakeEmbedder));
-        indexer.ann_reader = Some(AnnReader::open(&path, 3));
+        indexer.vector_file = Some(VectorFileReader::open(&path, 3));
         let filters = SearchFilters {
             project: Some("p".to_string()),
             ..SearchFilters::default()
         };
-        // Three live candidates cover the limit; the filter, not the deleted
-        // key, leaves one result, which the scan would not improve on.
+        // The window holds every vector, so the deleted key displaced no live
+        // one: the file serves the single result the filter keeps.
         let results = indexer
-            .search_ann(&db, &[1.0, 0.0, 0.0], 2, &filters)
+            .search_vector_file(&db, &[1.0, 0.0, 0.0], 2, &filters)
             .unwrap()
-            .expect("the index serves the query");
+            .expect("the file serves the query");
         let sessions: Vec<_> = results.into_iter().map(|r| r.session_id).collect();
         assert_eq!(sessions, vec!["kept".to_string()]);
     }

@@ -90,7 +90,7 @@ seCallはAIエージェントの会話に特化したローカルファースト
 ### ハイブリッド検索
 
 - **BM25全文検索**: SQLite FTS5 + 韓国語形態素解析 ([Lindera](https://github.com/lindera/lindera) ko-dic / [Kiwi-rs](https://github.com/bab2min/kiwi) 選択可能)
-- **ベクトル意味検索**: [Ollama](https://ollama.com/) BGE-M3エンベディング (1024次元) + **HNSW ANNインデックス** ([usearch](https://github.com/unum-cloud/usearch)) によるO(log n)探索
+- **ベクトル意味検索**: [Ollama](https://ollama.com/) BGE-M3エンベディング (1024次元) + mmap ベクトルファイルの全件比較による厳密な近傍探索
 - **Reciprocal Rank Fusion (RRF)**: BM25/ベクトル独立実行後に結合 (k=60) + **セッション多様性の強制** (1セッションあたり最大2ターン)
 - **LLMクエリ拡張**: Claude Codeによる自然言語クエリ拡張
 
@@ -246,7 +246,7 @@ brew install hang-in/tap/secall
 ```
 
 > **Windowsユーザー**: コア機能 (パース、BM25検索、vault、MCP) は同じように動作します。以下の機能はMSVC非対応のため無効化されます:
-> - **HNSW ANNインデックス** (`usearch`) — BLOBコサインスキャンへフォールバック
+> - **mmap ベクトルファイル** — BLOBコサインスキャンへフォールバック
 > - **Kiwi-rs形態素解析** — Lindera ko-dic へフォールバック
 
 ### Step 2. 初期化
@@ -748,7 +748,7 @@ Claude Code 設定 (`~/.claude/settings.json`) に追加:
 | 韓国語 NLP | Lindera ko-dic + Kiwi-rs 形態素解析 (macOS/Linux) |
 | プラットフォーム | macOS, Windows (x86_64), Linux (CI) |
 | エンベディング | Ollama BGE-M3 (1024次元) / ONNX Runtime (オプション) |
-| ANN インデックス | usearch HNSW (macOS/Linux) |
+| ベクトル検索 | mmap ベクトルファイルの全件比較 (macOS/Linux) |
 | MCP サーバー | rmcp (stdio + Streamable HTTP / axum) |
 | ボールト | Obsidian 互換 Markdown |
 | REST API | axum (CORS 対応) |

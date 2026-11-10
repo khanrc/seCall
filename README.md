@@ -90,7 +90,7 @@ seCall은 AI 에이전트 대화를 위한 로컬 퍼스트 도구입니다. **C
 ### 하이브리드 검색
 
 - **BM25 전문 검색**: SQLite FTS5 + 한국어 형태소 분석 ([Lindera](https://github.com/lindera/lindera) ko-dic / [Kiwi-rs](https://github.com/bab2min/kiwi) 선택 가능)
-- **벡터 시맨틱 검색**: [Ollama](https://ollama.com/) BGE-M3 임베딩 (1024차원) + **HNSW ANN 인덱스** ([usearch](https://github.com/unum-cloud/usearch))로 O(log n) 탐색
+- **벡터 시맨틱 검색**: [Ollama](https://ollama.com/) BGE-M3 임베딩 (1024차원) + mmap 벡터 파일 전체 비교로 정확한 최근접 탐색
 - **Reciprocal Rank Fusion (RRF)**: BM25/벡터 독립 실행 후 결합 (k=60) + **세션 다양성 강제** (세션당 최대 2개 턴)
 - **LLM 쿼리 확장**: Claude Code를 통한 자연어 쿼리 확장
 
@@ -246,7 +246,7 @@ brew install hang-in/tap/secall
 ```
 
 > **Windows 사용자**: 핵심 기능(파싱, BM25 검색, vault, MCP)은 동일하게 동작합니다. 아래 기능은 MSVC 미지원으로 비활성화:
-> - **HNSW ANN 인덱스** (`usearch`) — BLOB 코사인 스캔 fallback
+> - **mmap 벡터 파일** — BLOB 코사인 스캔 fallback
 > - **Kiwi-rs 형태소 분석** — Lindera ko-dic fallback
 
 ### Step 2. 초기화
@@ -750,7 +750,7 @@ Claude Code 설정 (`~/.claude/settings.json`)에 추가:
 | 한국어 NLP | Lindera ko-dic + Kiwi-rs 형태소 분석 (macOS/Linux) |
 | 플랫폼 | macOS, Windows (x86_64), Linux (CI) |
 | 임베딩 | Ollama BGE-M3 (1024차원) / ONNX Runtime (선택) |
-| ANN 인덱스 | usearch HNSW (macOS/Linux) |
+| 벡터 검색 | mmap 벡터 파일 전체 비교 (macOS/Linux) |
 | MCP 서버 | rmcp (stdio + Streamable HTTP / axum) |
 | 볼트 | Obsidian 호환 Markdown |
 | REST API | axum (CORS 지원) |

@@ -143,7 +143,7 @@ pub struct OrtEmbedder {
     next_session: std::sync::atomic::AtomicUsize,
     tokenizer: Arc<tokenizers::Tokenizer>,
     dim: usize,
-    /// Model dir basename — tags stored vectors and the ANN index so they
+    /// Model dir basename — tags stored vectors and the vector file so they
     /// track the actual model (dragonkue-e5-onnx), not a hardcoded name.
     model_name: String,
 }
