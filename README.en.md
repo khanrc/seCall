@@ -722,6 +722,7 @@ Config file location:
 | `secall model download\|info\|check` | ONNX model management |
 | `secall reindex --from-vault` | Rebuild DB from vault |
 | `secall migrate summary` | Backfill summary frontmatter |
+| `secall migrate filenames [--dry-run]` | Rename session files to the whole session id and repoint the index |
 
 ## MCP Integration
 

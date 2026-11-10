@@ -407,6 +407,13 @@ enum MigrateAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Rename vault session files to carry the whole session id, and point
+    /// index rows at the renamed files
+    Filenames {
+        /// Report what would change without renaming or writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -665,6 +672,9 @@ async fn main() -> anyhow::Result<ExitCode> {
         Commands::Migrate { action } => match action {
             MigrateAction::Summary { dry_run } => {
                 commands::migrate::run_summary(dry_run)?;
+            }
+            MigrateAction::Filenames { dry_run } => {
+                commands::migrate::run_filenames(dry_run, &cli.format)?;
             }
         },
         Commands::Log {

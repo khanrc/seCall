@@ -701,6 +701,7 @@ secall serve --port 8080 --allow-config-edit
 | `secall model download\|info\|check` | ONNX モデル管理 |
 | `secall reindex --from-vault` | ボールトから DB を再構築 |
 | `secall migrate summary` | summary frontmatter の一括追加 |
+| `secall migrate filenames [--dry-run]` | セッションファイル名を session id 全体に変更し、index を更新 |
 
 ## MCP連携
 

@@ -703,6 +703,7 @@ secall serve --port 8080 --allow-config-edit
 | `secall model download\|info\|check` | ONNX 모델 관리 |
 | `secall reindex --from-vault` | 볼트에서 DB 재구축 |
 | `secall migrate summary` | summary frontmatter 일괄 추가 |
+| `secall migrate filenames [--dry-run]` | 세션 파일 이름을 전체 session id로 바꾸고 index를 맞춤 |
 
 ## MCP 연동
 

@@ -348,6 +348,18 @@ impl Database {
         }
     }
 
+    /// Point the session at another file of its own Markdown, keeping its
+    /// status. Ingest's [`SessionRepo::update_session_vault_path`] marks the
+    /// row `indexed`; a row built from another host's Markdown must stay
+    /// `reindexed`, or `secall sync` stops following that Markdown.
+    pub fn move_session_vault_path(&self, session_id: &str, vault_path: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE sessions SET vault_path = ?1 WHERE id = ?2",
+            rusqlite::params![vault_path, session_id],
+        )?;
+        Ok(())
+    }
+
     /// Return (session_id, vault_path) for all sessions
     pub fn list_session_vault_paths(&self) -> Result<Vec<(String, Option<String>)>> {
         let mut stmt = self.conn().prepare("SELECT id, vault_path FROM sessions")?;

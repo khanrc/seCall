@@ -714,10 +714,12 @@ fn ingest_path(
                         session = session_id_hint,
                         "re-ingesting changed session (incremental)"
                     );
-                } else {
+                } else if has_vault_markdown(db, &config.vault.path, session_id_hint) {
                     *skipped += 1;
                     return;
                 }
+                // Unchanged but its Markdown is gone: ingest_single_session
+                // renders it again.
             }
             Ok(false) => {}
             Err(e) => {
@@ -1290,11 +1292,18 @@ fn ingest_single_session(
                     );
                     // fall through — incremental re-index, no delete
                 }
-                ReingestAction::Skip => {
+                ReingestAction::Skip if has_vault_markdown(db, &config.vault.path, &session.id) => {
                     // No new turns on an append-only log — only mtime or the
                     // in-progress last turn changed; nothing to index now.
                     *skipped += 1;
                     return SessionOutcome::Complete;
+                }
+                ReingestAction::Skip => {
+                    // Its Markdown is gone, e.g. overwritten by a session an
+                    // earlier release gave the same file name. Render it again;
+                    // the indexes take no new turns.
+                    tracing::info!(session = &session.id, "re-rendering missing vault Markdown");
+                    // fall through — vault write, no delete
                 }
             }
         }
@@ -1406,6 +1415,19 @@ fn ingest_single_session(
     }
 
     SessionOutcome::Complete
+}
+
+/// Whether the session's vault Markdown is where its row says. A failed
+/// lookup counts as present, so a database error never re-renders sessions.
+fn has_vault_markdown(db: &Database, vault_root: &Path, session_id: &str) -> bool {
+    match db.get_session_vault_path(session_id) {
+        Ok(Some(path)) if !path.is_empty() => vault_root.join(path).is_file(),
+        Ok(_) => false,
+        Err(e) => {
+            tracing::warn!(session = session_id, error = %e, "vault path lookup failed");
+            true
+        }
+    }
 }
 
 fn collect_paths(path: Option<&str>, auto: bool, cwd: Option<&Path>) -> Result<Vec<PathBuf>> {
