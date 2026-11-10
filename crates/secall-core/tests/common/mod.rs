@@ -69,7 +69,7 @@ pub async fn make_test_env() -> TestEnv {
         make_fake_adapters(0),
     ));
 
-    // SearchEngine 은 BM25 only 로 두 — 벡터 인덱스는 ort/usearch 초기화가 무거움.
+    // SearchEngine 은 BM25 only 로 두 — 벡터 검색은 ort 초기화가 무거움.
     let tok = LinderaKoTokenizer::new().expect("tokenizer init");
     let engine = SearchEngine::new(Bm25Indexer::new(Box::new(tok)), None);
 

@@ -1,4 +1,3 @@
-pub mod ann;
 pub mod bm25;
 pub mod chunker;
 pub mod embedding;
@@ -7,6 +6,7 @@ pub mod model_manager;
 pub mod query_expand;
 pub mod tokenizer;
 pub mod vector;
+pub mod vector_file;
 
 pub use bm25::{Bm25Indexer, GraphFilter, IndexStats, SearchFilters, SearchResult, SessionMeta};
 pub use embedding::{Embedder, OllamaEmbedder, OpenAIEmbedder};

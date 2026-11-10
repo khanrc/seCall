@@ -20,8 +20,8 @@ pub enum ReconcileOutcome {
 
 pub trait VectorRepo {
     fn init_vector_table(&self) -> anyhow::Result<()>;
-    /// Insert one chunk vector. Returns `Some(rowid)` when a new row was written
-    /// (caller adds it to the ANN index), or `None` when an identical
+    /// Insert one chunk vector. Returns `Some(rowid)` when a new row was written,
+    /// or `None` when an identical
     /// `(session_id, turn_index, chunk_seq, model)` row already existed and the
     /// insert was ignored — the vector store is idempotent per chunk key, so a
     /// double embed (e.g. a manual `embed` racing the daemon pass) can't create
@@ -41,7 +41,7 @@ pub trait VectorRepo {
         session_ids: Option<&[String]>,
     ) -> crate::error::Result<Vec<VectorRow>>;
     /// rowid로 turn_vectors의 (session_id, turn_index, chunk_seq) 조회.
-    /// ANN 검색 결과를 DB 메타데이터와 연결할 때 사용.
+    /// Links vector-file search hits back to their turns.
     fn get_vector_meta(&self, rowid: i64) -> anyhow::Result<(String, u32, u32)>;
 }
 
@@ -103,8 +103,8 @@ impl VectorRepo for Database {
         // INSERT OR IGNORE against the unique (session_id, turn_index, chunk_seq,
         // model) index: a second writer that embedded the same pending chunk
         // (before the first committed) inserts nothing rather than a duplicate.
-        // `changes() == 0` means the row already existed → return None so the
-        // caller skips adding a stale last_insert_rowid to the ANN index.
+        // `changes() == 0` means the row already existed → return None rather
+        // than a stale last_insert_rowid.
         let affected = self.conn().execute(
             "INSERT OR IGNORE INTO turn_vectors(session_id, turn_index, chunk_seq, model, embedded_at, embedding)
              VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)",
@@ -255,22 +255,6 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// turn_vectors 테이블의 총 벡터 수. ANN stale 감지에 사용.
-    pub fn count_vectors(&self) -> Result<usize> {
-        let exists: i64 = self.conn().query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='turn_vectors'",
-            [],
-            |r| r.get(0),
-        )?;
-        if exists == 0 {
-            return Ok(0);
-        }
-        let count: i64 = self
-            .conn()
-            .query_row("SELECT COUNT(*) FROM turn_vectors", [], |r| r.get(0))?;
-        Ok(count as usize)
-    }
-
     fn has_vector_table(&self) -> Result<bool> {
         let exists: i64 = self.conn().query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='turn_vectors'",
@@ -280,7 +264,7 @@ impl Database {
         Ok(exists > 0)
     }
 
-    /// Ids of `model`'s vectors, ascending. These are the ANN index keys.
+    /// Ids of `model`'s vectors, ascending. These are the vector file's keys.
     pub fn vector_ids(&self, model: &str) -> Result<Vec<i64>> {
         if !self.has_vector_table()? {
             return Ok(Vec::new());
@@ -296,33 +280,6 @@ impl Database {
             .collect::<rusqlite::Result<Vec<i64>>>()?;
         ids.sort_unstable();
         Ok(ids)
-    }
-
-    /// The highest id among stored vectors, or `None` when there are none.
-    pub fn newest_vector_id(&self) -> Result<Option<i64>> {
-        if !self.has_vector_table()? {
-            return Ok(None);
-        }
-        let newest = self
-            .conn()
-            .query_row("SELECT MAX(id) FROM turn_vectors", [], |r| r.get(0))?;
-        Ok(newest)
-    }
-
-    /// The highest id `turn_vectors` has ever assigned. The table is
-    /// AUTOINCREMENT, so no id is reused and every key an ANN index built from
-    /// it can hold lies at or below this.
-    pub fn vector_id_ceiling(&self) -> Result<i64> {
-        if !self.has_vector_table()? {
-            return Ok(0);
-        }
-        let ceiling: i64 = self.conn().query_row(
-            "SELECT MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'turn_vectors'), 0), \
-                        COALESCE((SELECT MAX(id) FROM turn_vectors), 0))",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(ceiling)
     }
 
     /// `model`'s vectors with id above `after`, ascending, at most `limit` of
@@ -442,8 +399,8 @@ impl Database {
     /// side effect of a degraded fallback or a mis-typed `model_path`.
     ///
     /// `Clean` when the table is missing, empty, or already holds only
-    /// `current_model` rows. The ANN index is keyed by `model`+`dim` on disk, so
-    /// the new model opens a fresh index file; no ANN cleanup is needed here.
+    /// `current_model` rows. The vector file is keyed by `model`+`dim` on disk,
+    /// so the new model starts a fresh file; no file cleanup is needed here.
     ///
     /// Call once at each embed entrypoint before the embed loop — never on a
     /// read/search path, which must not mutate the store.
