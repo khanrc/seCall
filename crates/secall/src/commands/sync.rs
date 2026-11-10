@@ -720,6 +720,8 @@ fn sync_foreign_markdown(
         return Ok(MarkdownAction::Ignore);
     }
     let Some(current) = source_file_meta(&vault_root.join(vault_path)) else {
+        // Reading it again during a reparse would find the snapshot unchanged.
+        anyhow::ensure!(!reparse, "could not stat {vault_path}");
         return Ok(MarkdownAction::Backfill);
     };
     let stored = db.get_source_meta(&fm.session_id)?;
