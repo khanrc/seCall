@@ -714,10 +714,12 @@ fn ingest_path(
                         session = session_id_hint,
                         "re-ingesting changed session (incremental)"
                     );
-                } else {
+                } else if has_vault_markdown(db, &config.vault.path, session_id_hint) {
                     *skipped += 1;
                     return;
                 }
+                // Unchanged but its Markdown is gone: ingest_single_session
+                // renders it again.
             }
             Ok(false) => {}
             Err(e) => {

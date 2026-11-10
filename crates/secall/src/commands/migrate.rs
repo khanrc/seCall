@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -6,7 +6,7 @@ use secall_core::{
     ingest::markdown::{
         extract_summary_from_body, full_id_filename, parse_session_frontmatter, SessionFrontmatter,
     },
-    store::{get_default_db_path, Database, SessionRepo},
+    store::{get_default_db_path, Database},
     vault::Config,
 };
 use serde::Serialize;
@@ -188,15 +188,25 @@ fn migrate_filenames(db: &Database, vault_root: &Path, dry_run: bool) -> Result<
     let mut created = HashSet::new();
 
     let sessions_dir = vault_root.join(secall_core::vault::sessions_reldir());
-    // Collected before renaming: a directory walk can revisit renamed entries.
-    let files: Vec<PathBuf> = walkdir::WalkDir::new(&sessions_dir)
+    // Every file and its turn count, read before anything is renamed: a
+    // directory walk can revisit renamed entries, and a merge decides from the
+    // files as they were, so a dry run decides as a real run would.
+    let files: Vec<(PathBuf, Option<SessionFrontmatter>)> = walkdir::WalkDir::new(&sessions_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .map(walkdir::DirEntry::into_path)
         .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
+        .map(|p| {
+            let fm = read_frontmatter(&p);
+            (p, fm)
+        })
         .collect();
-    for path in files {
-        let Some(fm) = read_frontmatter(&path) else {
+    let turns: HashMap<PathBuf, Option<u32>> = files
+        .iter()
+        .map(|(p, fm)| (p.clone(), fm.as_ref().map(|fm| fm.turns.unwrap_or(0))))
+        .collect();
+    for (path, fm) in files {
+        let Some(fm) = fm else {
             report.unreadable += 1;
             continue;
         };
@@ -214,10 +224,8 @@ fn migrate_filenames(db: &Database, vault_root: &Path, dry_run: bool) -> Result<
         };
         gone.insert(rename.from.clone());
         created.insert(rename.to.clone());
-        if target.is_file() {
-            let keep_old = read_frontmatter(&target).map_or(true, |newer| {
-                fm.turns.unwrap_or(0) > newer.turns.unwrap_or(0)
-            });
+        if let Some(&newer_turns) = turns.get(&target) {
+            let keep_old = newer_turns.map_or(true, |newer| fm.turns.unwrap_or(0) > newer);
             if !dry_run {
                 if keep_old {
                     std::fs::rename(&path, &target)?;
@@ -261,7 +269,7 @@ fn migrate_filenames(db: &Database, vault_root: &Path, dry_run: bool) -> Result<
     if !dry_run {
         db.with_transaction(|| {
             for (session_id, path) in &repoint {
-                db.update_session_vault_path(session_id, path)?;
+                db.move_session_vault_path(session_id, path)?;
             }
             Ok(())
         })?;
@@ -324,6 +332,7 @@ fn insert_summary_into_frontmatter(content: &str, summary: &str) -> Result<Strin
 mod tests {
     use super::*;
     use secall_core::ingest::{AgentKind, Session, TokenUsage};
+    use secall_core::store::SessionRepo;
 
     const DAY: &str = "raw/.sessions/2026-11-01";
     // A and B are Codex sessions started within a minute: one old file name.
@@ -332,6 +341,8 @@ mod tests {
     const C: &str = "c0ffee00-1111-4111-8111-111111111111";
     const D: &str = "d00d0000-3333-4333-8333-333333333333";
     const E: &str = "e0e0e0e0-2222-4222-8222-222222222222";
+    const F: &str = "f00f0000-4444-4444-8444-444444444444";
+    const G: &str = "9a9a0000-5555-4555-8555-555555555555";
 
     fn write_md(vault: &Path, name: &str, session_id: &str, turns: u32) {
         let path = vault.join(DAY).join(name);
@@ -391,6 +402,18 @@ mod tests {
         write_md(vault, "codex_log_e0e0e0e0.md", E, 9);
         write_md(vault, &format!("codex_log_{E}.md"), E, 4);
         add_row(&db, E, &format!("codex_log_{E}.md"));
+        // G's old file sits next to a whole-id file without frontmatter.
+        write_md(vault, "codex_log_9a9a0000.md", G, 3);
+        std::fs::write(vault.join(DAY).join(format!("codex_log_{G}.md")), "torn\n").unwrap();
+        // Another host's session, followed by `secall sync`.
+        write_md(vault, "codex_log_f00f0000.md", F, 2);
+        add_row(&db, F, "codex_log_f00f0000.md");
+        db.conn()
+            .execute(
+                "UPDATE sessions SET status = 'reindexed', host = 'macbook' WHERE id = ?1",
+                [F],
+            )
+            .unwrap();
         // Already migrated, and a file that is not a session.
         write_md(vault, &format!("codex_log_{D}.md"), D, 1);
         add_row(&db, D, &format!("codex_log_{D}.md"));
@@ -401,19 +424,29 @@ mod tests {
                 from: format!("{DAY}/{from}"),
                 to: format!("{DAY}/codex_log_{id}.md"),
             };
-            assert_eq!(report.renamed, vec![rename("codex_log_019dc309.md", A)]);
-            let mut merged = report.merged.clone();
-            merged.sort_by(|a, b| a.from.cmp(&b.from));
+            let sorted = |renames: &[Rename]| {
+                let mut renames = renames.to_vec();
+                renames.sort_by(|a, b| a.from.cmp(&b.from));
+                renames
+            };
             assert_eq!(
-                merged,
+                sorted(&report.renamed),
                 vec![
+                    rename("codex_log_019dc309.md", A),
+                    rename("codex_log_f00f0000.md", F)
+                ]
+            );
+            assert_eq!(
+                sorted(&report.merged),
+                vec![
+                    rename("codex_log_9a9a0000.md", G),
                     rename("codex_log_c0ffee00.md", C),
                     rename("codex_log_e0e0e0e0.md", E)
                 ]
             );
-            assert_eq!(report.repointed, 2);
+            assert_eq!(report.repointed, 3);
             assert_eq!(report.missing, vec![B.to_string()]);
-            assert_eq!(report.unreadable, 1);
+            assert_eq!(report.unreadable, 2);
         };
 
         let planned = migrate_filenames(&db, vault, true).unwrap();
@@ -430,16 +463,24 @@ mod tests {
         assert_eq!(turns_in(vault, &format!("codex_log_{A}.md")), Some(3));
         assert_eq!(turns_in(vault, &format!("codex_log_{C}.md")), Some(5));
         assert_eq!(turns_in(vault, &format!("codex_log_{E}.md")), Some(9));
+        assert_eq!(turns_in(vault, &format!("codex_log_{G}.md")), Some(3));
         for old in [
             "codex_log_019dc309.md",
             "codex_log_c0ffee00.md",
             "codex_log_e0e0e0e0.md",
+            "codex_log_9a9a0000.md",
+            "codex_log_f00f0000.md",
         ] {
             assert!(!vault.join(DAY).join(old).exists(), "{old} is gone");
         }
-        for id in [A, C, D, E] {
+        for id in [A, C, D, E, F] {
             assert_eq!(row_path(&db, id), format!("{DAY}/codex_log_{id}.md"));
         }
+        assert_eq!(
+            db.foreign_vault_path(F, "this-host").unwrap(),
+            Some(format!("{DAY}/codex_log_{F}.md")),
+            "sync still follows the other host's session"
+        );
         assert_eq!(row_path(&db, B), format!("{DAY}/codex_log_019dc309.md"));
 
         let again = migrate_filenames(&db, vault, false).unwrap();

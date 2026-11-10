@@ -12,6 +12,7 @@ use std::{
 // characters, which earlier releases used as the file name's id.
 const A: &str = "019dc309-1a2b-7c3d-8e4f-00000000000a";
 const B: &str = "019dc309-9f00-7aaa-bbbb-00000000000b";
+const CLAUDE: &str = "5c0d1e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f";
 
 fn rollout(root: &Path, id: &str) -> PathBuf {
     let path = root.join(format!("rollout-2026-09-13T00-00-00-{id}.jsonl"));
@@ -21,6 +22,28 @@ fn rollout(root: &Path, id: &str) -> PathBuf {
     for n in 0..2 {
         records.push(json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("Evidence {id} turn {n}")}]}}));
     }
+    fs::write(
+        &path,
+        records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    path
+}
+
+/// Writes a session source for an id under a directory.
+type WriteSource = fn(&Path, &str) -> PathBuf;
+
+/// A Claude Code transcript, named after its session id as Claude Code names it.
+fn claude_transcript(root: &Path, id: &str) -> PathBuf {
+    let path = root.join(format!("{id}.jsonl"));
+    let records = [
+        json!({"type":"user","message":{"role":"user","content":"list the files"},"timestamp":"2026-09-13T00:00:00Z","sessionId":id,"cwd":"/workspace/app","gitBranch":"main","version":"1.0"}),
+        json!({"type":"assistant","message":{"role":"assistant","id":"msg_1","model":"claude-opus-4-6","content":[{"type":"text","text":"Two files."}],"usage":{"input_tokens":5,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-09-13T00:00:01Z","sessionId":id}),
+    ];
     fs::write(
         &path,
         records
@@ -108,15 +131,20 @@ fn codex_sessions_started_together_keep_separate_markdown() {
 
 #[test]
 fn ingest_restores_a_session_markdown_that_is_gone() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    let source = rollout(root, A);
-    ingest(root, &source);
-    let [(path, _)] = session_files(root).try_into().unwrap();
-    fs::remove_file(&path).unwrap();
+    // Ingest finds a Claude Code transcript's row by its file name and a
+    // Codex rollout's by parsing it; both must notice the missing file.
+    let sources: [(WriteSource, &str); 2] = [(rollout, A), (claude_transcript, CLAUDE)];
+    for (write_source, id) in sources {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = write_source(root, id);
+        ingest(root, &source);
+        let [(path, _)] = session_files(root).try_into().unwrap();
+        fs::remove_file(&path).unwrap();
 
-    // The source is unchanged, so there are no new turns to index.
-    ingest(root, &source);
-    assert_eq!(session_files(root), vec![(path, A.to_string())]);
-    assert_eq!(stored_turns(root, A), 2);
+        // The source is unchanged, so there are no new turns to index.
+        ingest(root, &source);
+        assert_eq!(session_files(root), vec![(path, id.to_string())]);
+        assert_eq!(stored_turns(root, id), 2);
+    }
 }
