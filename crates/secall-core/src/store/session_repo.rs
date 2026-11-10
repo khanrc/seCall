@@ -873,19 +873,16 @@ impl Database {
     /// User turns are read lazily per session and the scan stops at the first real
     /// one, so long transcripts after it are never loaded.
     #[allow(clippy::type_complexity)]
-    pub fn get_all_sessions_for_classify(
-        &self,
-    ) -> Result<Vec<(String, Option<String>, Option<String>, String, String)>> {
+    pub fn get_all_sessions_for_classify(&self) -> Result<Vec<ClassifyRow>> {
         let mut sessions_stmt = self
             .conn()
-            .prepare("SELECT id, cwd, project, agent FROM sessions")?;
-        let sessions: Vec<(String, Option<String>, Option<String>, String)> = sessions_stmt
+            .prepare("SELECT id, project, session_type FROM sessions")?;
+        let sessions: Vec<(String, Option<String>, String)> = sessions_stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 ))
             })?
             .filter_map(|r| r.ok())
@@ -897,7 +894,7 @@ impl Database {
              ORDER BY turn_index",
         )?;
         let mut out = Vec::with_capacity(sessions.len());
-        for (id, cwd, project, agent) in sessions {
+        for (id, project, session_type) in sessions {
             let mut first_real = String::new();
             let mut rows = user_turns.query([&id])?;
             while let Some(row) = rows.next()? {
@@ -908,7 +905,12 @@ impl Database {
                 }
             }
             drop(rows);
-            out.push((id, cwd, project, agent, first_real));
+            out.push(ClassifyRow {
+                id,
+                project,
+                session_type,
+                first_user_content: first_real,
+            });
         }
         Ok(out)
     }
@@ -1545,6 +1547,17 @@ pub enum VaultRefresh {
     /// A stored turn changed; turns from the first change on were replaced
     /// and their vectors dropped.
     TurnsReplaced,
+}
+
+/// A session as `secall classify` sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifyRow {
+    pub id: String,
+    pub project: Option<String>,
+    /// The stored type; empty when the column is NULL.
+    pub session_type: String,
+    /// The first user turn a harness did not inject; empty when there is none.
+    pub first_user_content: String,
 }
 
 // ─── REST listing types ────────────────────────────────────────────────────

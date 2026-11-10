@@ -535,7 +535,7 @@ pub async fn ingest_sessions(
 /// 분류 규칙(`config.ingest.classification.rules`)을 한 번만 컴파일.
 ///
 /// regex 패턴 컴파일 실패 또는 `pattern`/`project` 둘 다 없는 룰은 fast-fail.
-fn compile_classification_rules(config: &Config) -> Result<Vec<CompiledRule>> {
+pub(crate) fn compile_classification_rules(config: &Config) -> Result<Vec<CompiledRule>> {
     let classification = &config.ingest.classification;
     classification
         .rules

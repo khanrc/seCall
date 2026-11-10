@@ -1,6 +1,15 @@
-use anyhow::Result;
-use secall_core::{store::get_default_db_path, store::Database, vault::Config};
+use std::path::Path;
 
+use anyhow::Result;
+use secall_core::{
+    ingest::markdown::with_frontmatter_session_type,
+    store::{get_default_db_path, Database},
+    vault::Config,
+};
+
+/// Reclassify every session with the configured rules. A session whose type
+/// changes gets it in the database and, when this host rendered it, in its
+/// vault Markdown's frontmatter, which consumers of the vault read.
 pub async fn run_backfill(dry_run: bool) -> Result<()> {
     let config = Config::load_or_default();
     let classification = &config.ingest.classification;
@@ -15,57 +24,68 @@ pub async fn run_backfill(dry_run: bool) -> Result<()> {
 
     let db_path = get_default_db_path();
     let db = Database::open(&db_path)?;
+    let compiled_rules = super::ingest::compile_classification_rules(&config)?;
+    let local_host = gethostname::gethostname().to_string_lossy().to_string();
 
-    // 전체 세션: (id, cwd, project, agent, first_user_content)
     let sessions = db.get_all_sessions_for_classify()?;
-
-    let total = sessions.len();
-    let mut updated = 0usize;
-
-    let compiled_rules: Vec<super::ingest::CompiledRule> = classification
-        .rules
-        .iter()
-        .map(|rule| {
-            if let Some(pattern) = &rule.pattern {
-                regex::Regex::new(pattern)
-                    .map(|re| super::ingest::CompiledRule::Pattern(re, rule.session_type.clone()))
-                    .map_err(|e| anyhow::anyhow!("invalid regex pattern {:?}: {}", pattern, e))
-            } else if let Some(project) = &rule.project {
-                Ok(super::ingest::CompiledRule::Project(
-                    project.clone(),
-                    rule.session_type.clone(),
-                ))
-            } else {
-                Err(anyhow::anyhow!(
-                    "classification rule missing both 'pattern' and 'project' fields"
-                ))
-            }
-        })
-        .collect::<anyhow::Result<_>>()?;
-
-    for (session_id, _cwd, project, _agent, first_content) in &sessions {
+    let mut changed = 0usize;
+    let mut rewritten = 0usize;
+    for session in &sessions {
         let new_type = super::ingest::apply_classification(
             &compiled_rules,
-            first_content,
-            project.as_deref(),
+            &session.first_user_content,
+            session.project.as_deref(),
             &classification.default,
         );
-
-        let short_id = &session_id[..8.min(session_id.len())];
-        if dry_run {
-            eprintln!("  [dry-run] {} → {}", short_id, new_type);
-        } else {
-            db.update_session_type(session_id, &new_type)?;
-            tracing::debug!(session = short_id, session_type = new_type, "classified");
+        if new_type == session.session_type {
+            continue;
         }
-        updated += 1;
+        changed += 1;
+        let short_id = &session.id[..8.min(session.id.len())];
+        if dry_run {
+            eprintln!(
+                "  [dry-run] {short_id}: {} → {new_type}",
+                session.session_type
+            );
+            continue;
+        }
+        db.update_session_type(&session.id, &new_type)?;
+        tracing::debug!(session = short_id, session_type = new_type, "classified");
+
+        // Another host's Markdown is that host's to rewrite when it reclassifies;
+        // `secall sync` reads the change from there.
+        if db.foreign_vault_path(&session.id, &local_host)?.is_some() {
+            continue;
+        }
+        let Some(vault_path) = db
+            .get_session_vault_path(&session.id)?
+            .filter(|p| !p.is_empty())
+        else {
+            continue;
+        };
+        let path = config.vault.path.join(vault_path);
+        match set_markdown_session_type(&path, &new_type) {
+            Ok(true) => rewritten += 1,
+            Ok(false) => tracing::warn!(path = %path.display(), "no session_type in frontmatter"),
+            Err(e) => tracing::warn!(path = %path.display(), error = %e, "Markdown not updated"),
+        }
     }
 
     eprintln!(
-        "Classify {}complete: {}/{} sessions processed",
+        "Classify {}complete: {changed} of {} sessions changed type, {rewritten} Markdown files updated",
         if dry_run { "(dry-run) " } else { "" },
-        updated,
-        total,
+        sessions.len(),
     );
     Ok(())
+}
+
+/// Set the frontmatter `session_type` of the Markdown at `path`; `false` when
+/// the frontmatter has none.
+fn set_markdown_session_type(path: &Path, session_type: &str) -> std::io::Result<bool> {
+    let content = std::fs::read_to_string(path)?;
+    let Some(updated) = with_frontmatter_session_type(&content, session_type) else {
+        return Ok(false);
+    };
+    std::fs::write(path, updated)?;
+    Ok(true)
 }

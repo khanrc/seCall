@@ -763,8 +763,8 @@ mod tests {
         db.insert_session(&make_test_session("sess-type")).unwrap();
         db.update_session_type("sess-type", "automated").unwrap();
         let sessions = db.get_all_sessions_for_classify().unwrap();
-        let updated = sessions.iter().find(|(id, ..)| id == "sess-type").unwrap();
-        assert_eq!(updated.0, "sess-type");
+        let updated = sessions.iter().find(|r| r.id == "sess-type").unwrap();
+        assert_eq!(updated.session_type, "automated");
     }
 
     #[test]
@@ -805,7 +805,13 @@ mod tests {
         .unwrap();
 
         let rows = db.get_all_sessions_for_classify().unwrap();
-        let first = |id: &str| rows.iter().find(|r| r.0 == id).unwrap().4.clone();
+        let first = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .first_user_content
+                .clone()
+        };
         assert_eq!(first("sess-codex"), "<today>2026-11-06</today>\n\n<digest>");
         assert_eq!(first("sess-injected-only"), "");
     }
