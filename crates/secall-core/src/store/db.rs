@@ -9,7 +9,7 @@ use crate::error::SecallError;
 use super::schema::{
     CREATE_CONFIG, CREATE_GRAPH_EDGES, CREATE_GRAPH_INDEXES, CREATE_GRAPH_NODES, CREATE_INDEXES,
     CREATE_INGEST_LOG, CREATE_JOBS, CREATE_QUERY_CACHE, CREATE_SESSIONS, CREATE_TURNS,
-    CREATE_TURNS_FTS, CREATE_WIKI_VECTORS, CURRENT_SCHEMA_VERSION,
+    CREATE_TURNS_FTS, CREATE_TURNS_FTS_ROWS, CREATE_WIKI_VECTORS, CURRENT_SCHEMA_VERSION,
 };
 
 pub struct Database {
@@ -216,6 +216,26 @@ impl Database {
             self.conn
                 .execute_batch(super::deferred_source_repo::CREATE_DEFERRED_SOURCES)?;
         }
+        if current < 15 {
+            // List the existing FTS rows, then rename the table so binaries
+            // from before v15 can't write it (see CREATE_TURNS_FTS). One pass
+            // over the FTS rows; the index itself is not rebuilt. One
+            // transaction, so an interrupted run leaves v14 as it was, and a
+            // concurrent opener finds the rename done once it gets the lock.
+            self.with_transaction(|| {
+                self.conn.execute_batch(CREATE_TURNS_FTS_ROWS)?;
+                if self.table_exists("turns_fts")? {
+                    self.conn.execute(
+                        "INSERT INTO turns_fts_rows(fts_rowid, session_id)
+                         SELECT rowid, session_id FROM turns_fts",
+                        [],
+                    )?;
+                    self.conn
+                        .execute_batch("ALTER TABLE turns_fts RENAME TO turns_fts_v2")?;
+                }
+                Ok(())
+            })?;
+        }
         if current < CURRENT_SCHEMA_VERSION {
             self.conn.execute(
                 "INSERT OR REPLACE INTO config(key, value) VALUES ('schema_version', ?1)",
@@ -272,6 +292,33 @@ impl Database {
             }
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Execute a closure as one unit, inside or outside a transaction.
+    ///
+    /// With no transaction open this is [`Self::with_transaction`]; a deferred
+    /// one could fail to become a writer. Inside one it is a savepoint, so on
+    /// Err only the closure's writes roll back.
+    pub(crate) fn with_nested_transaction<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        if self.conn.is_autocommit() {
+            return self.with_transaction(f);
+        }
+        self.conn.execute_batch("SAVEPOINT secall_unit")?;
+        match f() {
+            Ok(val) => {
+                self.conn.execute_batch("RELEASE secall_unit")?;
+                Ok(val)
+            }
+            Err(e) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO secall_unit; RELEASE secall_unit");
                 Err(e)
             }
         }
@@ -364,7 +411,6 @@ impl Database {
             .map_err(|e: std::num::ParseIntError| SecallError::Other(e.into()))
     }
 
-    #[cfg(test)]
     pub fn table_exists(&self, name: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -582,13 +628,13 @@ mod tests {
     }
 
     #[test]
-    fn test_migrate_creates_turns_fts() {
+    fn test_migrate_creates_turns_fts_v2() {
         let db = Database::open_memory().unwrap();
         // FTS tables appear as 'table' in sqlite_master
         let count: i64 = db
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name='turns_fts'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='turns_fts_v2'",
                 [],
                 |row| row.get(0),
             )
@@ -865,7 +911,7 @@ mod tests {
         let fts_count: i64 = db
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM turns_fts WHERE session_id = 'vault-001'",
+                "SELECT COUNT(*) FROM turns_fts_v2 WHERE session_id = 'vault-001'",
                 [],
                 |r| r.get(0),
             )
@@ -1009,7 +1055,7 @@ mod tests {
         let fts_count: i64 = db
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM turns_fts WHERE session_id = 'sess-fts-del'",
+                "SELECT COUNT(*) FROM turns_fts_v2 WHERE session_id = 'sess-fts-del'",
                 [],
                 |r| r.get(0),
             )
@@ -1023,7 +1069,7 @@ mod tests {
         let fts_after: i64 = db
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM turns_fts WHERE session_id = 'sess-fts-del'",
+                "SELECT COUNT(*) FROM turns_fts_v2 WHERE session_id = 'sess-fts-del'",
                 [],
                 |r| r.get(0),
             )
@@ -1032,6 +1078,153 @@ mod tests {
 
         // 세션과 turns도 삭제 확인
         assert!(!db.session_exists("sess-fts-del").unwrap());
+    }
+
+    /// `(rowid, session_id)` pairs.
+    type FtsRows = Vec<(i64, String)>;
+
+    /// Every FTS row, and every row `turns_fts_rows` lists.
+    fn fts_rows_and_listing(db: &Database) -> (FtsRows, FtsRows) {
+        let read = |sql: &str| -> FtsRows {
+            db.conn()
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        (
+            read("SELECT rowid, session_id FROM turns_fts_v2 ORDER BY rowid"),
+            read("SELECT fts_rowid, session_id FROM turns_fts_rows ORDER BY fts_rowid"),
+        )
+    }
+
+    fn sessions_of(rows: &FtsRows) -> Vec<&str> {
+        rows.iter().map(|(_, s)| s.as_str()).collect()
+    }
+
+    #[test]
+    fn test_migration_to_v15_lists_fts_rows_and_renames_the_table() {
+        use crate::store::SearchRepo;
+        let db = Database::open_memory().unwrap();
+        // A v14 index: `turns_fts` and no listing.
+        db.conn()
+            .execute_batch(
+                "DROP TABLE turns_fts_rows;
+                 ALTER TABLE turns_fts_v2 RENAME TO turns_fts;
+                 INSERT INTO turns_fts(content, session_id, turn_id) VALUES
+                     ('alpha', 'sess-a', 0), ('beta', 'sess-a', 1), ('gamma', 'sess-b', 0);
+                 UPDATE config SET value = '14' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+
+        let (fts, listed) = fts_rows_and_listing(&db);
+        assert_eq!(sessions_of(&fts), ["sess-a", "sess-a", "sess-b"]);
+        assert_eq!(listed, fts);
+        assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        // A v14 binary's FTS write now fails instead of skipping the listing.
+        assert!(db
+            .conn()
+            .execute(
+                "INSERT INTO turns_fts(content, session_id, turn_id) VALUES ('x', 'sess-c', 0)",
+                [],
+            )
+            .is_err());
+
+        db.delete_session_fts("sess-a").unwrap();
+        let (fts, listed) = fts_rows_and_listing(&db);
+        assert_eq!(sessions_of(&fts), ["sess-b"]);
+        assert_eq!(listed, fts);
+    }
+
+    #[test]
+    fn test_insert_and_delete_session_fts_keep_the_listing_in_step() {
+        use crate::store::SearchRepo;
+        let db = Database::open_memory().unwrap();
+        db.insert_fts("one", "sess-a", 0).unwrap();
+        db.insert_fts("two", "sess-b", 0).unwrap();
+        db.insert_fts("three", "sess-a", 1).unwrap();
+        // Inside an open transaction too, as ingest and refresh call it.
+        db.with_transaction(|| db.insert_fts("four", "sess-b", 1))
+            .unwrap();
+
+        let (fts, listed) = fts_rows_and_listing(&db);
+        assert_eq!(fts.len(), 4);
+        assert_eq!(listed, fts);
+
+        db.delete_session_fts("sess-b").unwrap();
+        let (fts, listed) = fts_rows_and_listing(&db);
+        assert_eq!(sessions_of(&fts), ["sess-a", "sess-a"]);
+        assert_eq!(listed, fts);
+    }
+
+    #[test]
+    fn test_delete_session_fts_finds_rows_by_rowid() {
+        // The point of turns_fts_rows: a full scan of the FTS table reads
+        // every session's content, which made refreshing thousands of
+        // sessions slow.
+        let db = Database::open_memory().unwrap();
+        let plan: Vec<String> = db
+            .conn()
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                crate::store::search_repo::DELETE_SESSION_FTS
+            ))
+            .unwrap()
+            .query_map(["sess-a"], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let fts_step = plan
+            .iter()
+            .find(|d| d.contains("turns_fts_v2 VIRTUAL TABLE"))
+            .unwrap_or_else(|| panic!("no FTS step in {plan:?}"));
+        // FTS5 marks a rowid-equality lookup with `=` in its index string.
+        assert!(
+            fts_step.ends_with(":="),
+            "full scan of the FTS table: {plan:?}"
+        );
+    }
+
+    fn config_keys(db: &Database) -> Vec<String> {
+        db.conn()
+            .prepare("SELECT key FROM config WHERE key IN ('kept', 'dropped') ORDER BY key")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_with_nested_transaction_rolls_back_only_its_own_writes() {
+        let db = Database::open_memory().unwrap();
+        let set = |key: &str| -> Result<()> {
+            db.conn()
+                .execute("INSERT INTO config(key, value) VALUES (?1, 'x')", [key])?;
+            Ok(())
+        };
+        let fail = || -> Result<()> {
+            set("dropped")?;
+            Err(SecallError::Search("boom".into()))
+        };
+
+        // On its own it is a transaction of its own.
+        assert!(db.with_nested_transaction(fail).is_err());
+        assert!(db.conn().is_autocommit());
+        assert!(config_keys(&db).is_empty());
+
+        // Inside a transaction it undoes only its own writes.
+        db.with_transaction(|| {
+            set("kept")?;
+            assert!(db.with_nested_transaction(fail).is_err());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(config_keys(&db), ["kept"]);
     }
 
     #[test]

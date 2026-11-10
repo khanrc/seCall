@@ -2,8 +2,18 @@ use crate::error::{Result, SecallError};
 use crate::search::bm25::{FtsRow, SearchFilters};
 use crate::store::db::Database;
 
+/// Deletes a session's FTS rows by the rowids `turns_fts_rows` lists for it.
+pub(crate) const DELETE_SESSION_FTS: &str = "DELETE FROM turns_fts_v2
+     WHERE rowid IN (SELECT fts_rowid FROM turns_fts_rows WHERE session_id = ?1)";
+
 pub trait SearchRepo {
+    /// Add one FTS row to `session_id`. A vault-built session's whole-body
+    /// row uses `turn_index` 0.
     fn insert_fts(&self, tokenized_content: &str, session_id: &str, turn_index: u32) -> Result<()>;
+    /// Remove every FTS row of `session_id`.
+    fn delete_session_fts(&self, session_id: &str) -> Result<()>;
+    /// Whether `session_id` has any FTS row.
+    fn has_fts_rows(&self, session_id: &str) -> Result<bool>;
     fn search_fts(
         &self,
         tokenized_query: &str,
@@ -20,12 +30,39 @@ impl SearchRepo for Database {
         session_id: &str,
         turn_index: u32,
     ) -> crate::error::Result<()> {
-        self.conn().execute(
-            // FTS5 컬럼명 turn_id는 유지 (스키마 변경 최소화). 저장값은 실제 turn_index.
-            "INSERT INTO turns_fts(content, session_id, turn_id) VALUES (?1, ?2, ?3)",
-            rusqlite::params![tokenized_content, session_id, turn_index as i64],
-        )?;
-        Ok(())
+        // An FTS row missing from turns_fts_rows could never be deleted by
+        // session, so the two inserts land together.
+        self.with_nested_transaction(|| {
+            self.conn().execute(
+                // FTS5 컬럼명 turn_id는 유지 (스키마 변경 최소화). 저장값은 실제 turn_index.
+                "INSERT INTO turns_fts_v2(content, session_id, turn_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![tokenized_content, session_id, turn_index as i64],
+            )?;
+            self.conn().execute(
+                "INSERT INTO turns_fts_rows(fts_rowid, session_id) VALUES (?1, ?2)",
+                rusqlite::params![self.conn().last_insert_rowid(), session_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn delete_session_fts(&self, session_id: &str) -> crate::error::Result<()> {
+        self.with_nested_transaction(|| {
+            self.conn().execute(DELETE_SESSION_FTS, [session_id])?;
+            self.conn().execute(
+                "DELETE FROM turns_fts_rows WHERE session_id = ?1",
+                [session_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn has_fts_rows(&self, session_id: &str) -> crate::error::Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM turns_fts_rows WHERE session_id = ?1)",
+            [session_id],
+            |r| r.get(0),
+        )?)
     }
 
     fn search_fts(
@@ -62,7 +99,7 @@ impl SearchRepo for Database {
                     .map(|i| format!("?{}", i + base_idx))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("AND turns_fts.session_id IN ({placeholders})")
+                format!("AND turns_fts_v2.session_id IN ({placeholders})")
             }
             None => String::new(),
         };
@@ -74,10 +111,10 @@ impl SearchRepo for Database {
         };
 
         let sql = format!(
-            "SELECT turns_fts.session_id, turns_fts.turn_id, turns_fts.content, bm25(turns_fts) as score
-             FROM turns_fts
-             JOIN sessions ON turns_fts.session_id = sessions.id
-             WHERE turns_fts.content MATCH ?1
+            "SELECT turns_fts_v2.session_id, turns_fts_v2.turn_id, turns_fts_v2.content, bm25(turns_fts_v2) as score
+             FROM turns_fts_v2
+             JOIN sessions ON turns_fts_v2.session_id = sessions.id
+             WHERE turns_fts_v2.content MATCH ?1
                AND (?2 IS NULL OR sessions.start_time >= ?2)
                AND (?3 IS NULL OR sessions.start_time < ?3)
                {archive_clause}
@@ -132,11 +169,11 @@ impl SearchRepo for Database {
 // ─── Additional Database methods (search/FTS domain) ─────────────────────────
 
 impl Database {
-    /// Count rows in the turns_fts virtual table
+    /// Count rows in the FTS virtual table
     pub fn count_fts_rows(&self) -> Result<i64> {
         let count = self
             .conn()
-            .query_row("SELECT COUNT(*) FROM turns_fts", [], |r| r.get(0))?;
+            .query_row("SELECT COUNT(*) FROM turns_fts_v2", [], |r| r.get(0))?;
         Ok(count)
     }
 

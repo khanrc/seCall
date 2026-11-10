@@ -522,7 +522,7 @@ mod tests {
         db.conn()
             .execute_batch("INSERT INTO turns(session_id, turn_index, role, content) VALUES('s1', 0, 'user', 'hello')")
             .unwrap();
-        // turns_fts has 0 rows, turns has 1 → L005
+        // turns_fts_v2 has 0 rows, turns has 1 → L005
         let (config, _tmp) = make_config_tmp();
         let report = run_lint(&db, &config).unwrap();
         let l005 = report.findings.iter().find(|f| f.code == "L005");
