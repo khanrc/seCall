@@ -7,9 +7,9 @@ use secall_core::{
     vault::Config,
 };
 
-/// Reclassify every session with the configured rules. A session whose type
-/// changes gets it in its vault Markdown's frontmatter when this host rendered
-/// it (consumers of the vault read it there), then in the database.
+/// Reclassify every session with the configured rules. The type goes into the
+/// frontmatter of the vault Markdown this host rendered (consumers of the vault
+/// read it there), then into the database.
 pub async fn run_backfill(dry_run: bool) -> Result<()> {
     let config = Config::load_or_default();
     let classification = &config.ingest.classification;
@@ -30,7 +30,7 @@ pub async fn run_backfill(dry_run: bool) -> Result<()> {
     let sessions = db.get_all_sessions_for_classify()?;
     let mut changed = 0usize;
     let mut rewritten = 0usize;
-    let mut deferred = 0usize;
+    let mut failed = 0usize;
     for session in &sessions {
         let new_type = super::ingest::apply_classification(
             &compiled_rules,
@@ -38,11 +38,34 @@ pub async fn run_backfill(dry_run: bool) -> Result<()> {
             session.project.as_deref(),
             &classification.default,
         );
-        if new_type == session.session_type {
+        let type_changed = new_type != session.session_type;
+        let short_id = &session.id[..8.min(session.id.len())];
+        // Every file is checked, not only those whose type changes: before
+        // classify wrote Markdown it changed only the database, leaving files
+        // with the type they were rendered with.
+        //
+        // The Markdown goes first: the database type decides whether a later
+        // run sees a change, so a file left behind is retried only while the
+        // database keeps the old type.
+        if let Some(path) = own_markdown(&db, &config, &session.id, &local_host)? {
+            match update_markdown_session_type(&path, &new_type, dry_run) {
+                Ok(MarkdownUpdate::Rewritten) => rewritten += 1,
+                Ok(MarkdownUpdate::Current) => {}
+                Ok(MarkdownUpdate::NoField) if type_changed => {
+                    tracing::warn!(path = %path.display(), "no session_type in frontmatter")
+                }
+                Ok(MarkdownUpdate::NoField) => {}
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "Markdown not updated; retried next run");
+                    failed += 1;
+                    continue;
+                }
+            }
+        }
+        if !type_changed {
             continue;
         }
         changed += 1;
-        let short_id = &session.id[..8.min(session.id.len())];
         if dry_run {
             eprintln!(
                 "  [dry-run] {short_id}: {} → {new_type}",
@@ -50,33 +73,20 @@ pub async fn run_backfill(dry_run: bool) -> Result<()> {
             );
             continue;
         }
-        // The Markdown first: the database type decides whether a later run
-        // sees a change, so a file left behind is retried only while the
-        // database keeps the old type.
-        if let Some(path) = own_markdown(&db, &config, &session.id, &local_host)? {
-            match set_markdown_session_type(&path, &new_type) {
-                Ok(true) => rewritten += 1,
-                Ok(false) => {
-                    tracing::warn!(path = %path.display(), "no session_type in frontmatter")
-                }
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "Markdown not updated; retried next run");
-                    deferred += 1;
-                    continue;
-                }
-            }
-        }
         db.update_session_type(&session.id, &new_type)?;
         tracing::debug!(session = short_id, session_type = new_type, "classified");
     }
 
     eprintln!(
-        "Classify {}complete: {changed} of {} sessions changed type, {rewritten} Markdown files updated",
+        "Classify {}complete: {changed} of {} sessions changed type, {rewritten} Markdown files {}",
         if dry_run { "(dry-run) " } else { "" },
         sessions.len(),
+        if dry_run { "to update" } else { "updated" },
     );
-    if deferred > 0 {
-        eprintln!("  {deferred} sessions keep their old type until their Markdown can be written");
+    if failed > 0 {
+        eprintln!(
+            "  {failed} Markdown files could not be updated; their sessions keep their database type until a run can update them"
+        );
     }
     Ok(())
 }
@@ -100,13 +110,28 @@ fn own_markdown(
         .filter(|path| path.is_file()))
 }
 
-/// Set the frontmatter `session_type` of the Markdown at `path`; `false` when
-/// the frontmatter has none.
-fn set_markdown_session_type(path: &Path, session_type: &str) -> std::io::Result<bool> {
+enum MarkdownUpdate {
+    Rewritten,
+    Current,
+    NoField,
+}
+
+/// Set the frontmatter `session_type` of the Markdown at `path`, writing the
+/// file only when the type differs and this is not a dry run.
+fn update_markdown_session_type(
+    path: &Path,
+    session_type: &str,
+    dry_run: bool,
+) -> std::io::Result<MarkdownUpdate> {
     let content = std::fs::read_to_string(path)?;
     let Some(updated) = with_frontmatter_session_type(&content, session_type) else {
-        return Ok(false);
+        return Ok(MarkdownUpdate::NoField);
     };
-    std::fs::write(path, updated)?;
-    Ok(true)
+    if updated == content {
+        return Ok(MarkdownUpdate::Current);
+    }
+    if !dry_run {
+        std::fs::write(path, updated)?;
+    }
+    Ok(MarkdownUpdate::Rewritten)
 }
