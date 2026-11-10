@@ -223,7 +223,7 @@ impl Database {
             // and v13 steps.
             self.conn.execute_batch(CREATE_TURNS_FTS_ROWS)?;
             if self.table_exists("turns_fts")? {
-                self.list_unlisted_fts_rows()?;
+                self.repair_fts_listing()?;
             }
         }
         if current < CURRENT_SCHEMA_VERSION {
@@ -1172,18 +1172,18 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(db.list_unlisted_fts_rows().unwrap(), 1);
-        assert_eq!(db.list_unlisted_fts_rows().unwrap(), 0);
+        assert_eq!(db.repair_fts_listing().unwrap(), 1);
+        assert_eq!(db.repair_fts_listing().unwrap(), 0);
         db.delete_session_fts("sess-a").unwrap();
         assert_eq!(fts_rows_and_listing(&db), (vec![], vec![]));
     }
 
     #[test]
-    fn test_delete_session_fts_spares_a_row_listed_under_another_session() {
+    fn test_a_row_listed_under_another_session_is_spared_and_repaired() {
         let db = Database::open_memory().unwrap();
         db.insert_fts("a", "sess-a", 0).unwrap();
         db.insert_fts("b", "sess-b", 0).unwrap();
-        // A stale listing: sess-b's row recorded as sess-a's.
+        // Stale: sess-b's row recorded as sess-a's.
         db.conn()
             .execute(
                 "UPDATE turns_fts_rows SET session_id = 'sess-a' WHERE session_id = 'sess-b'",
@@ -1191,16 +1191,25 @@ mod tests {
             )
             .unwrap();
 
-        db.delete_session_fts("sess-a").unwrap();
-
+        // Repair lists it under sess-b.
+        assert_eq!(db.repair_fts_listing().unwrap(), 1);
         let (fts, listed) = fts_rows_and_listing(&db);
+        assert_eq!(listed, fts);
+
+        // Deleting sess-a before a repair leaves sess-b's row alone.
+        db.conn()
+            .execute(
+                "UPDATE turns_fts_rows SET session_id = 'sess-a' WHERE session_id = 'sess-b'",
+                [],
+            )
+            .unwrap();
+        db.delete_session_fts("sess-a").unwrap();
+        let (fts, _) = fts_rows_and_listing(&db);
         assert_eq!(
             fts.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>(),
             ["sess-b"]
         );
-        // The stale entry went with sess-a's, so the next pass lists the row right.
-        assert!(listed.is_empty());
-        db.list_unlisted_fts_rows().unwrap();
+        db.repair_fts_listing().unwrap();
         assert_eq!(fts_rows_and_listing(&db).1, fts);
     }
 

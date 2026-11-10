@@ -15,11 +15,13 @@ pub trait SearchRepo {
     fn insert_fts(&self, tokenized_content: &str, session_id: &str, turn_index: u32) -> Result<()>;
     /// Remove every FTS row of `session_id` that `turns_fts_rows` lists.
     fn delete_session_fts(&self, session_id: &str) -> Result<()>;
-    /// List the FTS rows missing from `turns_fts_rows`, and return how many.
+    /// List every FTS row under its own session in `turns_fts_rows`: rows
+    /// missing from it, and rows it names another session for. Returns how
+    /// many rows it listed.
     ///
-    /// A binary from before the listing writes FTS rows without it, and
-    /// [`Self::delete_session_fts`] can't find those. Reads every FTS row once.
-    fn list_unlisted_fts_rows(&self) -> Result<usize>;
+    /// A binary from before the listing writes FTS rows without it, and FTS5
+    /// can hand a rowid it freed to another session. Reads every FTS row once.
+    fn repair_fts_listing(&self) -> Result<usize>;
     fn search_fts(
         &self,
         tokenized_query: &str,
@@ -66,11 +68,12 @@ impl SearchRepo for Database {
         })
     }
 
-    fn list_unlisted_fts_rows(&self) -> crate::error::Result<usize> {
+    fn repair_fts_listing(&self) -> crate::error::Result<usize> {
         Ok(self.conn().execute(
-            "INSERT INTO turns_fts_rows(fts_rowid, session_id)
-             SELECT rowid, session_id FROM turns_fts
-             WHERE rowid NOT IN (SELECT fts_rowid FROM turns_fts_rows)",
+            "INSERT OR REPLACE INTO turns_fts_rows(fts_rowid, session_id)
+             SELECT f.rowid, f.session_id FROM turns_fts f
+             LEFT JOIN turns_fts_rows l ON l.fts_rowid = f.rowid
+             WHERE l.session_id IS NOT f.session_id",
             [],
         )?)
     }

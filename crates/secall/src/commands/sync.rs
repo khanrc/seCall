@@ -504,12 +504,12 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
     }
 
     let local_host = gethostname::gethostname().to_string_lossy().to_string();
-    // A refresh deletes a session's FTS rows by their listing. Rows an older
-    // binary wrote are missing from it, for instance while a sync started
-    // before an upgrade was still running.
-    let listed = db.list_unlisted_fts_rows()?;
-    if listed > 0 {
-        tracing::warn!(rows = listed, "listed FTS rows missing from turns_fts_rows");
+    // A refresh deletes a session's FTS rows by their listing, which a binary
+    // from before it does not keep, for instance a sync that started before
+    // an upgrade and was still running.
+    let repaired = db.repair_fts_listing()?;
+    if repaired > 0 {
+        tracing::warn!(rows = repaired, "repaired the listing of FTS rows");
     }
     // Turns stored by an older Markdown parser: read every other host's
     // session from its Markdown again, once.
