@@ -6,7 +6,7 @@ use secall_core::{
     ingest::markdown_reparse::{parse_turns_from_body, REPARSE_REVISION},
     jobs::ProgressSink,
     search::{tokenizer::create_tokenizer, Bm25Indexer, SearchEngine},
-    store::{get_default_db_path, session_repo::VaultRefresh, Database, SearchRepo, SessionRepo},
+    store::{get_default_db_path, session_repo::VaultRefresh, Database, SessionRepo},
     vault::{git::VaultGit, Config, Vault},
 };
 
@@ -504,13 +504,6 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
     }
 
     let local_host = gethostname::gethostname().to_string_lossy().to_string();
-    // A refresh deletes a session's FTS rows by their listing, which a binary
-    // from before it does not keep, for instance a sync that started before
-    // an upgrade and was still running.
-    let repaired = db.repair_fts_listing()?;
-    if repaired > 0 {
-        tracing::warn!(rows = repaired, "repaired the listing of FTS rows");
-    }
     // Turns stored by an older Markdown parser: read every other host's
     // session from its Markdown again, once.
     let reparse = db.markdown_reparse_revision()? < REPARSE_REVISION;

@@ -2039,7 +2039,7 @@ mod tests {
         );
         let fts: Vec<String> = db
             .conn()
-            .prepare("SELECT content FROM turns_fts WHERE session_id = 'sess-mac'")
+            .prepare("SELECT content FROM turns_fts_v2 WHERE session_id = 'sess-mac'")
             .unwrap()
             .query_map([], |r| r.get(0))
             .unwrap()
@@ -2049,7 +2049,7 @@ mod tests {
         assert_eq!(
             count(
                 &db,
-                "SELECT COUNT(*) FROM turns_fts_rows r JOIN turns_fts f ON f.rowid = r.fts_rowid
+                "SELECT COUNT(*) FROM turns_fts_rows r JOIN turns_fts_v2 f ON f.rowid = r.fts_rowid
                  WHERE r.session_id = 'sess-mac' AND f.content = 'new body'"
             ),
             1,

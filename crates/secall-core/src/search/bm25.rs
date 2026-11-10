@@ -96,7 +96,7 @@ impl Bm25Indexer {
         db.insert_session(session)?;
 
         for turn in &session.turns {
-            // Turn-incremental: `turns_fts` is a plain FTS5 insert with no dedup,
+            // Turn-incremental: the FTS table is a plain FTS5 insert with no dedup,
             // so we may only insert it for turns `insert_turn` reports as newly
             // added (rows affected == 1). Re-indexing an append-grown session
             // then adds FTS rows for the new turns only, never duplicating the
@@ -362,7 +362,7 @@ mod tests {
         let fts_count = |db: &Database| -> i64 {
             db.conn()
                 .query_row(
-                    "SELECT COUNT(*) FROM turns_fts WHERE session_id = 'grow'",
+                    "SELECT COUNT(*) FROM turns_fts_v2 WHERE session_id = 'grow'",
                     [],
                     |r| r.get(0),
                 )

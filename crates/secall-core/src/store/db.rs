@@ -5,7 +5,6 @@ use rusqlite::Connection;
 use crate::error::Result;
 #[cfg(test)]
 use crate::error::SecallError;
-use crate::store::search_repo::SearchRepo;
 
 use super::schema::{
     CREATE_CONFIG, CREATE_GRAPH_EDGES, CREATE_GRAPH_INDEXES, CREATE_GRAPH_NODES, CREATE_INDEXES,
@@ -218,13 +217,24 @@ impl Database {
                 .execute_batch(super::deferred_source_repo::CREATE_DEFERRED_SOURCES)?;
         }
         if current < 15 {
-            // List the FTS rows written before the table existed. The FTS
-            // index is unchanged. Guarded on turns_fts existing, like the v12
-            // and v13 steps.
-            self.conn.execute_batch(CREATE_TURNS_FTS_ROWS)?;
-            if self.table_exists("turns_fts")? {
-                self.repair_fts_listing()?;
-            }
+            // List the existing FTS rows, then rename the table so binaries
+            // from before v15 can't write it (see CREATE_TURNS_FTS). One pass
+            // over the FTS rows; the index itself is not rebuilt. One
+            // transaction, so an interrupted run leaves v14 as it was, and a
+            // concurrent opener finds the rename done once it gets the lock.
+            self.with_transaction(|| {
+                self.conn.execute_batch(CREATE_TURNS_FTS_ROWS)?;
+                if self.table_exists("turns_fts")? {
+                    self.conn.execute(
+                        "INSERT INTO turns_fts_rows(fts_rowid, session_id)
+                         SELECT rowid, session_id FROM turns_fts",
+                        [],
+                    )?;
+                    self.conn
+                        .execute_batch("ALTER TABLE turns_fts RENAME TO turns_fts_v2")?;
+                }
+                Ok(())
+            })?;
         }
         if current < CURRENT_SCHEMA_VERSION {
             self.conn.execute(
@@ -618,13 +628,13 @@ mod tests {
     }
 
     #[test]
-    fn test_migrate_creates_turns_fts() {
+    fn test_migrate_creates_turns_fts_v2() {
         let db = Database::open_memory().unwrap();
         // FTS tables appear as 'table' in sqlite_master
         let count: i64 = db
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name='turns_fts'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='turns_fts_v2'",
                 [],
                 |row| row.get(0),
             )
@@ -901,7 +911,7 @@ mod tests {
         let fts_count: i64 = db
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM turns_fts WHERE session_id = 'vault-001'",
+                "SELECT COUNT(*) FROM turns_fts_v2 WHERE session_id = 'vault-001'",
                 [],
                 |r| r.get(0),
             )
@@ -1045,7 +1055,7 @@ mod tests {
         let fts_count: i64 = db
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM turns_fts WHERE session_id = 'sess-fts-del'",
+                "SELECT COUNT(*) FROM turns_fts_v2 WHERE session_id = 'sess-fts-del'",
                 [],
                 |r| r.get(0),
             )
@@ -1059,7 +1069,7 @@ mod tests {
         let fts_after: i64 = db
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM turns_fts WHERE session_id = 'sess-fts-del'",
+                "SELECT COUNT(*) FROM turns_fts_v2 WHERE session_id = 'sess-fts-del'",
                 [],
                 |r| r.get(0),
             )
@@ -1085,18 +1095,24 @@ mod tests {
                 .unwrap()
         };
         (
-            read("SELECT rowid, session_id FROM turns_fts ORDER BY rowid"),
+            read("SELECT rowid, session_id FROM turns_fts_v2 ORDER BY rowid"),
             read("SELECT fts_rowid, session_id FROM turns_fts_rows ORDER BY fts_rowid"),
         )
     }
 
+    fn sessions_of(rows: &FtsRows) -> Vec<&str> {
+        rows.iter().map(|(_, s)| s.as_str()).collect()
+    }
+
     #[test]
-    fn test_migration_to_v15_lists_existing_fts_rows() {
+    fn test_migration_to_v15_lists_fts_rows_and_renames_the_table() {
+        use crate::store::SearchRepo;
         let db = Database::open_memory().unwrap();
-        // A v14 index: FTS rows and no listing.
+        // A v14 index: `turns_fts` and no listing.
         db.conn()
             .execute_batch(
                 "DROP TABLE turns_fts_rows;
+                 ALTER TABLE turns_fts_v2 RENAME TO turns_fts;
                  INSERT INTO turns_fts(content, session_id, turn_id) VALUES
                      ('alpha', 'sess-a', 0), ('beta', 'sess-a', 1), ('gamma', 'sess-b', 0);
                  UPDATE config SET value = '14' WHERE key = 'schema_version';",
@@ -1106,21 +1122,27 @@ mod tests {
         db.migrate().unwrap();
 
         let (fts, listed) = fts_rows_and_listing(&db);
-        assert_eq!(fts.len(), 3);
+        assert_eq!(sessions_of(&fts), ["sess-a", "sess-a", "sess-b"]);
         assert_eq!(listed, fts);
         assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        // A v14 binary's FTS write now fails instead of skipping the listing.
+        assert!(db
+            .conn()
+            .execute(
+                "INSERT INTO turns_fts(content, session_id, turn_id) VALUES ('x', 'sess-c', 0)",
+                [],
+            )
+            .is_err());
 
         db.delete_session_fts("sess-a").unwrap();
         let (fts, listed) = fts_rows_and_listing(&db);
-        assert_eq!(
-            fts.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>(),
-            ["sess-b"]
-        );
+        assert_eq!(sessions_of(&fts), ["sess-b"]);
         assert_eq!(listed, fts);
     }
 
     #[test]
     fn test_insert_and_delete_session_fts_keep_the_listing_in_step() {
+        use crate::store::SearchRepo;
         let db = Database::open_memory().unwrap();
         db.insert_fts("one", "sess-a", 0).unwrap();
         db.insert_fts("two", "sess-b", 0).unwrap();
@@ -1135,88 +1157,15 @@ mod tests {
 
         db.delete_session_fts("sess-b").unwrap();
         let (fts, listed) = fts_rows_and_listing(&db);
-        assert_eq!(
-            fts.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>(),
-            ["sess-a", "sess-a"]
-        );
+        assert_eq!(sessions_of(&fts), ["sess-a", "sess-a"]);
         assert_eq!(listed, fts);
-    }
-
-    #[test]
-    fn test_insert_fts_takes_over_a_stale_listing_of_its_rowid() {
-        let db = Database::open_memory().unwrap();
-        db.insert_fts("old", "sess-old", 0).unwrap();
-        let (old_rows, _) = fts_rows_and_listing(&db);
-        // A pre-v15 binary deletes by session_id and leaves the listing.
-        db.conn()
-            .execute("DELETE FROM turns_fts WHERE session_id = 'sess-old'", [])
-            .unwrap();
-
-        // FTS5 hands the freed rowid to the next row.
-        db.insert_fts("new", "sess-new", 0).unwrap();
-
-        let (fts, listed) = fts_rows_and_listing(&db);
-        assert_eq!(fts, [(old_rows[0].0, "sess-new".to_string())]);
-        assert_eq!(listed, fts);
-    }
-
-    #[test]
-    fn test_unlisted_fts_rows_are_listed_and_then_deletable() {
-        let db = Database::open_memory().unwrap();
-        db.insert_fts("listed", "sess-a", 0).unwrap();
-        // Written by a binary that predates the listing.
-        db.conn()
-            .execute(
-                "INSERT INTO turns_fts(content, session_id, turn_id) VALUES ('stale', 'sess-a', 0)",
-                [],
-            )
-            .unwrap();
-
-        assert_eq!(db.repair_fts_listing().unwrap(), 1);
-        assert_eq!(db.repair_fts_listing().unwrap(), 0);
-        db.delete_session_fts("sess-a").unwrap();
-        assert_eq!(fts_rows_and_listing(&db), (vec![], vec![]));
-    }
-
-    #[test]
-    fn test_a_row_listed_under_another_session_is_spared_and_repaired() {
-        let db = Database::open_memory().unwrap();
-        db.insert_fts("a", "sess-a", 0).unwrap();
-        db.insert_fts("b", "sess-b", 0).unwrap();
-        // Stale: sess-b's row recorded as sess-a's.
-        db.conn()
-            .execute(
-                "UPDATE turns_fts_rows SET session_id = 'sess-a' WHERE session_id = 'sess-b'",
-                [],
-            )
-            .unwrap();
-
-        // Repair lists it under sess-b.
-        assert_eq!(db.repair_fts_listing().unwrap(), 1);
-        let (fts, listed) = fts_rows_and_listing(&db);
-        assert_eq!(listed, fts);
-
-        // Deleting sess-a before a repair leaves sess-b's row alone.
-        db.conn()
-            .execute(
-                "UPDATE turns_fts_rows SET session_id = 'sess-a' WHERE session_id = 'sess-b'",
-                [],
-            )
-            .unwrap();
-        db.delete_session_fts("sess-a").unwrap();
-        let (fts, _) = fts_rows_and_listing(&db);
-        assert_eq!(
-            fts.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>(),
-            ["sess-b"]
-        );
-        db.repair_fts_listing().unwrap();
-        assert_eq!(fts_rows_and_listing(&db).1, fts);
     }
 
     #[test]
     fn test_delete_session_fts_finds_rows_by_rowid() {
-        // The point of turns_fts_rows: a full scan of turns_fts reads every
-        // session's content, which made refreshing thousands of sessions slow.
+        // The point of turns_fts_rows: a full scan of the FTS table reads
+        // every session's content, which made refreshing thousands of
+        // sessions slow.
         let db = Database::open_memory().unwrap();
         let plan: Vec<String> = db
             .conn()
@@ -1231,10 +1180,13 @@ mod tests {
             .unwrap();
         let fts_step = plan
             .iter()
-            .find(|d| d.contains("turns_fts VIRTUAL TABLE"))
-            .unwrap_or_else(|| panic!("no turns_fts step in {plan:?}"));
+            .find(|d| d.contains("turns_fts_v2 VIRTUAL TABLE"))
+            .unwrap_or_else(|| panic!("no FTS step in {plan:?}"));
         // FTS5 marks a rowid-equality lookup with `=` in its index string.
-        assert!(fts_step.ends_with(":="), "full scan of turns_fts: {plan:?}");
+        assert!(
+            fts_step.ends_with(":="),
+            "full scan of the FTS table: {plan:?}"
+        );
     }
 
     fn config_keys(db: &Database) -> Vec<String> {

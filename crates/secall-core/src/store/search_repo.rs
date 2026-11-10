@@ -3,25 +3,15 @@ use crate::search::bm25::{FtsRow, SearchFilters};
 use crate::store::db::Database;
 
 /// Deletes a session's FTS rows by the rowids `turns_fts_rows` lists for it.
-/// The `session_id` check keeps a listing that went stale under an older
-/// binary from deleting another session's row.
-pub(crate) const DELETE_SESSION_FTS: &str = "DELETE FROM turns_fts
-     WHERE rowid IN (SELECT fts_rowid FROM turns_fts_rows WHERE session_id = ?1)
-       AND session_id = ?1";
+pub(crate) const DELETE_SESSION_FTS: &str = "DELETE FROM turns_fts_v2
+     WHERE rowid IN (SELECT fts_rowid FROM turns_fts_rows WHERE session_id = ?1)";
 
 pub trait SearchRepo {
     /// Add one FTS row to `session_id`. A vault-built session's whole-body
     /// row uses `turn_index` 0.
     fn insert_fts(&self, tokenized_content: &str, session_id: &str, turn_index: u32) -> Result<()>;
-    /// Remove every FTS row of `session_id` that `turns_fts_rows` lists.
+    /// Remove every FTS row of `session_id`.
     fn delete_session_fts(&self, session_id: &str) -> Result<()>;
-    /// List every FTS row under its own session in `turns_fts_rows`: rows
-    /// missing from it, and rows it names another session for. Returns how
-    /// many rows it listed.
-    ///
-    /// A binary from before the listing writes FTS rows without it, and FTS5
-    /// can hand a rowid it freed to another session. Reads every FTS row once.
-    fn repair_fts_listing(&self) -> Result<usize>;
     fn search_fts(
         &self,
         tokenized_query: &str,
@@ -43,14 +33,11 @@ impl SearchRepo for Database {
         self.with_nested_transaction(|| {
             self.conn().execute(
                 // FTS5 컬럼명 turn_id는 유지 (스키마 변경 최소화). 저장값은 실제 turn_index.
-                "INSERT INTO turns_fts(content, session_id, turn_id) VALUES (?1, ?2, ?3)",
+                "INSERT INTO turns_fts_v2(content, session_id, turn_id) VALUES (?1, ?2, ?3)",
                 rusqlite::params![tokenized_content, session_id, turn_index as i64],
             )?;
-            // REPLACE: a binary that predates turns_fts_rows deletes FTS rows
-            // without their listing, and FTS5 can reuse a freed rowid. The row
-            // just inserted owns it.
             self.conn().execute(
-                "INSERT OR REPLACE INTO turns_fts_rows(fts_rowid, session_id) VALUES (?1, ?2)",
+                "INSERT INTO turns_fts_rows(fts_rowid, session_id) VALUES (?1, ?2)",
                 rusqlite::params![self.conn().last_insert_rowid(), session_id],
             )?;
             Ok(())
@@ -66,16 +53,6 @@ impl SearchRepo for Database {
             )?;
             Ok(())
         })
-    }
-
-    fn repair_fts_listing(&self) -> crate::error::Result<usize> {
-        Ok(self.conn().execute(
-            "INSERT OR REPLACE INTO turns_fts_rows(fts_rowid, session_id)
-             SELECT f.rowid, f.session_id FROM turns_fts f
-             LEFT JOIN turns_fts_rows l ON l.fts_rowid = f.rowid
-             WHERE l.session_id IS NOT f.session_id",
-            [],
-        )?)
     }
 
     fn search_fts(
@@ -112,7 +89,7 @@ impl SearchRepo for Database {
                     .map(|i| format!("?{}", i + base_idx))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("AND turns_fts.session_id IN ({placeholders})")
+                format!("AND turns_fts_v2.session_id IN ({placeholders})")
             }
             None => String::new(),
         };
@@ -124,10 +101,10 @@ impl SearchRepo for Database {
         };
 
         let sql = format!(
-            "SELECT turns_fts.session_id, turns_fts.turn_id, turns_fts.content, bm25(turns_fts) as score
-             FROM turns_fts
-             JOIN sessions ON turns_fts.session_id = sessions.id
-             WHERE turns_fts.content MATCH ?1
+            "SELECT turns_fts_v2.session_id, turns_fts_v2.turn_id, turns_fts_v2.content, bm25(turns_fts_v2) as score
+             FROM turns_fts_v2
+             JOIN sessions ON turns_fts_v2.session_id = sessions.id
+             WHERE turns_fts_v2.content MATCH ?1
                AND (?2 IS NULL OR sessions.start_time >= ?2)
                AND (?3 IS NULL OR sessions.start_time < ?3)
                {archive_clause}
@@ -182,11 +159,11 @@ impl SearchRepo for Database {
 // ─── Additional Database methods (search/FTS domain) ─────────────────────────
 
 impl Database {
-    /// Count rows in the turns_fts virtual table
+    /// Count rows in the FTS virtual table
     pub fn count_fts_rows(&self) -> Result<i64> {
         let count = self
             .conn()
-            .query_row("SELECT COUNT(*) FROM turns_fts", [], |r| r.get(0))?;
+            .query_row("SELECT COUNT(*) FROM turns_fts_v2", [], |r| r.get(0))?;
         Ok(count)
     }
 
