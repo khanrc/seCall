@@ -654,6 +654,7 @@ secall serve --port 8080 --allow-config-edit
 | `embedding.pool_size` | ORT session pool 크기 (미설정 = RAM 기반 자동) | `null` |
 | `embedding.cloud_host` | Ollama Cloud API 호스트 | `https://ollama.com` |
 | `embedding.cloud_model` | Ollama Cloud embedding 모델 이름 | `null` |
+| `embedding.include_automated` | `automated` 세션도 임베딩 (끄면 `secall embed`가 기존 벡터도 삭제, 키워드 검색은 유지) | `false` |
 | `output.timezone` | 타임존 (IANA) | `UTC` |
 | `ingest.classification.default` | 분류 규칙 미매칭 시 기본 session_type | `interactive` |
 | `ingest.classification.skip_embed_types` | 임베딩을 스킵할 session_type 목록 | `[]` |

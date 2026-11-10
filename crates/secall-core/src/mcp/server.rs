@@ -12,6 +12,7 @@ use super::tools::{
     GetParams, GraphQueryParams, QueryType, RecallParams, StatusParams, WikiSearchMode,
     WikiSearchParams,
 };
+use crate::ingest::AUTOMATED_SESSION_TYPE;
 use crate::search::bm25::{SearchFilters, SearchResult};
 use crate::search::hybrid::{
     diversify_by_session, parse_temporal_filter, reciprocal_rank_fusion, SearchEngine, RRF_K,
@@ -122,7 +123,7 @@ impl SeCallMcpServer {
             agent: params.agent,
             since: None,
             until: None,
-            exclude_session_types: vec!["automated".to_string()],
+            exclude_session_types: vec![AUTOMATED_SESSION_TYPE.to_string()],
             ..Default::default()
         };
 

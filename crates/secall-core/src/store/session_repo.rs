@@ -450,6 +450,34 @@ impl Database {
         Ok(deleted)
     }
 
+    /// The stored `session_type`, or `None` when the session has no row.
+    pub fn stored_session_type(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT COALESCE(session_type, '') FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Delete the vectors of every session whose type is one of `session_types`.
+    pub fn delete_vectors_of_session_types(&self, session_types: &[String]) -> Result<usize> {
+        if session_types.is_empty() || !self.table_exists("turn_vectors")? {
+            return Ok(0);
+        }
+        let placeholders = vec!["?"; session_types.len()].join(", ");
+        let deleted = self.conn().execute(
+            &format!(
+                "DELETE FROM turn_vectors WHERE session_id IN \
+                 (SELECT id FROM sessions WHERE session_type IN ({placeholders}))"
+            ),
+            rusqlite::params_from_iter(session_types),
+        )?;
+        Ok(deleted)
+    }
+
     /// Return all session IDs in the database
     pub fn list_all_session_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn().prepare("SELECT id FROM sessions")?;

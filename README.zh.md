@@ -652,6 +652,7 @@ secall serve --port 8080 --allow-config-edit
 | `embedding.pool_size` | ORT session pool 大小（未设置 = 根据 RAM 自动） | `null` |
 | `embedding.cloud_host` | Ollama Cloud API host | `https://ollama.com` |
 | `embedding.cloud_model` | Ollama Cloud embedding 模型名 | `null` |
+| `embedding.include_automated` | 同时嵌入 `automated` 会话（关闭时 `secall embed` 也会删除其已有向量，关键词检索仍可找到） | `false` |
 | `output.timezone` | 时区（IANA） | `UTC` |
 | `ingest.classification.default` | 分类规则未命中时的默认 session_type | `interactive` |
 | `ingest.classification.skip_embed_types` | 跳过嵌入的 session_type 列表 | `[]` |

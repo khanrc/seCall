@@ -671,6 +671,7 @@ secall serve --port 8080 --allow-config-edit
 | `embedding.pool_size` | ORT session pool size (null = auto from RAM) | `null` |
 | `embedding.cloud_host` | Ollama Cloud API host | `https://ollama.com` |
 | `embedding.cloud_model` | Ollama Cloud embedding model name | `null` |
+| `embedding.include_automated` | Embed `automated` sessions too (when off, `secall embed` also deletes their vectors; keyword search still finds them) | `false` |
 | `output.timezone` | Timezone (IANA) | `UTC` |
 | `ingest.classification.default` | Default session_type when no rule matches | `interactive` |
 | `ingest.classification.skip_embed_types` | Session types to skip vector embedding | `[]` |

@@ -120,6 +120,16 @@ pub async fn run(
         ReconcileOutcome::Clean => {}
     }
 
+    // Classify can move a session into a skipped type after it was embedded;
+    // the vector file sync after the pass drops what this removes.
+    let removed = db.delete_vectors_of_session_types(indexer.skipped_session_types())?;
+    if removed > 0 {
+        eprintln!(
+            "Removed {removed} vector(s) of automated sessions; \
+             [embedding] include_automated keeps them."
+        );
+    }
+
     let model = indexer.model_name().to_string();
     let dimensions = indexer.dimensions();
     let tz = config.timezone();

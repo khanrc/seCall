@@ -58,6 +58,8 @@ pub struct VectorIndexer {
     /// must never trigger a destructive vector-store reconcile — see
     /// `reconcile_vector_model` and the embed entrypoint.
     is_fallback: bool,
+    /// Session types that get no vectors (`[embedding] include_automated`).
+    skipped_session_types: Vec<String>,
 }
 
 impl VectorIndexer {
@@ -70,6 +72,7 @@ impl VectorIndexer {
             query_prefix: String::new(),
             passage_prefix: String::new(),
             is_fallback: false,
+            skipped_session_types: Vec::new(),
         }
     }
 
@@ -96,6 +99,26 @@ impl VectorIndexer {
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size.max(1);
         self
+    }
+
+    /// Give sessions of these types no vectors.
+    pub fn skipping_session_types(mut self, session_types: Vec<String>) -> Self {
+        self.skipped_session_types = session_types;
+        self
+    }
+
+    /// The session types this indexer gives no vectors.
+    pub fn skipped_session_types(&self) -> &[String] {
+        &self.skipped_session_types
+    }
+
+    /// Whether the stored session takes vectors; `None` when its row is gone.
+    /// Reads the row rather than `Session::session_type`: ingest recomputes the
+    /// type from the current rules, but the row keeps the stored classification.
+    fn takes_vectors(&self, db: &Database, session_id: &str) -> Result<Option<bool>> {
+        Ok(db
+            .stored_session_type(session_id)?
+            .map(|session_type| !self.skipped_session_types.contains(&session_type)))
     }
 
     /// The active embedding model's name (model-dir basename for ORT, provider
@@ -133,6 +156,9 @@ impl VectorIndexer {
         session: &Session,
         tz: chrono_tz::Tz,
     ) -> Result<bool> {
+        if self.takes_vectors(db, &session.id)? == Some(false) {
+            return Ok(false);
+        }
         let all_chunks = chunk_session(session, tz);
         if all_chunks.is_empty() {
             return Ok(false);
@@ -149,6 +175,9 @@ impl VectorIndexer {
         session: &Session,
         tz: chrono_tz::Tz,
     ) -> Result<IndexStats> {
+        if self.takes_vectors(db, &session.id)? == Some(false) {
+            return Ok(IndexStats::default());
+        }
         let all_chunks = chunk_session(session, tz);
 
         // Ensure vector table exists
@@ -268,18 +297,21 @@ impl VectorIndexer {
         let mut chunks_embedded = 0usize;
         for batch in embedded.chunks(COMMIT_BATCH_CHUNKS) {
             let mut inserted = 0usize;
-            // Re-check existence inside the write transaction. A concurrent
-            // delete_session_full (rebuild / --force) between batches must not
-            // leave later batches orphaned against a deleted session (turn_vectors
-            // has no sessions FK). Both are BEGIN IMMEDIATE, so they serialize:
-            // if the delete won, we skip (its wipe already removed our earlier
-            // batches); if we win, the delete then wipes what we wrote. No orphans.
+            // Re-check inside the write transaction that the session exists and
+            // still takes vectors. A concurrent delete_session_full (rebuild /
+            // --force) between batches must not leave later batches orphaned
+            // against a deleted session (turn_vectors has no sessions FK). Both
+            // are BEGIN IMMEDIATE, so they serialize: if the delete won, we skip
+            // (its wipe already removed our earlier batches); if we win, the
+            // delete then wipes what we wrote. No orphans. A concurrent classify
+            // into a skipped type stops later batches the same way; the next
+            // `secall embed` removes the earlier ones.
             // Residual (out of scope, self-healing on next rebuild): a delete+
             // reinsert of the same id in this gap can attach this run's stale
             // vectors to the rebuilt session — closing that needs a per-session
             // generation token, not just a presence check (logan-cha/log#1605).
-            let session_live = db.with_transaction(|| {
-                if !db.session_exists(&session.id)? {
+            let still_takes_vectors = db.with_transaction(|| {
+                if self.takes_vectors(db, &session.id)? != Some(true) {
                     return Ok(false);
                 }
                 for &(chunk, embedding) in batch {
@@ -301,7 +333,7 @@ impl VectorIndexer {
             })?; // A batch error (lock timeout, dimension/disk failure) propagates:
                  // batches already committed persist in their own transactions and
                  // the next cycle resumes the remainder — no silent partial success.
-            if !session_live {
+            if !still_takes_vectors {
                 break;
             }
             chunks_embedded += inserted;
@@ -627,13 +659,20 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
 
 /// The indexer for writing vectors (`secall embed`, ingest): the configured
 /// backend's embedder without the vector file, which only `secall embed`
-/// rewrites, from the stored vectors, after its pass.
+/// rewrites, from the stored vectors, after its pass. It skips the session
+/// types `[embedding]` leaves out.
+pub async fn create_embedding_indexer(config: &Config) -> Option<VectorIndexer> {
+    let indexer = backend_indexer(config).await?;
+    Some(indexer.skipping_session_types(config.embedding.skipped_session_types()))
+}
+
+/// The configured backend's indexer, or its fallback.
 ///
 /// The e5 query/passage prefixes are bound to the ORT model
 /// (model_manager::model_prefixes) and applied only on the ORT paths — they are
 /// a property of that model, not a user setting, so a non-e5 backend
 /// (ollama/openai) never carries them.
-pub async fn create_embedding_indexer(config: &Config) -> Option<VectorIndexer> {
+async fn backend_indexer(config: &Config) -> Option<VectorIndexer> {
     let indexer = match config.embedding.backend.as_str() {
         "ort" => {
             let model_dir = config
@@ -1001,6 +1040,103 @@ mod tests {
 
         assert_eq!(stats.chunks_embedded, 0);
         assert_eq!(db.get_session_chunk_keys(&session.id).unwrap().len(), 0);
+    }
+
+    fn one_turn_session(id: &str, session_type: &str) -> Session {
+        use crate::ingest::{AgentKind, Role, TokenUsage, Turn};
+        Session {
+            id: id.to_string(),
+            agent: AgentKind::ClaudeCode,
+            model: None,
+            project: None,
+            cwd: None,
+            git_branch: None,
+            host: None,
+            start_time: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            end_time: None,
+            turns: vec![Turn {
+                index: 0,
+                role: Role::User,
+                timestamp: None,
+                content: format!("{id} content"),
+                actions: vec![],
+                tokens: None,
+                thinking: None,
+                is_sidechain: false,
+            }],
+            total_tokens: TokenUsage::default(),
+            session_type: session_type.to_string(),
+            archived: false,
+            archived_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_automated_session_vectors_are_removed_and_not_rebuilt() {
+        // A session embedded before classify marked it automated: `secall
+        // embed` removes its vectors, and the skipping indexer embeds it no more.
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+        let automated = one_turn_session("auto-sess", "automated");
+        let interactive = one_turn_session("chat-sess", "interactive");
+        db.insert_session(&automated).unwrap();
+        db.insert_session(&interactive).unwrap();
+
+        let including = VectorIndexer::new(Box::new(FakeEmbedder));
+        for session in [&automated, &interactive] {
+            including
+                .index_session(&db, session, chrono_tz::UTC)
+                .await
+                .unwrap();
+        }
+
+        let skipping = VectorIndexer::new(Box::new(FakeEmbedder)).skipping_session_types(
+            crate::vault::config::EmbeddingConfig::default().skipped_session_types(),
+        );
+        let removed = db
+            .delete_vectors_of_session_types(skipping.skipped_session_types())
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(!skipping
+            .has_pending_chunks(&db, &automated, chrono_tz::UTC)
+            .unwrap());
+        let stats = skipping
+            .index_session(&db, &automated, chrono_tz::UTC)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.chunks_embedded, 0);
+        assert!(db.get_session_chunk_keys("auto-sess").unwrap().is_empty());
+        assert_eq!(db.get_session_chunk_keys("chat-sess").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_stored_type_decides_which_sessions_take_vectors() {
+        // Ingest recomputes `session_type` from the current rules, but the
+        // stored row keeps its classification, and that is what skips.
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+        db.insert_session(&one_turn_session("auto-sess", "automated"))
+            .unwrap();
+        db.insert_session(&one_turn_session("chat-sess", "interactive"))
+            .unwrap();
+        let indexer = VectorIndexer::new(Box::new(FakeEmbedder))
+            .skipping_session_types(vec!["automated".to_string()]);
+
+        for recomputed in [
+            one_turn_session("auto-sess", "interactive"),
+            one_turn_session("chat-sess", "automated"),
+        ] {
+            indexer
+                .index_session(&db, &recomputed, chrono_tz::UTC)
+                .await
+                .unwrap();
+        }
+
+        assert!(db.get_session_chunk_keys("auto-sess").unwrap().is_empty());
+        assert_eq!(db.get_session_chunk_keys("chat-sess").unwrap().len(), 1);
     }
 
     /// Stores a session with one turn vector under the "fake" model.
