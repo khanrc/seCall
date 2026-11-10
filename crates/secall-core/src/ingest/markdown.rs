@@ -49,6 +49,31 @@ pub fn parse_session_frontmatter(content: &str) -> crate::error::Result<SessionF
     Ok(parsed)
 }
 
+/// `content` with its frontmatter's `session_type` set, or `None` when the
+/// frontmatter has no `session_type` line. The body and line endings are left
+/// as they are.
+pub fn with_frontmatter_session_type(content: &str, session_type: &str) -> Option<String> {
+    let opening = content.split_inclusive('\n').next()?;
+    if opening.trim_end() != "---" {
+        return None;
+    }
+    let front_end = opening.len() + content[opening.len()..].find("\n---")? + 1;
+    let (front, body) = content.split_at(front_end);
+    let mut found = false;
+    let front: String = front
+        .split_inclusive('\n')
+        .map(|line| {
+            if found || !line.starts_with("session_type:") {
+                return line.to_string();
+            }
+            found = true;
+            let eol = &line[line.trim_end_matches(['\r', '\n']).len()..];
+            format!("session_type: {session_type}{eol}")
+        })
+        .collect();
+    found.then(|| front + body)
+}
+
 /// frontmatter 이후의 본문 텍스트 추출 (턴 내용).
 pub fn extract_body_text(content: &str) -> String {
     content
@@ -816,6 +841,39 @@ mod tests {
         let fm = parse_session_frontmatter(content).unwrap();
         assert_eq!(fm.archived, None);
         assert_eq!(fm.archived_at, None);
+    }
+
+    #[test]
+    fn with_frontmatter_session_type_changes_only_the_frontmatter() {
+        let content = "---\nsession_id: s\nsession_type: interactive\n---\n\n## Turn 1 — User (05:30)\n\nsession_type: interactive\n";
+        let changed = with_frontmatter_session_type(content, "automated").unwrap();
+        assert_eq!(
+            changed,
+            "---\nsession_id: s\nsession_type: automated\n---\n\n## Turn 1 — User (05:30)\n\nsession_type: interactive\n"
+        );
+        assert_eq!(
+            parse_session_frontmatter(&changed)
+                .unwrap()
+                .session_type
+                .as_deref(),
+            Some("automated")
+        );
+        assert_eq!(
+            with_frontmatter_session_type(
+                "---\r\nsession_type: interactive\r\n---\r\nbody\r\n",
+                "automated"
+            )
+            .as_deref(),
+            Some("---\r\nsession_type: automated\r\n---\r\nbody\r\n")
+        );
+        assert_eq!(
+            with_frontmatter_session_type("---\nsession_id: s\n---\n", "automated"),
+            None
+        );
+        assert_eq!(
+            with_frontmatter_session_type("no frontmatter", "automated"),
+            None
+        );
     }
 
     // P49 ─ 같은 role 연속 turn 헤더 강등 (h2 → h3) 회귀 테스트

@@ -1,5 +1,5 @@
-//! Each Codex session keeps its own vault Markdown. Every test isolates both
-//! database and vault.
+//! Each session keeps its own vault Markdown, which follows the session's
+//! classification. Every test isolates both database and vault.
 use secall_core::store::Database;
 use serde_json::json;
 use std::{
@@ -56,21 +56,16 @@ fn claude_transcript(root: &Path, id: &str) -> PathBuf {
     path
 }
 
-fn ingest(root: &Path, path: &Path) {
-    let config = root.join("config.toml");
-    fs::write(
-        &config,
-        format!("[vault]\npath = {:?}\n", root.join("vault")),
-    )
-    .unwrap();
+/// Write the config with `extra` after the vault section.
+fn configure(root: &Path, extra: &str) {
+    let vault = format!("[vault]\npath = {:?}\n", root.join("vault"));
+    fs::write(root.join("config.toml"), vault + extra).unwrap();
+}
+
+fn secall(root: &Path, args: &[&str]) {
     let output = Command::new(env!("CARGO_BIN_EXE_secall"))
-        .args([
-            "ingest",
-            path.to_str().unwrap(),
-            "--no-semantic",
-            "--no-embed",
-        ])
-        .env("SECALL_CONFIG_PATH", config)
+        .args(args)
+        .env("SECALL_CONFIG_PATH", root.join("config.toml"))
         .env("SECALL_DB_PATH", root.join("index.sqlite"))
         .output()
         .unwrap();
@@ -78,6 +73,19 @@ fn ingest(root: &Path, path: &Path) {
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn ingest(root: &Path, path: &Path) {
+    configure(root, "");
+    secall(
+        root,
+        &[
+            "ingest",
+            path.to_str().unwrap(),
+            "--no-semantic",
+            "--no-embed",
+        ],
     );
 }
 
@@ -147,4 +155,59 @@ fn ingest_restores_a_session_markdown_that_is_gone() {
         assert_eq!(session_files(root), vec![(path, id.to_string())]);
         assert_eq!(stored_turns(root, id), 2);
     }
+}
+
+#[test]
+fn classify_rewrites_the_type_in_this_hosts_markdown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    ingest(root, &rollout(root, A));
+    ingest(root, &rollout(root, B));
+    // B stands for a session another host rendered and `secall sync` follows.
+    let db = Database::open(&root.join("index.sqlite")).unwrap();
+    db.conn()
+        .execute(
+            "UPDATE sessions SET status = 'reindexed', host = 'macbook' WHERE id = ?1",
+            [B],
+        )
+        .unwrap();
+
+    configure(
+        root,
+        "[ingest.classification]\ndefault = \"interactive\"\n\n\
+         [[ingest.classification.rules]]\npattern = '^Evidence'\nsession_type = \"automated\"\n",
+    );
+    secall(root, &["classify"]);
+
+    let stored = |id: &str| -> String {
+        db.conn()
+            .query_row(
+                "SELECT session_type FROM sessions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        (stored(A), stored(B)),
+        ("automated".into(), "automated".into())
+    );
+    let frontmatter_type = |id: &str| -> String {
+        let (path, _) = session_files(root)
+            .into_iter()
+            .find(|(_, s)| s == id)
+            .unwrap();
+        let content = fs::read_to_string(path).unwrap();
+        content
+            .lines()
+            .find_map(|line| line.strip_prefix("session_type: "))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(frontmatter_type(A), "automated");
+    assert_eq!(
+        frontmatter_type(B),
+        "interactive",
+        "the other host rewrites its own"
+    );
 }
