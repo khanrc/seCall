@@ -50,20 +50,25 @@ pub fn parse_session_frontmatter(content: &str) -> crate::error::Result<SessionF
 }
 
 /// `content` with its frontmatter's `session_type` set, or `None` when the
-/// frontmatter has no `session_type` line. The body is left as it is.
+/// frontmatter has no `session_type` line. The body and line endings are left
+/// as they are.
 pub fn with_frontmatter_session_type(content: &str, session_type: &str) -> Option<String> {
-    let front_end = "---\n".len() + content.strip_prefix("---\n")?.find("\n---")? + 1;
+    let opening = content.split_inclusive('\n').next()?;
+    if opening.trim_end() != "---" {
+        return None;
+    }
+    let front_end = opening.len() + content[opening.len()..].find("\n---")? + 1;
     let (front, body) = content.split_at(front_end);
     let mut found = false;
     let front: String = front
         .split_inclusive('\n')
         .map(|line| {
-            if !found && line.starts_with("session_type:") {
-                found = true;
-                format!("session_type: {session_type}\n")
-            } else {
-                line.to_string()
+            if found || !line.starts_with("session_type:") {
+                return line.to_string();
             }
+            found = true;
+            let eol = &line[line.trim_end_matches(['\r', '\n']).len()..];
+            format!("session_type: {session_type}{eol}")
         })
         .collect();
     found.then(|| front + body)
@@ -852,6 +857,14 @@ mod tests {
                 .session_type
                 .as_deref(),
             Some("automated")
+        );
+        assert_eq!(
+            with_frontmatter_session_type(
+                "---\r\nsession_type: interactive\r\n---\r\nbody\r\n",
+                "automated"
+            )
+            .as_deref(),
+            Some("---\r\nsession_type: automated\r\n---\r\nbody\r\n")
         );
         assert_eq!(
             with_frontmatter_session_type("---\nsession_id: s\n---\n", "automated"),
