@@ -507,22 +507,32 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
     // Turns stored by an older Markdown parser: read every other host's
     // session from its Markdown again, once.
     let reparse = db.markdown_reparse_revision()? < REPARSE_REVISION;
-    let mut refresh_failed = false;
+    // Set when a file may have been passed over for a reason that can clear
+    // (I/O, the database); the revision then waits for a complete pass.
+    let mut incomplete = false;
     let mut indexed = 0usize;
     let mut refreshed = 0usize;
     let mut replaced = 0usize;
     let mut skipped = 0usize;
 
-    for entry in walkdir::WalkDir::new(&sessions_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
-    {
+    for entry in walkdir::WalkDir::new(&sessions_dir) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to walk the vault");
+                incomplete = true;
+                continue;
+            }
+        };
+        if entry.path().extension().map(|x| x == "md") != Some(true) {
+            continue;
+        }
         let path = entry.path();
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "failed to read");
+                incomplete = true;
                 continue;
             }
         };
@@ -543,6 +553,7 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "DB check failed");
+                incomplete = true;
                 continue;
             }
         };
@@ -579,7 +590,7 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
                 Ok(MarkdownAction::Backfill) => {}
                 Err(e) => {
                     tracing::warn!(session_id = %fm.session_id, error = %e, "vault refresh failed");
-                    refresh_failed = true;
+                    incomplete = true;
                     skipped += 1;
                     continue;
                 }
@@ -658,8 +669,8 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
         }
     }
 
-    // A failed refresh keeps the older turns; the next sync reads them again.
-    if reparse && !refresh_failed {
+    // A session passed over keeps its older turns; the next sync reads them again.
+    if reparse && !incomplete {
         db.set_markdown_reparse_revision(REPARSE_REVISION)?;
     }
 
@@ -950,6 +961,28 @@ mod tests {
         assert_eq!(f.reindex(), (0, 1, 1, 0));
         assert_eq!(f.turns("sess-mac"), ["why?", "Because."]);
         assert_eq!(f.reindex(), (0, 0, 0, 1), "only once");
+    }
+
+    #[test]
+    fn reindex_vault_keeps_the_parser_revision_pending_until_every_file_is_read() {
+        let f = Fixture::new();
+        let path = f.write("2026-11-09", "sess-mac", "macbook", &[("User", "why?")]);
+        assert_eq!(f.reindex(), (1, 0, 0, 0));
+        f.db.set_markdown_reparse_revision(REPARSE_REVISION - 1)
+            .unwrap();
+
+        // A Markdown file that cannot be read: a directory by that name.
+        let unreadable = path.with_file_name("codex_log_unreadable.md");
+        std::fs::create_dir(&unreadable).unwrap();
+        f.reindex();
+        assert_eq!(
+            f.db.markdown_reparse_revision().unwrap(),
+            REPARSE_REVISION - 1
+        );
+
+        std::fs::remove_dir(&unreadable).unwrap();
+        f.reindex();
+        assert_eq!(f.db.markdown_reparse_revision().unwrap(), REPARSE_REVISION);
     }
 
     #[test]
