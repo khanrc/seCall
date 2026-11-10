@@ -158,6 +158,37 @@ fn ingest_restores_a_session_markdown_that_is_gone() {
 }
 
 #[test]
+fn auto_ingest_restores_a_session_whose_rollout_codex_archived() {
+    // Codex moves an archived thread's rollout out of `sessions/`. If the
+    // session's Markdown was lost meanwhile, that file is its only source.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let day = root.join(".codex/sessions/2026/09/13");
+    let archived = root.join(".codex/archived_sessions");
+    fs::create_dir_all(&day).unwrap();
+    fs::create_dir_all(&archived).unwrap();
+    let source = rollout(&day, A);
+    ingest(root, &source);
+    let [(path, _)] = session_files(root).try_into().unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::rename(&source, archived.join(source.file_name().unwrap())).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_secall"))
+        .args(["ingest", "--auto", "--no-semantic", "--no-embed"])
+        .env("HOME", root)
+        .env("SECALL_CONFIG_PATH", root.join("config.toml"))
+        .env("SECALL_DB_PATH", root.join("index.sqlite"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(session_files(root), vec![(path, A.to_string())]);
+}
+
+#[test]
 fn classify_rewrites_the_type_in_this_hosts_markdown() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

@@ -190,20 +190,29 @@ pub fn find_claude_sessions(base: Option<&Path>) -> Result<Vec<std::path::PathBu
     Ok(paths)
 }
 
-/// Find all Codex session files under the given base directory
+/// Find all Codex session files under the given base directory, or by
+/// default in this user's Codex home.
 pub fn find_codex_sessions(base: Option<&Path>) -> Result<Vec<std::path::PathBuf>> {
-    let default_base;
-    let base = match base {
-        Some(b) => b,
+    match base {
+        Some(base) => codex_rollouts_under(base),
         None => {
-            default_base = dirs::home_dir()
-                .ok_or_else(|| anyhow!("cannot determine home directory"))?
-                .join(".codex")
-                .join("sessions");
-            &default_base
+            let home =
+                dirs::home_dir().ok_or_else(|| anyhow!("cannot determine home directory"))?;
+            codex_home_rollouts(&home.join(".codex"))
         }
-    };
+    }
+}
 
+/// The rollouts in a Codex home. Codex moves the rollout of a thread it
+/// archives from `sessions/` to `archived_sessions/`, so one archived before a
+/// sync reached it, or after its Markdown was lost, exists only there.
+fn codex_home_rollouts(codex_home: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut paths = codex_rollouts_under(&codex_home.join("sessions"))?;
+    paths.extend(codex_rollouts_under(&codex_home.join("archived_sessions"))?);
+    Ok(paths)
+}
+
+fn codex_rollouts_under(base: &Path) -> Result<Vec<std::path::PathBuf>> {
     if !base.exists() {
         return Ok(Vec::new());
     }
@@ -401,6 +410,28 @@ mod tests {
             &[r#"{"type":"session_meta","payload":{}}"#],
         );
         assert!(detect_parser(&unknown).is_err());
+    }
+
+    #[test]
+    fn test_codex_home_rollouts_include_archived_threads() {
+        let home = tempfile::tempdir().unwrap();
+        let day = home
+            .path()
+            .join("sessions")
+            .join("2026")
+            .join("10")
+            .join("07");
+        let archived = home.path().join("archived_sessions");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::create_dir_all(&archived).unwrap();
+        let live = make_jsonl_file(&day, "rollout-live.jsonl", &["{}"]);
+        let moved = make_jsonl_file(&archived, "rollout-archived.jsonl", &["{}"]);
+
+        let mut found = codex_home_rollouts(home.path()).unwrap();
+        found.sort();
+        let mut expected = vec![live, moved];
+        expected.sort();
+        assert_eq!(found, expected);
     }
 
     #[test]
