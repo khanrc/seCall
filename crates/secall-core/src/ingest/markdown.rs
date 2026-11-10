@@ -224,7 +224,8 @@ pub fn render_session(session: &Session, tz: chrono_tz::Tz) -> String {
         // Thinking block
         if let Some(thinking) = &turn.thinking {
             let escaped = escape_dataview_fields(thinking);
-            out.push_str("> [!thinking]- Thinking\n");
+            out.push_str(THINKING_CALLOUT);
+            out.push('\n');
             for line in escaped.lines() {
                 out.push_str(&format!("> {}\n", line));
             }
@@ -284,6 +285,10 @@ pub fn render_session(session: &Session, tz: chrono_tz::Tz) -> String {
 
     out
 }
+
+/// First line of the callout that holds a turn's thinking, right under the
+/// turn header; every line of the thinking follows it behind `> `.
+pub(crate) const THINKING_CALLOUT: &str = "> [!thinking]- Thinking";
 
 /// Generate the vault-relative path for a session file
 pub fn session_vault_path(session: &Session, tz: chrono_tz::Tz) -> PathBuf {

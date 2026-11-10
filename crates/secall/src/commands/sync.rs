@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use secall_core::{
     ingest::markdown::{extract_body_text, parse_session_frontmatter, SessionFrontmatter},
-    ingest::parse_turns_from_body,
+    ingest::markdown_reparse::{parse_turns_from_body, REPARSE_REVISION},
     jobs::ProgressSink,
     search::{tokenizer::create_tokenizer, Bm25Indexer, SearchEngine},
     store::{get_default_db_path, session_repo::VaultRefresh, Database, SessionRepo},
@@ -504,21 +504,35 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
     }
 
     let local_host = gethostname::gethostname().to_string_lossy().to_string();
+    // Turns stored by an older Markdown parser: read every other host's
+    // session from its Markdown again, once.
+    let reparse = db.markdown_reparse_revision()? < REPARSE_REVISION;
+    // Set when a file may have been passed over for a reason that can clear
+    // (I/O, the database); the revision then waits for a complete pass.
+    let mut incomplete = false;
     let mut indexed = 0usize;
     let mut refreshed = 0usize;
     let mut replaced = 0usize;
     let mut skipped = 0usize;
 
-    for entry in walkdir::WalkDir::new(&sessions_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
-    {
+    for entry in walkdir::WalkDir::new(&sessions_dir) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to walk the vault");
+                incomplete = true;
+                continue;
+            }
+        };
+        if entry.path().extension().map(|x| x == "md") != Some(true) {
+            continue;
+        }
         let path = entry.path();
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "failed to read");
+                incomplete = true;
                 continue;
             }
         };
@@ -539,6 +553,7 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "DB check failed");
+                incomplete = true;
                 continue;
             }
         };
@@ -558,8 +573,8 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
                 &fm,
                 &body,
                 &vault_path,
-                path,
                 &local_host,
+                reparse,
             ) {
                 Ok(MarkdownAction::Refreshed(refresh)) => {
                     refreshed += 1;
@@ -575,6 +590,7 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
                 Ok(MarkdownAction::Backfill) => {}
                 Err(e) => {
                     tracing::warn!(session_id = %fm.session_id, error = %e, "vault refresh failed");
+                    incomplete = true;
                     skipped += 1;
                     continue;
                 }
@@ -613,8 +629,8 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
                 &fm,
                 &body,
                 &vault_path,
-                path,
                 &local_host,
+                false,
             ) {
                 tracing::warn!(session_id = %fm.session_id, error = %e, "vault snapshot failed");
             }
@@ -653,6 +669,11 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
         }
     }
 
+    // A session passed over keeps its older turns; the next sync reads them again.
+    if reparse && !incomplete {
+        db.set_markdown_reparse_revision(REPARSE_REVISION)?;
+    }
+
     Ok(ReindexResult {
         indexed,
         refreshed,
@@ -673,7 +694,8 @@ enum MarkdownAction {
 
 /// Keep a session built from another host's Markdown in step with that
 /// Markdown: record its first `(size, mtime)` snapshot, and refresh the
-/// session when the snapshot changes.
+/// session when the snapshot changes, or for every session when `reparse`
+/// (the parser changed since the stored turns were read).
 ///
 /// The other host rewrites the Markdown whenever it re-renders the session,
 /// for instance after a parser change moved turn boundaries
@@ -685,8 +707,8 @@ fn sync_foreign_markdown(
     fm: &SessionFrontmatter,
     body: &str,
     vault_path: &str,
-    md_path: &Path,
     local_host: &str,
+    reparse: bool,
 ) -> Result<MarkdownAction> {
     let Some(followed) = db.foreign_vault_path(&fm.session_id, local_host)? else {
         return Ok(MarkdownAction::Backfill);
@@ -697,23 +719,23 @@ fn sync_foreign_markdown(
     if followed != vault_path && vault_root.join(&followed).is_file() {
         return Ok(MarkdownAction::Ignore);
     }
-    let Some(current) = source_file_meta(md_path) else {
+    let Some(current) = source_file_meta(&vault_root.join(vault_path)) else {
+        // Reading it again during a reparse would find the snapshot unchanged.
+        anyhow::ensure!(!reparse, "could not stat {vault_path}");
         return Ok(MarkdownAction::Backfill);
     };
-    match db.get_source_meta(&fm.session_id)? {
-        Some(stored) if stored != current => {
-            let turns = parse_turns_from_body(body, &fm.date);
-            let refresh = db.refresh_session_from_vault(fm, body, vault_path, &turns, current)?;
-            Ok(MarkdownAction::Refreshed(refresh))
-        }
-        Some(_) => Ok(MarkdownAction::Backfill),
-        // Indexed before snapshots were recorded: start from the current
-        // Markdown instead of re-embedding every such session at once.
-        None => {
-            db.set_source_meta(&fm.session_id, current.0, current.1)?;
-            Ok(MarkdownAction::Backfill)
-        }
+    let stored = db.get_source_meta(&fm.session_id)?;
+    if reparse || stored.is_some_and(|stored| stored != current) {
+        let turns = parse_turns_from_body(body, &fm.date);
+        let refresh = db.refresh_session_from_vault(fm, body, vault_path, &turns, current)?;
+        return Ok(MarkdownAction::Refreshed(refresh));
     }
+    // Indexed before snapshots were recorded: start from the current
+    // Markdown instead of re-embedding every such session at once.
+    if stored.is_none() {
+        db.set_source_meta(&fm.session_id, current.0, current.1)?;
+    }
+    Ok(MarkdownAction::Backfill)
 }
 
 /// ingest --auto 로직 재사용
@@ -914,6 +936,55 @@ mod tests {
         );
         assert_eq!(f.reindex(), (0, 0, 0, 2));
         assert_eq!(f.turns("sess-mac"), ["list files", "One file: a.rs"]);
+    }
+
+    #[test]
+    fn reindex_vault_rereads_other_hosts_markdown_once_per_parser_revision() {
+        let f = Fixture::new();
+        let thought = "> [!thinking]- Thinking\n> weigh it\n\nBecause.";
+        f.write(
+            "2026-11-09",
+            "sess-mac",
+            "macbook",
+            &[("User", "why?"), ("Assistant", thought)],
+        );
+        assert_eq!(f.reindex(), (1, 0, 0, 0));
+        assert_eq!(f.turns("sess-mac"), ["why?", "Because."]);
+
+        // Turns an earlier parser stored, thinking and all.
+        f.db.conn()
+            .execute(
+                "UPDATE turns SET content = ?1 WHERE session_id = 'sess-mac' AND turn_index = 1",
+                [thought],
+            )
+            .unwrap();
+        f.db.set_markdown_reparse_revision(REPARSE_REVISION - 1)
+            .unwrap();
+        assert_eq!(f.reindex(), (0, 1, 1, 0));
+        assert_eq!(f.turns("sess-mac"), ["why?", "Because."]);
+        assert_eq!(f.reindex(), (0, 0, 0, 1), "only once");
+    }
+
+    #[test]
+    fn reindex_vault_keeps_the_parser_revision_pending_until_every_file_is_read() {
+        let f = Fixture::new();
+        let path = f.write("2026-11-09", "sess-mac", "macbook", &[("User", "why?")]);
+        assert_eq!(f.reindex(), (1, 0, 0, 0));
+        f.db.set_markdown_reparse_revision(REPARSE_REVISION - 1)
+            .unwrap();
+
+        // A Markdown file that cannot be read: a directory by that name.
+        let unreadable = path.with_file_name("codex_log_unreadable.md");
+        std::fs::create_dir(&unreadable).unwrap();
+        f.reindex();
+        assert_eq!(
+            f.db.markdown_reparse_revision().unwrap(),
+            REPARSE_REVISION - 1
+        );
+
+        std::fs::remove_dir(&unreadable).unwrap();
+        f.reindex();
+        assert_eq!(f.db.markdown_reparse_revision().unwrap(), REPARSE_REVISION);
     }
 
     #[test]

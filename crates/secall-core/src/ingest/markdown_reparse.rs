@@ -8,8 +8,16 @@
 //! Used by `reindex_vault` so vault-pulled sessions gain `turns` rows
 //! (and therefore vector embeddings via the `secall embed` backfill).
 
+use crate::ingest::markdown::THINKING_CALLOUT;
 use crate::ingest::types::{Role, Turn};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+
+/// Revision of the turns [`parse_turns_from_body`] reads from Markdown. Bump it
+/// when a change alters the turns read from existing Markdown: `secall sync`
+/// then refreshes every other host's session from its Markdown once.
+///
+/// 1: thinking callouts leave turn content.
+pub const REPARSE_REVISION: u32 = 1;
 
 fn role_from_str(s: &str) -> Option<Role> {
     match s {
@@ -61,6 +69,28 @@ fn build_timestamp(date: &str, hhmm: &Option<String>) -> Option<DateTime<Utc>> {
     Some(Utc.from_utc_datetime(&nt))
 }
 
+/// A turn's lines as `(thinking, content)`. The renderer puts the thinking
+/// callout first; it is not content, which ingest indexes and embeds (#1585).
+fn split_thinking(lines: &[String]) -> (Option<String>, String) {
+    let first = lines.iter().position(|line| !line.trim().is_empty());
+    let Some(callout) = first.filter(|&i| lines[i] == THINKING_CALLOUT) else {
+        return (None, lines.join("\n").trim().to_string());
+    };
+    // The callout runs through its `>` lines; a blank line closes it.
+    let body = &lines[callout + 1..];
+    let end = body
+        .iter()
+        .position(|line| !line.starts_with('>'))
+        .unwrap_or(body.len());
+    let thinking = body[..end]
+        .iter()
+        .map(|line| line.strip_prefix("> ").unwrap_or(&line[1..]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = body[end..].join("\n").trim().to_string();
+    (Some(thinking), content)
+}
+
 /// Parse the markdown body (everything after frontmatter) into turns.
 /// `date` is the frontmatter `date` (YYYY-MM-DD); pass "" to skip timestamps.
 pub fn parse_turns_from_body(body: &str, date: &str) -> Vec<Turn> {
@@ -71,7 +101,7 @@ pub fn parse_turns_from_body(body: &str, date: &str) -> Vec<Turn> {
     let flush = |turns: &mut Vec<Turn>,
                  cur: Option<(u32, Role, Option<String>, Vec<String>)>| {
         if let Some((num, role, time, lines)) = cur {
-            let content = lines.join("\n").trim().to_string();
+            let (thinking, content) = split_thinking(&lines);
             turns.push(Turn {
                 index: num.saturating_sub(1),
                 role,
@@ -79,7 +109,7 @@ pub fn parse_turns_from_body(body: &str, date: &str) -> Vec<Turn> {
                 content,
                 actions: Vec::new(),
                 tokens: None,
-                thinking: None,
+                thinking,
                 is_sidechain: false,
             });
         }
@@ -155,6 +185,100 @@ Continued assistant turn.
         assert!(!turns[0].content.contains("Turn 2"));
         // assistant body content is captured (callout lines may be folded into content)
         assert!(turns[1].content.contains("Here is how."));
+    }
+
+    #[test]
+    fn thinking_callout_is_not_content() {
+        let turns = parse_turns_from_body(SAMPLE, "2026-06-24");
+        assert_eq!(turns[1].thinking.as_deref(), Some("Let me consider."));
+        assert!(turns[1].content.starts_with("Here is how."));
+        assert!(!turns[1].content.contains("[!thinking]"));
+        assert_eq!(turns[0].thinking, None);
+    }
+
+    #[test]
+    fn a_turn_of_thinking_alone_has_no_content() {
+        let body = "## Turn 1 — Assistant (05:30)\n\n> [!thinking]- Thinking\n\n\
+                    ## Turn 2 — Assistant (05:31)\n\n> [!thinking]- Thinking\n> step one\n> \n> step two\n";
+        let turns = parse_turns_from_body(body, "2026-06-24");
+        assert_eq!(turns[0].content, "");
+        assert_eq!(turns[0].thinking.as_deref(), Some(""));
+        assert_eq!(turns[1].content, "");
+        assert_eq!(turns[1].thinking.as_deref(), Some("step one\n\nstep two"));
+    }
+
+    #[test]
+    fn content_quoting_a_callout_stays_content() {
+        // The callout counts only as the turn's first line; a quote after it
+        // and a callout further down are content.
+        let body = "## Turn 1 — User (05:30)\n\nSee this:\n\n> [!thinking]- Thinking\n> pasted\n";
+        let turns = parse_turns_from_body(body, "2026-06-24");
+        assert_eq!(turns[0].thinking, None);
+        assert!(turns[0].content.contains("> pasted"));
+
+        let body =
+            "## Turn 1 — Assistant (05:30)\n\n> [!thinking]- Thinking\n> plan\n\n> quoted reply\n";
+        let turns = parse_turns_from_body(body, "2026-06-24");
+        assert_eq!(turns[0].thinking.as_deref(), Some("plan"));
+        assert_eq!(turns[0].content, "> quoted reply");
+    }
+
+    #[test]
+    fn rendered_turns_read_back_without_their_thinking() {
+        use crate::ingest::markdown::{extract_body_text, render_session};
+        use crate::ingest::{AgentKind, Session, TokenUsage};
+
+        let turn = |index, role, content: &str, thinking: Option<&str>| Turn {
+            index,
+            role,
+            timestamp: None,
+            content: content.to_string(),
+            actions: Vec::new(),
+            tokens: None,
+            thinking: thinking.map(str::to_string),
+            is_sidechain: false,
+        };
+        let session = Session {
+            id: "s".to_string(),
+            agent: AgentKind::ClaudeCode,
+            model: None,
+            project: None,
+            cwd: None,
+            git_branch: None,
+            host: None,
+            start_time: Utc::now(),
+            end_time: None,
+            turns: vec![
+                turn(0, Role::User, "why?", None),
+                turn(
+                    1,
+                    Role::Assistant,
+                    "Because.",
+                    Some("Weigh it.\n\nThen answer."),
+                ),
+                turn(2, Role::Assistant, "", Some("")),
+            ],
+            total_tokens: TokenUsage::default(),
+            session_type: "interactive".to_string(),
+            archived: false,
+            archived_at: None,
+        };
+        let md = render_session(&session, chrono_tz::Tz::UTC);
+        let read: Vec<_> = parse_turns_from_body(&extract_body_text(&md), "")
+            .into_iter()
+            .map(|t| (t.content, t.thinking))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("why?".to_string(), None),
+                (
+                    "Because.".to_string(),
+                    Some("Weigh it.\n\nThen answer.".to_string())
+                ),
+                (String::new(), Some(String::new())),
+            ]
+        );
     }
 
     #[test]
