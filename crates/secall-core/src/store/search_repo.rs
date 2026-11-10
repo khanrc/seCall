@@ -2,8 +2,16 @@ use crate::error::{Result, SecallError};
 use crate::search::bm25::{FtsRow, SearchFilters};
 use crate::store::db::Database;
 
+/// Deletes a session's FTS rows by the rowids `turns_fts_rows` lists for it.
+pub(crate) const DELETE_SESSION_FTS: &str = "DELETE FROM turns_fts WHERE rowid IN
+     (SELECT fts_rowid FROM turns_fts_rows WHERE session_id = ?1)";
+
 pub trait SearchRepo {
+    /// Add one FTS row to `session_id`. A vault-built session's whole-body
+    /// row uses `turn_index` 0.
     fn insert_fts(&self, tokenized_content: &str, session_id: &str, turn_index: u32) -> Result<()>;
+    /// Remove every FTS row of `session_id`.
+    fn delete_session_fts(&self, session_id: &str) -> Result<()>;
     fn search_fts(
         &self,
         tokenized_query: &str,
@@ -20,12 +28,34 @@ impl SearchRepo for Database {
         session_id: &str,
         turn_index: u32,
     ) -> crate::error::Result<()> {
-        self.conn().execute(
-            // FTS5 컬럼명 turn_id는 유지 (스키마 변경 최소화). 저장값은 실제 turn_index.
-            "INSERT INTO turns_fts(content, session_id, turn_id) VALUES (?1, ?2, ?3)",
-            rusqlite::params![tokenized_content, session_id, turn_index as i64],
-        )?;
-        Ok(())
+        // An FTS row missing from turns_fts_rows could never be deleted by
+        // session, so the two inserts land together.
+        self.with_savepoint(|| {
+            self.conn().execute(
+                // FTS5 컬럼명 turn_id는 유지 (스키마 변경 최소화). 저장값은 실제 turn_index.
+                "INSERT INTO turns_fts(content, session_id, turn_id) VALUES (?1, ?2, ?3)",
+                rusqlite::params![tokenized_content, session_id, turn_index as i64],
+            )?;
+            // REPLACE: a binary that predates turns_fts_rows deletes FTS rows
+            // without their listing, and FTS5 can reuse a freed rowid. The row
+            // just inserted owns it.
+            self.conn().execute(
+                "INSERT OR REPLACE INTO turns_fts_rows(fts_rowid, session_id) VALUES (?1, ?2)",
+                rusqlite::params![self.conn().last_insert_rowid(), session_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn delete_session_fts(&self, session_id: &str) -> crate::error::Result<()> {
+        self.with_savepoint(|| {
+            self.conn().execute(DELETE_SESSION_FTS, [session_id])?;
+            self.conn().execute(
+                "DELETE FROM turns_fts_rows WHERE session_id = ?1",
+                [session_id],
+            )?;
+            Ok(())
+        })
     }
 
     fn search_fts(

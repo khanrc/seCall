@@ -6,6 +6,7 @@ use crate::error::{Result, SecallError};
 use crate::ingest::{is_injected_user_context, Session, Turn};
 use crate::search::bm25::SessionMeta;
 use crate::store::db::{Database, SessionMeta as WikiSessionMeta, TurnRow};
+use crate::store::search_repo::SearchRepo;
 
 /// (id, project, summary, turn_count, tools_used, session_type)
 pub type DailySessionRow = (
@@ -392,11 +393,7 @@ impl Database {
     pub fn delete_session_full(&self, session_id: &str) -> Result<()> {
         self.with_transaction(|| {
             self.delete_session_vectors(session_id)?;
-            // FTS5 행 삭제 (turns 삭제 전에 수행 — session_id로 매칭)
-            self.conn().execute(
-                "DELETE FROM turns_fts WHERE session_id = ?1",
-                rusqlite::params![session_id],
-            )?;
+            self.delete_session_fts(session_id)?;
             self.conn().execute(
                 "DELETE FROM turns WHERE session_id = ?1",
                 rusqlite::params![session_id],
@@ -564,10 +561,7 @@ impl Database {
 
         // FTS 인덱싱 — 본문 전체를 하나의 청크로
         if !body_text.trim().is_empty() {
-            self.conn().execute(
-                "INSERT INTO turns_fts(content, session_id, turn_id) VALUES (?1, ?2, 0)",
-                rusqlite::params![body_text, fm.session_id],
-            )?;
+            self.insert_fts(body_text, &fm.session_id, 0)?;
         }
 
         Ok(())
@@ -664,13 +658,9 @@ impl Database {
                 VaultRefresh::TurnsReplaced
             };
 
-            self.conn()
-                .execute("DELETE FROM turns_fts WHERE session_id = ?1", [id])?;
+            self.delete_session_fts(id)?;
             if !body_text.trim().is_empty() {
-                self.conn().execute(
-                    "INSERT INTO turns_fts(content, session_id, turn_id) VALUES (?1, ?2, 0)",
-                    rusqlite::params![body_text, id],
-                )?;
+                self.insert_fts(body_text, id, 0)?;
             }
 
             // Favorites, notes, tags, and classification belong to this host
@@ -2056,6 +2046,22 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(fts, ["new body"]);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM turns_fts_rows r JOIN turns_fts f ON f.rowid = r.fts_rowid
+                 WHERE r.session_id = 'sess-mac' AND f.content = 'new body'"
+            ),
+            1,
+            "turns_fts_rows lists the new body row and nothing else"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM turns_fts_rows WHERE session_id = 'sess-mac'"
+            ),
+            1
+        );
         assert_eq!(db.get_source_meta("sess-mac").unwrap(), Some((10, 20)));
     }
 

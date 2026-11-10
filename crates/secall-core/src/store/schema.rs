@@ -1,4 +1,4 @@
-pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+pub const CURRENT_SCHEMA_VERSION: u32 = 15;
 
 pub const CREATE_SESSIONS: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS turns (
 );
 ";
 
+/// Write and delete `turns_fts` rows only through `SearchRepo::insert_fts` and
+/// `SearchRepo::delete_session_fts`, which keep [`CREATE_TURNS_FTS_ROWS`] in step.
 pub const CREATE_TURNS_FTS: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
     content,
@@ -56,6 +58,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
     turn_id UNINDEXED,
     tokenize='unicode61'
 );
+";
+
+/// The session of each `turns_fts` row, by FTS rowid.
+///
+/// FTS5 can't index the UNINDEXED `session_id` column, so
+/// `DELETE FROM turns_fts WHERE session_id = ?` reads every row's content.
+/// Deleting by the rowids listed here is a lookup instead. Triggers can't be
+/// created on a virtual table, so the code that writes `turns_fts` also writes
+/// this table.
+pub const CREATE_TURNS_FTS_ROWS: &str = "
+CREATE TABLE IF NOT EXISTS turns_fts_rows (
+    fts_rowid   INTEGER PRIMARY KEY,
+    session_id  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turns_fts_rows_session ON turns_fts_rows(session_id);
 ";
 
 pub const CREATE_INGEST_LOG: &str = "
