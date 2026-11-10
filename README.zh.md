@@ -701,6 +701,7 @@ secall serve --port 8080 --allow-config-edit
 | `secall model download\|info\|check` | ONNX 模型管理 |
 | `secall reindex --from-vault` | 从 vault 重建 DB |
 | `secall migrate summary` | 批量补齐 summary frontmatter |
+| `secall migrate filenames [--dry-run]` | 将会话文件名改为完整 session id，并更新 index |
 
 ## MCP 集成
 

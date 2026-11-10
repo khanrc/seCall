@@ -273,11 +273,23 @@ pub fn session_vault_path(session: &Session, tz: chrono_tz::Tz) -> PathBuf {
     crate::vault::sessions_reldir().join(date).join(filename)
 }
 
+/// `{agent}_{project}_{session id}.md`. The whole id, because Codex ids are
+/// UUIDv7: their first 8 characters are the start time's top 32 bits, which
+/// sessions started within about a minute share.
 fn session_filename(session: &Session) -> String {
     let agent = session.agent.as_str();
-    let raw_project = session.project.as_deref().unwrap_or("unknown");
-    let sanitized: String = raw_project
-        .chars()
+    let sanitized = filename_safe(session.project.as_deref().unwrap_or("unknown"));
+    let project = if sanitized.starts_with('.') {
+        format!("_{sanitized}")
+    } else {
+        sanitized
+    };
+    let id = filename_safe(&session.id);
+    format!("{agent}_{project}_{id}.md")
+}
+
+fn filename_safe(part: &str) -> String {
+    part.chars()
         .map(|c| {
             if c == '/' || c == '\\' || c == '\0' {
                 '_'
@@ -285,19 +297,22 @@ fn session_filename(session: &Session) -> String {
                 c
             }
         })
-        .collect();
-    let project = if sanitized.starts_with('.') {
-        format!("_{sanitized}")
-    } else {
-        sanitized
-    };
-    let project = project.as_str();
-    let id_prefix = if session.id.len() >= 8 {
-        &session.id[..8]
-    } else {
-        &session.id
-    };
-    format!("{agent}_{project}_{id_prefix}.md")
+        .collect()
+}
+
+/// The name [`session_vault_path`] now gives the session in file `name`,
+/// which an earlier release named after the first 8 characters of
+/// `session_id`. `None` when `name` does not end in that prefix, including
+/// when it already ends in the whole id.
+pub fn full_id_filename(name: &str, session_id: &str) -> Option<String> {
+    let id = filename_safe(session_id);
+    let stem = name.strip_suffix(".md")?;
+    if stem.ends_with(&format!("_{id}")) {
+        return None;
+    }
+    let prefix = session_id.get(..8).unwrap_or(session_id);
+    let base = stem.strip_suffix(prefix)?.strip_suffix('_')?;
+    Some(format!("{base}_{id}.md"))
 }
 
 fn escape_yaml_string(s: &str) -> String {
@@ -548,9 +563,43 @@ mod tests {
         let session = make_session(vec![]);
         let path = session_vault_path(&session, chrono_tz::Tz::UTC);
         let path_str = path.to_string_lossy().replace('\\', "/");
-        assert!(path_str.starts_with("raw/.sessions/2026-04-05/"));
-        assert!(path_str.contains("claude-code_seCall_a1b2c3d"));
-        assert!(path_str.ends_with(".md"));
+        assert_eq!(
+            path_str,
+            "raw/.sessions/2026-04-05/claude-code_seCall_a1b2c3d4-e5f6-7890-abcd-ef1234567890.md"
+        );
+    }
+
+    #[test]
+    fn codex_sessions_started_within_a_minute_get_their_own_files() {
+        // UUIDv7 ids of sessions started 30s apart share their first 8 characters.
+        let mut first = make_session(vec![]);
+        first.agent = AgentKind::Codex;
+        first.id = "019dc309-1a2b-7c3d-8e4f-000000000001".to_string();
+        let mut second = first.clone();
+        second.id = "019dc309-9f00-7aaa-bbbb-000000000002".to_string();
+
+        assert_ne!(
+            session_vault_path(&first, chrono_tz::Tz::UTC),
+            session_vault_path(&second, chrono_tz::Tz::UTC)
+        );
+    }
+
+    #[test]
+    fn full_id_filename_renames_only_names_ending_in_the_id_prefix() {
+        let id = "019dc309-1a2b-7c3d-8e4f-000000000001";
+        assert_eq!(
+            full_id_filename("codex_log_019dc309.md", id).as_deref(),
+            Some("codex_log_019dc309-1a2b-7c3d-8e4f-000000000001.md")
+        );
+        // Already renamed.
+        assert_eq!(
+            full_id_filename("codex_log_019dc309-1a2b-7c3d-8e4f-000000000001.md", id),
+            None
+        );
+        // Another session's file, or not a session file name at all.
+        assert_eq!(full_id_filename("codex_log_77aa0000.md", id), None);
+        assert_eq!(full_id_filename("019dc309.md", id), None);
+        assert_eq!(full_id_filename("codex_log_019dc309.txt", id), None);
     }
 
     #[test]
