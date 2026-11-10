@@ -211,3 +211,41 @@ fn classify_rewrites_the_type_in_this_hosts_markdown() {
         "the other host rewrites its own"
     );
 }
+
+#[test]
+fn classify_rewrites_markdown_left_behind_by_a_database_only_reclassify() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    ingest(root, &rollout(root, A));
+    let (path, _) = session_files(root)
+        .into_iter()
+        .find(|(_, s)| s == A)
+        .unwrap();
+    let rendered = fs::read_to_string(&path).unwrap();
+    // What a classify that changed only the database left behind.
+    let db = Database::open(&root.join("index.sqlite")).unwrap();
+    db.conn()
+        .execute(
+            "UPDATE sessions SET session_type = 'automated' WHERE id = ?1",
+            [A],
+        )
+        .unwrap();
+    configure(
+        root,
+        "[ingest.classification]\ndefault = \"interactive\"\n\n\
+         [[ingest.classification.rules]]\npattern = '^Evidence'\nsession_type = \"automated\"\n",
+    );
+
+    secall(root, &["classify", "--dry-run"]);
+    assert_eq!(fs::read_to_string(&path).unwrap(), rendered);
+    secall(root, &["classify"]);
+
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        rendered.replace(
+            "\nsession_type: interactive\n",
+            "\nsession_type: automated\n"
+        )
+    );
+    assert!(rendered.contains("\nsession_type: interactive\n"));
+}
