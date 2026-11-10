@@ -112,6 +112,12 @@ pub struct EmbeddingConfig {
     pub max_chunk_tokens: Option<usize>,
     /// Optional override for token overlap between adjacent chunks.
     pub overlap_tokens: Option<usize>,
+    /// Embed sessions classified `automated`. Off by default: recall leaves
+    /// them out unless asked, so their vectors would cost embed time and
+    /// storage without serving a default search. With it off, `secall embed`
+    /// also removes the vectors they already have; keyword search still finds
+    /// them.
+    pub include_automated: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -387,6 +393,18 @@ impl Default for EmbeddingConfig {
             cloud_api_key: None,
             max_chunk_tokens: None,
             overlap_tokens: None,
+            include_automated: false,
+        }
+    }
+}
+
+impl EmbeddingConfig {
+    /// The session types that get no vectors.
+    pub fn skipped_session_types(&self) -> Vec<String> {
+        if self.include_automated {
+            Vec::new()
+        } else {
+            vec![crate::ingest::AUTOMATED_SESSION_TYPE.to_string()]
         }
     }
 }
@@ -675,6 +693,16 @@ mod tests {
         let mut config = Config::default();
         config.output.timezone = "INVALID/TZ".to_string();
         assert_eq!(config.timezone(), chrono_tz::Tz::UTC);
+    }
+
+    #[test]
+    fn test_embedding_skips_automated_unless_included() {
+        let default: Config = toml::from_str("[embedding]\nbackend = \"ort\"\n").unwrap();
+        assert_eq!(default.embedding.skipped_session_types(), vec!["automated"]);
+
+        let including: Config =
+            toml::from_str("[embedding]\nbackend = \"ort\"\ninclude_automated = true\n").unwrap();
+        assert!(including.embedding.skipped_session_types().is_empty());
     }
 
     #[test]

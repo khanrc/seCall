@@ -3,6 +3,12 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// The `session_type` of sessions no person drove, such as scheduled jobs and
+/// agents another tool launched. Recall leaves them out unless asked, and
+/// `secall embed` gives them no vectors unless `[embedding] include_automated`
+/// is set.
+pub const AUTOMATED_SESSION_TYPE: &str = "automated";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AgentKind {
     ClaudeCode,

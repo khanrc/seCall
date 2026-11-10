@@ -652,6 +652,7 @@ secall serve --port 8080 --allow-config-edit
 | `embedding.pool_size` | ORT session pool サイズ (未設定 = RAM ベース自動) | `null` |
 | `embedding.cloud_host` | Ollama Cloud API ホスト | `https://ollama.com` |
 | `embedding.cloud_model` | Ollama Cloud embedding モデル名 | `null` |
+| `embedding.include_automated` | `automated` セッションもエンベディング (オフ時は `secall embed` が既存ベクトルも削除、キーワード検索は維持) | `false` |
 | `output.timezone` | タイムゾーン (IANA) | `UTC` |
 | `ingest.classification.default` | 分類ルール未マッチ時のデフォルト session_type | `interactive` |
 | `ingest.classification.skip_embed_types` | エンベディングをスキップする session_type 一覧 | `[]` |

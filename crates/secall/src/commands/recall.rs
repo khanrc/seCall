@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use secall_core::{
+    ingest::AUTOMATED_SESSION_TYPE,
     search::hybrid::parse_temporal_filter,
     search::query_expand::expand_query,
     search::tokenizer::create_tokenizer,
@@ -55,7 +56,7 @@ pub async fn run(
     let exclude_session_types = if include_automated {
         vec![]
     } else {
-        vec!["automated".to_string()]
+        vec![AUTOMATED_SESSION_TYPE.to_string()]
     };
 
     // graph_filter: --topic, --file, --issue 중 첫 번째 지정된 것 적용

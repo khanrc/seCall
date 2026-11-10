@@ -14,7 +14,7 @@ pub use markdown_reparse::parse_turns_from_body;
 pub mod opencode;
 pub mod types;
 
-pub use types::{Action, AgentKind, Role, Session, TokenUsage, Turn};
+pub use types::{Action, AgentKind, Role, Session, TokenUsage, Turn, AUTOMATED_SESSION_TYPE};
 
 /// P49: secall 이 Claude Code 를 invoke 해 세션 요약을 생성할 때 던지는 프롬프트
 /// prefix. 변경 시 wiki 등 생성 코드와 함께 갱신할 것.
