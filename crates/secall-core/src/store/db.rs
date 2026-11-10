@@ -5,6 +5,7 @@ use rusqlite::Connection;
 use crate::error::Result;
 #[cfg(test)]
 use crate::error::SecallError;
+use crate::store::search_repo::SearchRepo;
 
 use super::schema::{
     CREATE_CONFIG, CREATE_GRAPH_EDGES, CREATE_GRAPH_INDEXES, CREATE_GRAPH_NODES, CREATE_INDEXES,
@@ -217,17 +218,12 @@ impl Database {
                 .execute_batch(super::deferred_source_repo::CREATE_DEFERRED_SOURCES)?;
         }
         if current < 15 {
-            // List the session of every FTS row written before the table
-            // existed. One pass over turns_fts; the FTS index is unchanged.
-            // Re-running after an interrupted migration is harmless. Guarded
-            // on turns_fts existing, like the v12 and v13 steps.
+            // List the FTS rows written before the table existed. The FTS
+            // index is unchanged. Guarded on turns_fts existing, like the v12
+            // and v13 steps.
             self.conn.execute_batch(CREATE_TURNS_FTS_ROWS)?;
             if self.table_exists("turns_fts")? {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO turns_fts_rows(fts_rowid, session_id)
-                     SELECT rowid, session_id FROM turns_fts",
-                    [],
-                )?;
+                self.list_unlisted_fts_rows()?;
             }
         }
         if current < CURRENT_SCHEMA_VERSION {
@@ -292,14 +288,17 @@ impl Database {
     }
 
     /// Execute a closure as one unit, inside or outside a transaction.
-    /// Releases the savepoint on Ok, rolls back to it on Err.
     ///
-    /// Unlike [`Self::with_transaction`] it nests, so a helper whose writes
-    /// must land together can use it whatever its caller has open.
-    pub(crate) fn with_savepoint<F, T>(&self, f: F) -> Result<T>
+    /// With no transaction open this is [`Self::with_transaction`]; a deferred
+    /// one could fail to become a writer. Inside one it is a savepoint, so on
+    /// Err only the closure's writes roll back.
+    pub(crate) fn with_nested_transaction<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce() -> Result<T>,
     {
+        if self.conn.is_autocommit() {
+            return self.with_transaction(f);
+        }
         self.conn.execute_batch("SAVEPOINT secall_unit")?;
         match f() {
             Ok(val) => {
@@ -1093,7 +1092,6 @@ mod tests {
 
     #[test]
     fn test_migration_to_v15_lists_existing_fts_rows() {
-        use crate::store::SearchRepo;
         let db = Database::open_memory().unwrap();
         // A v14 index: FTS rows and no listing.
         db.conn()
@@ -1123,7 +1121,6 @@ mod tests {
 
     #[test]
     fn test_insert_and_delete_session_fts_keep_the_listing_in_step() {
-        use crate::store::SearchRepo;
         let db = Database::open_memory().unwrap();
         db.insert_fts("one", "sess-a", 0).unwrap();
         db.insert_fts("two", "sess-b", 0).unwrap();
@@ -1147,7 +1144,6 @@ mod tests {
 
     #[test]
     fn test_insert_fts_takes_over_a_stale_listing_of_its_rowid() {
-        use crate::store::SearchRepo;
         let db = Database::open_memory().unwrap();
         db.insert_fts("old", "sess-old", 0).unwrap();
         let (old_rows, _) = fts_rows_and_listing(&db);
@@ -1162,6 +1158,50 @@ mod tests {
         let (fts, listed) = fts_rows_and_listing(&db);
         assert_eq!(fts, [(old_rows[0].0, "sess-new".to_string())]);
         assert_eq!(listed, fts);
+    }
+
+    #[test]
+    fn test_unlisted_fts_rows_are_listed_and_then_deletable() {
+        let db = Database::open_memory().unwrap();
+        db.insert_fts("listed", "sess-a", 0).unwrap();
+        // Written by a binary that predates the listing.
+        db.conn()
+            .execute(
+                "INSERT INTO turns_fts(content, session_id, turn_id) VALUES ('stale', 'sess-a', 0)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(db.list_unlisted_fts_rows().unwrap(), 1);
+        assert_eq!(db.list_unlisted_fts_rows().unwrap(), 0);
+        db.delete_session_fts("sess-a").unwrap();
+        assert_eq!(fts_rows_and_listing(&db), (vec![], vec![]));
+    }
+
+    #[test]
+    fn test_delete_session_fts_spares_a_row_listed_under_another_session() {
+        let db = Database::open_memory().unwrap();
+        db.insert_fts("a", "sess-a", 0).unwrap();
+        db.insert_fts("b", "sess-b", 0).unwrap();
+        // A stale listing: sess-b's row recorded as sess-a's.
+        db.conn()
+            .execute(
+                "UPDATE turns_fts_rows SET session_id = 'sess-a' WHERE session_id = 'sess-b'",
+                [],
+            )
+            .unwrap();
+
+        db.delete_session_fts("sess-a").unwrap();
+
+        let (fts, listed) = fts_rows_and_listing(&db);
+        assert_eq!(
+            fts.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>(),
+            ["sess-b"]
+        );
+        // The stale entry went with sess-a's, so the next pass lists the row right.
+        assert!(listed.is_empty());
+        db.list_unlisted_fts_rows().unwrap();
+        assert_eq!(fts_rows_and_listing(&db).1, fts);
     }
 
     #[test]
@@ -1188,34 +1228,42 @@ mod tests {
         assert!(fts_step.ends_with(":="), "full scan of turns_fts: {plan:?}");
     }
 
+    fn config_keys(db: &Database) -> Vec<String> {
+        db.conn()
+            .prepare("SELECT key FROM config WHERE key IN ('kept', 'dropped') ORDER BY key")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
     #[test]
-    fn test_with_savepoint_rolls_back_only_its_own_writes() {
+    fn test_with_nested_transaction_rolls_back_only_its_own_writes() {
         let db = Database::open_memory().unwrap();
         let set = |key: &str| -> Result<()> {
             db.conn()
                 .execute("INSERT INTO config(key, value) VALUES (?1, 'x')", [key])?;
             Ok(())
         };
+        let fail = || -> Result<()> {
+            set("dropped")?;
+            Err(SecallError::Search("boom".into()))
+        };
+
+        // On its own it is a transaction of its own.
+        assert!(db.with_nested_transaction(fail).is_err());
+        assert!(db.conn().is_autocommit());
+        assert!(config_keys(&db).is_empty());
+
+        // Inside a transaction it undoes only its own writes.
         db.with_transaction(|| {
             set("kept")?;
-            let failed = db.with_savepoint(|| -> Result<()> {
-                set("dropped")?;
-                Err(SecallError::Search("boom".into()))
-            });
-            assert!(failed.is_err());
+            assert!(db.with_nested_transaction(fail).is_err());
             Ok(())
         })
         .unwrap();
-
-        let keys: Vec<String> = db
-            .conn()
-            .prepare("SELECT key FROM config WHERE key IN ('kept', 'dropped')")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(keys, ["kept"]);
+        assert_eq!(config_keys(&db), ["kept"]);
     }
 
     #[test]

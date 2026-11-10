@@ -3,15 +3,23 @@ use crate::search::bm25::{FtsRow, SearchFilters};
 use crate::store::db::Database;
 
 /// Deletes a session's FTS rows by the rowids `turns_fts_rows` lists for it.
-pub(crate) const DELETE_SESSION_FTS: &str = "DELETE FROM turns_fts WHERE rowid IN
-     (SELECT fts_rowid FROM turns_fts_rows WHERE session_id = ?1)";
+/// The `session_id` check keeps a listing that went stale under an older
+/// binary from deleting another session's row.
+pub(crate) const DELETE_SESSION_FTS: &str = "DELETE FROM turns_fts
+     WHERE rowid IN (SELECT fts_rowid FROM turns_fts_rows WHERE session_id = ?1)
+       AND session_id = ?1";
 
 pub trait SearchRepo {
     /// Add one FTS row to `session_id`. A vault-built session's whole-body
     /// row uses `turn_index` 0.
     fn insert_fts(&self, tokenized_content: &str, session_id: &str, turn_index: u32) -> Result<()>;
-    /// Remove every FTS row of `session_id`.
+    /// Remove every FTS row of `session_id` that `turns_fts_rows` lists.
     fn delete_session_fts(&self, session_id: &str) -> Result<()>;
+    /// List the FTS rows missing from `turns_fts_rows`, and return how many.
+    ///
+    /// A binary from before the listing writes FTS rows without it, and
+    /// [`Self::delete_session_fts`] can't find those. Reads every FTS row once.
+    fn list_unlisted_fts_rows(&self) -> Result<usize>;
     fn search_fts(
         &self,
         tokenized_query: &str,
@@ -30,7 +38,7 @@ impl SearchRepo for Database {
     ) -> crate::error::Result<()> {
         // An FTS row missing from turns_fts_rows could never be deleted by
         // session, so the two inserts land together.
-        self.with_savepoint(|| {
+        self.with_nested_transaction(|| {
             self.conn().execute(
                 // FTS5 컬럼명 turn_id는 유지 (스키마 변경 최소화). 저장값은 실제 turn_index.
                 "INSERT INTO turns_fts(content, session_id, turn_id) VALUES (?1, ?2, ?3)",
@@ -48,7 +56,7 @@ impl SearchRepo for Database {
     }
 
     fn delete_session_fts(&self, session_id: &str) -> crate::error::Result<()> {
-        self.with_savepoint(|| {
+        self.with_nested_transaction(|| {
             self.conn().execute(DELETE_SESSION_FTS, [session_id])?;
             self.conn().execute(
                 "DELETE FROM turns_fts_rows WHERE session_id = ?1",
@@ -56,6 +64,15 @@ impl SearchRepo for Database {
             )?;
             Ok(())
         })
+    }
+
+    fn list_unlisted_fts_rows(&self) -> crate::error::Result<usize> {
+        Ok(self.conn().execute(
+            "INSERT INTO turns_fts_rows(fts_rowid, session_id)
+             SELECT rowid, session_id FROM turns_fts
+             WHERE rowid NOT IN (SELECT fts_rowid FROM turns_fts_rows)",
+            [],
+        )?)
     }
 
     fn search_fts(
