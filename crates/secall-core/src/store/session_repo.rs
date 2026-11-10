@@ -594,6 +594,28 @@ impl Database {
         Ok(path)
     }
 
+    /// The [`crate::ingest::markdown_reparse::REPARSE_REVISION`] that sessions
+    /// from other hosts' Markdown were last read with; 0 before any.
+    pub fn markdown_reparse_revision(&self) -> Result<u32> {
+        let value: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT value FROM config WHERE key = 'markdown_reparse_revision'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(value.and_then(|v| v.parse().ok()).unwrap_or(0))
+    }
+
+    pub fn set_markdown_reparse_revision(&self, revision: u32) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO config(key, value) VALUES ('markdown_reparse_revision', ?1)",
+            [revision.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Record the snapshot of the local source file ingest just processed.
     ///
     /// A row first built from vault Markdown becomes an ingested row here, so
