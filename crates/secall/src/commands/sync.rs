@@ -6,7 +6,7 @@ use secall_core::{
     ingest::markdown_reparse::{parse_turns_from_body, REPARSE_REVISION},
     jobs::ProgressSink,
     search::{tokenizer::create_tokenizer, Bm25Indexer, SearchEngine},
-    store::{get_default_db_path, session_repo::VaultRefresh, Database, SessionRepo},
+    store::{get_default_db_path, session_repo::VaultRefresh, Database, SearchRepo, SessionRepo},
     vault::{git::VaultGit, Config, Vault},
 };
 
@@ -694,8 +694,9 @@ enum MarkdownAction {
 
 /// Keep a session built from another host's Markdown in step with that
 /// Markdown: record its first `(size, mtime)` snapshot, and refresh the
-/// session when the snapshot changes, or for every session when `reparse`
-/// (the parser changed since the stored turns were read).
+/// session when the snapshot changes, when it has no FTS row, or for every
+/// session when `reparse` (the parser changed since the stored turns were
+/// read).
 ///
 /// The other host rewrites the Markdown whenever it re-renders the session,
 /// for instance after a parser change moved turn boundaries
@@ -725,7 +726,11 @@ fn sync_foreign_markdown(
         return Ok(MarkdownAction::Backfill);
     };
     let stored = db.get_source_meta(&fm.session_id)?;
-    if reparse || stored.is_some_and(|stored| stored != current) {
+    // An import that stopped after the session row leaves it out of keyword
+    // search: a binary from before schema v15 fails there once another
+    // process has renamed the FTS table.
+    let fts_missing = !body.trim().is_empty() && !db.has_fts_rows(&fm.session_id)?;
+    if reparse || fts_missing || stored.is_some_and(|stored| stored != current) {
         let turns = parse_turns_from_body(body, &fm.date);
         let refresh = db.refresh_session_from_vault(fm, body, vault_path, &turns, current)?;
         return Ok(MarkdownAction::Refreshed(refresh));
@@ -916,6 +921,25 @@ mod tests {
         assert_eq!(f.reindex(), (0, 0, 0, 0));
         assert_eq!(f.turns("sess-mac"), ["list files", "One file: a.rs"]);
         assert!(f.db.get_source_meta("sess-mac").unwrap().is_some());
+        assert_eq!(f.reindex(), (0, 0, 0, 1));
+    }
+
+    #[test]
+    fn reindex_vault_restores_the_fts_row_of_a_half_imported_session() {
+        let f = Fixture::new();
+        f.write("2026-11-09", "sess-mac", "macbook", &V1);
+        f.reindex();
+        // The import stopped after the session row: no FTS row, no snapshot.
+        f.db.delete_session_fts("sess-mac").unwrap();
+        f.db.conn()
+            .execute(
+                "UPDATE sessions SET source_size = NULL, source_mtime = NULL WHERE id = 'sess-mac'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(f.reindex(), (0, 1, 0, 0));
+        assert!(f.db.has_fts_rows("sess-mac").unwrap());
         assert_eq!(f.reindex(), (0, 0, 0, 1));
     }
 

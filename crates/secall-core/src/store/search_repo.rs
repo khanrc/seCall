@@ -12,6 +12,8 @@ pub trait SearchRepo {
     fn insert_fts(&self, tokenized_content: &str, session_id: &str, turn_index: u32) -> Result<()>;
     /// Remove every FTS row of `session_id`.
     fn delete_session_fts(&self, session_id: &str) -> Result<()>;
+    /// Whether `session_id` has any FTS row.
+    fn has_fts_rows(&self, session_id: &str) -> Result<bool>;
     fn search_fts(
         &self,
         tokenized_query: &str,
@@ -53,6 +55,14 @@ impl SearchRepo for Database {
             )?;
             Ok(())
         })
+    }
+
+    fn has_fts_rows(&self, session_id: &str) -> crate::error::Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM turns_fts_rows WHERE session_id = ?1)",
+            [session_id],
+            |r| r.get(0),
+        )?)
     }
 
     fn search_fts(
