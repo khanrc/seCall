@@ -587,11 +587,27 @@ pub fn passes_filters(meta: &SessionMeta, filters: &SearchFilters) -> bool {
     true
 }
 
-/// Determine ORT session pool size: explicit config → RAM-based heuristic.
-fn resolve_pool_size(config: &crate::vault::config::Config) -> usize {
-    if let Some(n) = config.embedding.pool_size {
-        return n.max(1);
+/// What an embedder is loaded for. It sets the ORT session pool size: each
+/// session holds its own copy of the model for the life of the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbedderRole {
+    /// Embeds one short query per request (MCP, web, `secall recall`).
+    Search,
+    /// Embeds chunks of several sessions at once (`secall embed`, ingest).
+    Write,
+}
+
+/// ORT session pool size for `role`: `[embedding].search_pool_size` (default 1)
+/// for search, `[embedding].pool_size` (default from RAM) for writing.
+fn resolve_pool_size(config: &crate::vault::config::Config, role: EmbedderRole) -> usize {
+    match role {
+        EmbedderRole::Search => config.embedding.search_pool_size.unwrap_or(1),
+        EmbedderRole::Write => config.embedding.pool_size.unwrap_or_else(pool_size_for_ram),
     }
+    .max(1)
+}
+
+fn pool_size_for_ram() -> usize {
     // 메모리 용량만 필요 — new_all() (CPU/프로세스/네트워크까지 fresh)
     // 대신 new() + refresh_memory() 로 메모리만 갱신.
     let mut sys = sysinfo::System::new();
@@ -651,7 +667,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// its vector file. Falls back to Ollama if ort fails; returns None if neither is
 /// available.
 pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
-    let indexer = create_embedding_indexer(config).await?;
+    let indexer = configured_indexer(config, EmbedderRole::Search).await?;
     #[cfg(not(target_os = "windows"))]
     let indexer = attach_vector_file(indexer);
     Some(indexer)
@@ -659,20 +675,25 @@ pub async fn create_vector_indexer(config: &Config) -> Option<VectorIndexer> {
 
 /// The indexer for writing vectors (`secall embed`, ingest): the configured
 /// backend's embedder without the vector file, which only `secall embed`
-/// rewrites, from the stored vectors, after its pass. It skips the session
-/// types `[embedding]` leaves out.
+/// rewrites, from the stored vectors, after its pass.
 pub async fn create_embedding_indexer(config: &Config) -> Option<VectorIndexer> {
-    let indexer = backend_indexer(config).await?;
+    configured_indexer(config, EmbedderRole::Write).await
+}
+
+/// The backend's indexer for `role`, skipping the session types `[embedding]`
+/// leaves out.
+async fn configured_indexer(config: &Config, role: EmbedderRole) -> Option<VectorIndexer> {
+    let indexer = backend_indexer(config, role).await?;
     Some(indexer.skipping_session_types(config.embedding.skipped_session_types()))
 }
 
-/// The configured backend's indexer, or its fallback.
+/// The configured backend's indexer for `role`, or its fallback.
 ///
 /// The e5 query/passage prefixes are bound to the ORT model
 /// (model_manager::model_prefixes) and applied only on the ORT paths — they are
 /// a property of that model, not a user setting, so a non-e5 backend
 /// (ollama/openai) never carries them.
-async fn backend_indexer(config: &Config) -> Option<VectorIndexer> {
+async fn backend_indexer(config: &Config, role: EmbedderRole) -> Option<VectorIndexer> {
     let indexer = match config.embedding.backend.as_str() {
         "ort" => {
             let model_dir = config
@@ -691,7 +712,7 @@ async fn backend_indexer(config: &Config) -> Option<VectorIndexer> {
                 }
             }
 
-            let pool = resolve_pool_size(config);
+            let pool = resolve_pool_size(config, role);
             match build_ort_embedder(&model_dir, pool) {
                 Ok(e) => {
                     tracing::info!(
@@ -720,7 +741,7 @@ async fn backend_indexer(config: &Config) -> Option<VectorIndexer> {
                 tracing::warn!("ONNX model not found, downloading");
                 if let Err(e) = mgr.download(false).await {
                     tracing::warn!(error = %e, "download failed, trying ORT CPU fallback");
-                    return try_ort_cpu_fallback(config).await;
+                    return try_ort_cpu_fallback(config, role).await;
                 }
             }
 
@@ -735,7 +756,7 @@ async fn backend_indexer(config: &Config) -> Option<VectorIndexer> {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "OpenVINO load failed, trying ORT CPU fallback");
-                    return try_ort_cpu_fallback(config).await;
+                    return try_ort_cpu_fallback(config, role).await;
                 }
             }
         }
@@ -825,14 +846,14 @@ pub async fn create_vector_indexer_for_ingest(
 
 /// OpenVINO 실패 시 ORT CPU → Ollama 순으로 fallback.
 #[cfg(feature = "openvino")]
-async fn try_ort_cpu_fallback(config: &Config) -> Option<VectorIndexer> {
+async fn try_ort_cpu_fallback(config: &Config, role: EmbedderRole) -> Option<VectorIndexer> {
     let model_dir = config
         .embedding
         .model_path
         .clone()
         .unwrap_or_else(default_model_path);
 
-    let pool = resolve_pool_size(config);
+    let pool = resolve_pool_size(config, role);
     match build_ort_embedder(&model_dir, pool) {
         Ok(e) => {
             tracing::info!(
@@ -1482,21 +1503,33 @@ mod tests {
     fn resolve_pool_size_uses_explicit_config_value() {
         let mut config = crate::vault::config::Config::default();
         config.embedding.pool_size = Some(3);
-        assert_eq!(resolve_pool_size(&config), 3);
+        assert_eq!(resolve_pool_size(&config, EmbedderRole::Write), 3);
     }
 
     #[test]
     fn resolve_pool_size_clamps_zero_to_one() {
         let mut config = crate::vault::config::Config::default();
         config.embedding.pool_size = Some(0);
-        assert_eq!(resolve_pool_size(&config), 1);
+        config.embedding.search_pool_size = Some(0);
+        assert_eq!(resolve_pool_size(&config, EmbedderRole::Write), 1);
+        assert_eq!(resolve_pool_size(&config, EmbedderRole::Search), 1);
+    }
+
+    #[test]
+    fn resolve_pool_size_sizes_search_apart_from_writing() {
+        let mut config = crate::vault::config::Config::default();
+        config.embedding.pool_size = Some(3);
+        assert_eq!(resolve_pool_size(&config, EmbedderRole::Search), 1);
+        config.embedding.search_pool_size = Some(2);
+        assert_eq!(resolve_pool_size(&config, EmbedderRole::Search), 2);
+        assert_eq!(resolve_pool_size(&config, EmbedderRole::Write), 3);
     }
 
     #[test]
     fn resolve_pool_size_auto_returns_at_least_one() {
         let mut config = crate::vault::config::Config::default();
         config.embedding.pool_size = None;
-        let size = resolve_pool_size(&config);
+        let size = resolve_pool_size(&config, EmbedderRole::Write);
         assert!(
             (1..=4).contains(&size),
             "auto pool_size should be 1–4, got {size}"

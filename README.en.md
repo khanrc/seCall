@@ -668,7 +668,8 @@ secall serve --port 8080 --allow-config-edit
 | `search.default_limit` | Search result count | `10` |
 | `embedding.backend` | Embedding backend (`ollama` / `ort` / `openai` / `openvino` / `ollama_cloud`) | `ollama` |
 | `embedding.ollama_model` | Ollama model name | `bge-m3` |
-| `embedding.pool_size` | ORT session pool size (null = auto from RAM) | `null` |
+| `embedding.pool_size` | ORT session pool size for `secall embed` and ingest (null = auto from RAM) | `null` |
+| `embedding.search_pool_size` | ORT session pool size for search (MCP, web, `secall recall`); each session keeps its own copy of the model in memory | `1` |
 | `embedding.cloud_host` | Ollama Cloud API host | `https://ollama.com` |
 | `embedding.cloud_model` | Ollama Cloud embedding model name | `null` |
 | `embedding.include_automated` | Embed `automated` sessions too (when off, `secall embed` also deletes their vectors; keyword search still finds them) | `false` |

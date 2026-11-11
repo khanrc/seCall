@@ -133,3 +133,79 @@ fn codex_rollout_filename_conflict_cannot_write_another_session() {
         .unwrap();
     assert_eq!(count, 0);
 }
+
+#[cfg(unix)]
+#[test]
+fn unchanged_codex_rollout_is_skipped_without_reading_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // Under .codex/sessions the parser is chosen by path, so nothing before the
+    // duplicate check needs the file's content.
+    let dir = root.join(".codex/sessions/2026/09/13");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("rollout-2026-09-13T00-00-00-{A}.jsonl"));
+    let jsonl = |texts: &[String]| {
+        let mut records = vec![
+            json!({"type":"session_meta","payload":{"id":A,"cwd":"/workspace/app","timestamp":"2026-09-13T00:00:00Z"}}),
+        ];
+        for text in texts {
+            records.push(json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}}));
+        }
+        records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let turns = || -> i64 {
+        Database::open(&root.join("index.sqlite"))
+            .unwrap()
+            .conn()
+            .query_row("SELECT count(*) FROM turns WHERE session_id=?1", [A], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    let set_mtime = |mtime: std::time::SystemTime| {
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    };
+    let set_mode =
+        |mode: u32| fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+
+    let original = jsonl(&[format!("first {}", "x".repeat(400))]);
+    fs::write(&path, &original).unwrap();
+    assert!(ingest(root, &path).status.success());
+    assert_eq!(turns(), 1);
+    let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+
+    // One more turn at the same size and mtime, in a file nobody may read: the
+    // ingest succeeds only if it decides on the file's size and mtime alone.
+    // (Root ignores the mode, so there this shows the skip but not the absent read.)
+    let shorter = jsonl(&["first".into(), "second".into()]);
+    let pad = original.len() - shorter.len() - 1;
+    let grown = jsonl(&["first".into(), format!("second {}", "y".repeat(pad))]);
+    assert_eq!(grown.len(), original.len());
+    fs::write(&path, &grown).unwrap();
+    set_mtime(mtime);
+    set_mode(0o000);
+    let skipped = ingest(root, &path);
+    set_mode(0o644);
+    assert!(
+        skipped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&skipped.stderr)
+    );
+    assert_eq!(turns(), 1);
+
+    // A new mtime marks it changed again.
+    set_mtime(mtime + std::time::Duration::from_secs(10));
+    assert!(ingest(root, &path).status.success());
+    assert_eq!(turns(), 2);
+}

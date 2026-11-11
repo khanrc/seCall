@@ -47,7 +47,8 @@ seCall 의 LLM 관련 설정, 환경변수, 진입점을 한 곳에 정리한 �
 | `[log].cloud_host` | `https://ollama.com` | log ollama_cloud 호스트 override |
 | `[log].cloud_model` | `kimi-k2.6:cloud` | log ollama_cloud model override |
 | `[embedding].backend` | `"ollama"` | embedding backend |
-| `[embedding].pool_size` | `null` (auto) | ORT session pool size. 미설정 시 시스템 RAM 기반 자동 결정 (≤15GB→1, 16-31GB→2, ≥32GB→4) |
+| `[embedding].pool_size` | `null` (auto) | `secall embed`·ingest의 ORT session pool size. 미설정 시 시스템 RAM 기반 자동 결정 (≤15GB→1, 16-31GB→2, ≥32GB→4) |
+| `[embedding].search_pool_size` | `1` | 검색(MCP, web, `secall recall`)의 ORT session pool size. session마다 모델 사본을 하나씩 메모리에 둔다 |
 | `[embedding].cloud_host` | `https://ollama.com` | ollama_cloud embedding API 호스트 |
 | `[embedding].cloud_model` | `null` | ollama_cloud embedding 모델 이름 |
 

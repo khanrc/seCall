@@ -649,7 +649,8 @@ secall serve --port 8080 --allow-config-edit
 | `search.default_limit` | 检索结果数 | `10` |
 | `embedding.backend` | 嵌入后端（`ollama` / `ort` / `openai` / `openvino` / `ollama_cloud`） | `ollama` |
 | `embedding.ollama_model` | Ollama 模型名 | `bge-m3` |
-| `embedding.pool_size` | ORT session pool 大小（未设置 = 根据 RAM 自动） | `null` |
+| `embedding.pool_size` | `secall embed` 和 ingest 的 ORT session pool 大小（未设置 = 根据 RAM 自动） | `null` |
+| `embedding.search_pool_size` | 搜索（MCP、web、`secall recall`）的 ORT session pool 大小；每个 session 在内存中各保留一份模型 | `1` |
 | `embedding.cloud_host` | Ollama Cloud API host | `https://ollama.com` |
 | `embedding.cloud_model` | Ollama Cloud embedding 模型名 | `null` |
 | `embedding.include_automated` | 同时嵌入 `automated` 会话（关闭时 `secall embed` 也会删除其已有向量，关键词检索仍可找到） | `false` |
