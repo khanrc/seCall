@@ -651,7 +651,8 @@ secall serve --port 8080 --allow-config-edit
 | `search.default_limit` | 검색 결과 수 | `10` |
 | `embedding.backend` | 임베딩 백엔드 (`ollama` / `ort` / `openai` / `openvino` / `ollama_cloud`) | `ollama` |
 | `embedding.ollama_model` | Ollama 모델 이름 | `bge-m3` |
-| `embedding.pool_size` | ORT session pool 크기 (미설정 = RAM 기반 자동) | `null` |
+| `embedding.pool_size` | `secall embed`·ingest의 ORT session pool 크기 (미설정 = RAM 기반 자동) | `null` |
+| `embedding.search_pool_size` | 검색(MCP, web, `secall recall`)의 ORT session pool 크기. session마다 모델 사본을 하나씩 메모리에 둔다 | `1` |
 | `embedding.cloud_host` | Ollama Cloud API 호스트 | `https://ollama.com` |
 | `embedding.cloud_model` | Ollama Cloud embedding 모델 이름 | `null` |
 | `embedding.include_automated` | `automated` 세션도 임베딩 (끄면 `secall embed`가 기존 벡터도 삭제, 키워드 검색은 유지) | `false` |

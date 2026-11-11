@@ -332,8 +332,10 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
 }
 
 /// Recognize both rollout-UUID and rollout-TIMESTAMP-UUID names. Other names
-/// (copied exports, custom homes) continue to use the opening metadata.
-fn rollout_filename_id(path: &Path) -> Option<uuid::Uuid> {
+/// (copied exports, custom homes) continue to use the opening metadata. The
+/// parser rejects a rollout whose header names another session, so a parsed
+/// rollout is always the session this UUID names.
+pub fn rollout_filename_id(path: &Path) -> Option<uuid::Uuid> {
     let name = path.file_stem()?.to_str()?.strip_prefix("rollout-")?;
     uuid::Uuid::parse_str(name.get(name.len().checked_sub(36)?..)?).ok()
 }

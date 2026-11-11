@@ -97,8 +97,13 @@ pub struct EmbeddingConfig {
     pub openai_model: Option<String>,
     /// OpenVINO device type: "NPU" | "GPU" | "CPU" (openvino backend)
     pub openvino_device: Option<String>,
-    /// ORT session pool size. None = auto-detect from RAM (≤15GB→1, 16-31GB→2, ≥32GB→4)
+    /// ORT session pool size for writing vectors (`secall embed`, ingest).
+    /// None = auto-detect from RAM (≤15GB→1, 16-31GB→2, ≥32GB→4)
     pub pool_size: Option<usize>,
+    /// ORT session pool size for search (MCP, web, `secall recall`). None = 1:
+    /// a search embeds one short query, and every session in the pool holds
+    /// its own copy of the model for as long as the process runs.
+    pub search_pool_size: Option<usize>,
     /// Ollama Cloud API host (ollama_cloud backend)
     pub cloud_host: Option<String>,
     /// Ollama Cloud embedding model name (ollama_cloud backend)
@@ -388,6 +393,7 @@ impl Default for EmbeddingConfig {
             openai_model: None,
             openvino_device: None,
             pool_size: None,
+            search_pool_size: None,
             cloud_host: None,
             cloud_model: None,
             cloud_api_key: None,

@@ -581,8 +581,8 @@ fn source_changed(stored: Option<(i64, i64)>, current: Option<(i64, i64)>) -> bo
 
 /// 단일 경로의 detect/parse/ingest_single_session 처리.
 ///
-/// ClaudeAi/ChatGpt 는 `parse_all()` 1:N 경로, 그 외는 filename-stem 힌트로
-/// 중복 체크 후 `parse()` 1:1 경로. 카운터/에러 누적 모두 `&mut` 로 받음.
+/// ClaudeAi/ChatGpt 는 `parse_all()` 1:N 경로, 그 외는 파일 이름 힌트(Codex
+/// rollout 은 이름 속 UUID, 나머지는 stem)로 중복 체크 후 `parse()` 1:1 경로. 카운터/에러 누적 모두 `&mut` 로 받음.
 #[allow(clippy::too_many_arguments)]
 fn ingest_path(
     config: &Config,
@@ -666,34 +666,18 @@ fn ingest_path(
         return;
     }
 
-    let fingerprint = if parser.agent_kind() == AgentKind::Codex {
-        match prepare_codex_source(db, session_path, force) {
-            Ok((fingerprint, cached)) => {
-                if cached {
-                    *deferred += 1;
-                    return;
-                }
-                Some(fingerprint)
-            }
-            Err(e) => {
-                record_source_failure(session_path, e, errors, error_details);
-                return;
-            }
-        }
-    } else {
-        None
-    };
-
     // 소스 파일 (size, mtime) 스냅샷 — 변경 감지(재인제스트 판정) + ingest 후 기록 (#13).
     let file_meta = source_file_meta(session_path);
 
-    // 1:1 파서: filename-stem 힌트로 빠른 중복 체크 (--force 시 스킵)
-    if !force {
-        let session_id_hint = session_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-
+    // Quick duplicate check on the session the file is named after (skipped
+    // under --force). It runs before the Codex source fingerprint, which reads
+    // the whole file, so an unchanged rollout is skipped on its size and mtime.
+    let hint = if force {
+        None
+    } else {
+        session_id_hint(parser.agent_kind(), session_path)
+    };
+    if let Some(session_id_hint) = hint.as_deref() {
         match db.session_exists(session_id_hint) {
             Ok(true) => {
                 // 소스 파일이 마지막 ingest 이후 변경됐으면(size/mtime) 재인제스트.
@@ -735,6 +719,24 @@ fn ingest_path(
             }
         }
     }
+
+    let fingerprint = if parser.agent_kind() == AgentKind::Codex {
+        match prepare_codex_source(db, session_path, force) {
+            Ok((fingerprint, cached)) => {
+                if cached {
+                    *deferred += 1;
+                    return;
+                }
+                Some(fingerprint)
+            }
+            Err(e) => {
+                record_source_failure(session_path, e, errors, error_details);
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     match parser.parse(session_path) {
         Ok(session) => {
@@ -802,6 +804,18 @@ fn ingest_path(
             *errors += 1;
         }
     }
+}
+
+/// The session a file is named after, for the duplicate check that runs before
+/// any read of its content. A Codex rollout carries its session's UUID in its
+/// name (`rollout-<time>-<uuid>`); any other file is checked under its stem.
+fn session_id_hint(agent: AgentKind, path: &Path) -> Option<String> {
+    if agent == AgentKind::Codex {
+        if let Some(id) = secall_core::ingest::codex::rollout_filename_id(path) {
+            return Some(id.to_string());
+        }
+    }
+    path.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
 }
 
 fn prepare_codex_source(
