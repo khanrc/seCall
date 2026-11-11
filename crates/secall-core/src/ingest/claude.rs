@@ -46,8 +46,12 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
     let mut turns: Vec<Turn> = Vec::new();
     let mut total_tokens = TokenUsage::default();
 
-    // Pending tool_use entries keyed by tool_use_id waiting for tool_result
-    let mut pending_tool_uses: HashMap<String, usize> = HashMap::new(); // tool_use_id -> action index in last assistant turn
+    // tool_use calls still waiting for their tool_result, by tool_use_id, with
+    // the (turn index, action index) of the action the result belongs to.
+    // Claude Code writes each result on its own line, sometimes only after
+    // every call of a parallel batch, so an entry lives until its own result
+    // arrives rather than until the next result line.
+    let mut pending_tool_uses: HashMap<String, (usize, usize)> = HashMap::new();
 
     // message.id of the last assistant turn, to merge Claude Code's split
     // streaming events (thinking / text / tool_use of one message arrive as
@@ -116,7 +120,6 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
                         .any(|item| item["type"].as_str() == Some("tool_result"));
 
                     if has_tool_result {
-                        // Attach tool results to the last assistant turn
                         for item in items {
                             if item["type"].as_str() == Some("tool_result") {
                                 let tool_use_id =
@@ -124,10 +127,11 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
                                 let output = extract_tool_result_content(&item["content"]);
                                 let truncated = truncate_str(&output, TOOL_OUTPUT_MAX_CHARS);
 
-                                // Find the corresponding action in the last assistant turn
-                                if let Some(&action_idx) = pending_tool_uses.get(&tool_use_id) {
+                                if let Some((turn_idx, action_idx)) =
+                                    pending_tool_uses.remove(&tool_use_id)
+                                {
                                     if let Some(Action::ToolUse { output_summary, .. }) = turns
-                                        .last_mut()
+                                        .get_mut(turn_idx)
                                         .and_then(|turn| turn.actions.get_mut(action_idx))
                                     {
                                         *output_summary = truncated;
@@ -135,7 +139,6 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
                                 }
                             }
                         }
-                        pending_tool_uses.clear();
                         continue;
                     }
                 }
@@ -189,7 +192,8 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
                 let mut text_parts: Vec<String> = Vec::new();
                 let mut actions: Vec<Action> = Vec::new();
                 let mut thinking_parts: Vec<String> = Vec::new();
-                let mut new_pending: HashMap<String, usize> = HashMap::new();
+                // tool_use ids of this event with their index in `actions`.
+                let mut new_pending: Vec<(String, usize)> = Vec::new();
 
                 if let Some(content_arr) = message["content"].as_array() {
                     for item in content_arr {
@@ -211,7 +215,7 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
 
                                 let action_idx = actions.len();
                                 if !tool_use_id.is_empty() {
-                                    new_pending.insert(tool_use_id.clone(), action_idx);
+                                    new_pending.push((tool_use_id.clone(), action_idx));
                                 }
 
                                 actions.push(Action::ToolUse {
@@ -243,6 +247,7 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
                     && turns.last().map(|t| t.role == Role::Assistant).unwrap_or(false);
 
                 if merge {
+                    let turn_idx = turns.len() - 1;
                     let last = turns.last_mut().unwrap();
                     let action_base = last.actions.len();
                     if !content.is_empty() {
@@ -269,8 +274,8 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
                     }
                     // new tool_uses land after the pre-merge actions — offset
                     // their pending indices so tool_result attaches correctly.
-                    for (k, v) in new_pending {
-                        pending_tool_uses.insert(k, v + action_base);
+                    for (id, action_idx) in new_pending {
+                        pending_tool_uses.insert(id, (turn_idx, action_base + action_idx));
                     }
                 } else {
                     let turn = Turn {
@@ -283,8 +288,11 @@ pub fn parse_claude_jsonl(path: &Path) -> Result<Session> {
                         thinking,
                         is_sidechain,
                     };
+                    let turn_idx = turns.len();
                     turns.push(turn);
-                    pending_tool_uses = new_pending;
+                    for (id, action_idx) in new_pending {
+                        pending_tool_uses.insert(id, (turn_idx, action_idx));
+                    }
                 }
                 last_asst_msg_id = msg_id;
             }
@@ -520,6 +528,45 @@ mod tests {
             .collect();
         assert!(outs.contains(&"OUT_ONE"), "first tool_result attached");
         assert!(outs.contains(&"OUT_TWO"), "second tool_result attached to offset action");
+    }
+
+    #[test]
+    fn test_merge_batched_parallel_tool_results() {
+        // Claude Code may write every tool_use of a parallel batch before any
+        // tool_result, one result per line and not necessarily in call order.
+        // Each result must reach its own action, not only the first to arrive.
+        let lines = &[
+            r#"{"type":"user","message":{"role":"user","content":"do three things"},"timestamp":"2026-04-05T10:00:00Z","sessionId":"s7","cwd":"/p","gitBranch":"main"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"mb","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"echo one"}}]},"timestamp":"2026-04-05T10:00:01Z"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"mb","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"echo two"}}]},"timestamp":"2026-04-05T10:00:02Z"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","id":"mb","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"echo three"}}]},"timestamp":"2026-04-05T10:00:03Z"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"OUT_TWO"}]},"timestamp":"2026-04-05T10:00:04Z"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"OUT_ONE"}]},"timestamp":"2026-04-05T10:00:05Z"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t3","content":"OUT_THREE"}]},"timestamp":"2026-04-05T10:00:06Z"}"#,
+        ];
+        let f = write_jsonl(lines);
+        let s = parse_claude_jsonl(f.path()).unwrap();
+        assert_eq!(s.turns.len(), 2, "user + one merged assistant turn");
+        let pairs: Vec<(&str, &str)> = s.turns[1]
+            .actions
+            .iter()
+            .filter_map(|act| match act {
+                Action::ToolUse {
+                    input_summary,
+                    output_summary,
+                    ..
+                } => Some((input_summary.as_str(), output_summary.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("echo one", "OUT_ONE"),
+                ("echo two", "OUT_TWO"),
+                ("echo three", "OUT_THREE"),
+            ]
+        );
     }
 
     #[test]
