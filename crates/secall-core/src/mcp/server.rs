@@ -310,11 +310,24 @@ impl SeCallMcpServer {
                 );
             }
             if params.full.unwrap_or(false) {
-                let content = if let Some(vault_path) = &meta.vault_path {
-                    std::fs::read_to_string(vault_path).ok()
-                } else {
-                    None
-                };
+                // `vault_path` is relative to the vault root, as for the CLI `get`.
+                // Reading it unjoined resolved against the server's cwd, failed
+                // silently, and served the DB turns, which lack every tool call.
+                let content = meta.vault_path.as_deref().and_then(|rel| {
+                    let path = self.vault_path.join(rel);
+                    match std::fs::read_to_string(&path) {
+                        Ok(text) => Some(text),
+                        Err(error) => {
+                            tracing::warn!(
+                                session = %session_id,
+                                path = %path.display(),
+                                %error,
+                                "cannot read the session Markdown; serving DB turns"
+                            );
+                            None
+                        }
+                    }
+                });
                 // vault 파일이 없으면 DB turns를 합쳐 fallback content 생성
                 let content = content.or_else(|| {
                     let mut stmt = db
@@ -1727,5 +1740,67 @@ mod tests {
 
         let err = server.do_wiki_get("nope").unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_get_full_reads_the_markdown_under_the_vault_root() {
+        // `vault_path` is stored relative to the vault root, and the server never
+        // runs from the vault. Reading it unjoined fell back to the DB turns,
+        // which carry no tool calls.
+        use super::super::tools::GetParams;
+        use crate::ingest::types::{AgentKind, Role, Session, TokenUsage, Turn};
+        use crate::store::SessionRepo;
+        use chrono::{TimeZone, Utc};
+
+        let vault = tempfile::tempdir().unwrap();
+        let rel = "raw/.sessions/2026-04-05/claude-code_proj_s-vault-root.md";
+        let md = "---\nsession_id: s-vault-root\n---\n\n## Turn 1 — Assistant\n\n> [!tool]- Bash\n> ```\n> ls\n> ```\n";
+        let abs = vault.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, md).unwrap();
+
+        let db = Database::open_memory().unwrap();
+        db.insert_session(&Session {
+            id: "s-vault-root".to_string(),
+            agent: AgentKind::ClaudeCode,
+            model: None,
+            project: Some("proj".to_string()),
+            cwd: None,
+            git_branch: None,
+            host: None,
+            start_time: Utc.with_ymd_and_hms(2026, 4, 5, 0, 0, 0).unwrap(),
+            end_time: None,
+            session_type: "interactive".to_string(),
+            archived: false,
+            archived_at: None,
+            turns: vec![Turn {
+                index: 0,
+                role: Role::Assistant,
+                timestamp: None,
+                content: String::new(),
+                actions: Vec::new(),
+                tokens: None,
+                thinking: None,
+                is_sidechain: false,
+            }],
+            total_tokens: TokenUsage::default(),
+        })
+        .unwrap();
+        db.update_session_vault_path("s-vault-root", rel).unwrap();
+        let tok = LinderaKoTokenizer::new().unwrap();
+        let engine = SearchEngine::new(Bm25Indexer::new(Box::new(tok)), None);
+        let server = SeCallMcpServer::new(
+            Arc::new(Mutex::new(db)),
+            Arc::new(engine),
+            vault.path().to_path_buf(),
+        );
+
+        let got = server
+            .do_get(GetParams {
+                id: "s-vault-root".to_string(),
+                full: Some(true),
+            })
+            .unwrap();
+        assert_eq!(got["content"].as_str(), Some(md));
     }
 }
