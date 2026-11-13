@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use secall_core::{
+    ingest::Action,
     store::{get_default_db_path, Database, SessionRepo},
     vault::Config,
 };
@@ -25,6 +26,23 @@ pub fn run(id: String, full: bool) -> Result<()> {
         println!("Role: {}", turn.role);
         println!("---");
         println!("{}", turn.content);
+        for action in db.get_turn_actions(session_id, turn_idx)? {
+            if let Action::ToolUse {
+                name,
+                input_summary,
+                output_summary,
+                ..
+            } = action
+            {
+                println!("\n[Tool: {name}]");
+                if !input_summary.is_empty() {
+                    println!("{input_summary}");
+                }
+                if !output_summary.is_empty() {
+                    println!("[Output]\n{output_summary}");
+                }
+            }
+        }
     } else if full {
         // Read full MD file from vault
         let config = Config::load_or_default();

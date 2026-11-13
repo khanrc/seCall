@@ -660,7 +660,7 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
                 );
             }
         }
-        // A failed insert leaves the session's later turns to the next sync.
+        // A failed insert leaves the session's missing turns to the next sync.
         if let Err(e) = bm25.index_turns(db, &fm.session_id, &parsed_turns) {
             tracing::warn!(session_id = %fm.session_id, error = %e, "insert_turn failed");
         }

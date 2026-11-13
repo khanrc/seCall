@@ -42,6 +42,12 @@ fn actions_json(actions: &[crate::ingest::Action]) -> Option<String> {
     }
 }
 
+/// The actions a `turns.actions_json` value holds; none for NULL.
+fn actions_from_json(json: Option<String>) -> Vec<crate::ingest::Action> {
+    json.and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
 // SessionRepo impl for Database — session/turn CRUD
 impl SessionRepo for Database {
     fn insert_session(&self, session: &Session) -> crate::error::Result<()> {
@@ -252,6 +258,24 @@ impl Database {
                 },
                 _ => SecallError::Database(e),
             })
+    }
+
+    /// The tool calls of a turn, which its content leaves out; none for a
+    /// turn that is not stored.
+    pub fn get_turn_actions(
+        &self,
+        session_id: &str,
+        turn_index: u32,
+    ) -> Result<Vec<crate::ingest::Action>> {
+        let json: Option<Option<String>> = self
+            .conn()
+            .query_row(
+                "SELECT actions_json FROM turns WHERE session_id = ?1 AND turn_index = ?2",
+                rusqlite::params![session_id, turn_index as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(actions_from_json(json.flatten()))
     }
 
     /// P89 (#100, Gemini PR #101): `(session_id, turn_index)` 다건의 content 를
@@ -873,9 +897,7 @@ impl Database {
                         .map(|dt| dt.with_timezone(&chrono::Utc))
                         .ok()
                 });
-                let actions = actions_json
-                    .and_then(|j| serde_json::from_str::<Vec<crate::ingest::Action>>(&j).ok())
-                    .unwrap_or_default();
+                let actions = actions_from_json(actions_json);
                 Turn {
                     index: idx as u32,
                     role,

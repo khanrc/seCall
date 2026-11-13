@@ -268,10 +268,13 @@ impl SeCallMcpServer {
 
         if let Some(turn_idx) = turn_index {
             let turn = db.get_turn(&session_id, turn_idx)?;
+            // A turn found through a tool input may have no content at all.
+            let actions = db.get_turn_actions(&session_id, turn_idx)?;
             Ok(serde_json::json!({
                 "turn_index": turn.turn_index,
                 "role": turn.role,
                 "content": turn.content,
+                "actions": actions,
             }))
         } else {
             let meta = db.get_session_meta(&session_id)?;
@@ -1229,7 +1232,7 @@ impl SeCallMcpServer {
     }
 
     #[tool(
-        description = "Retrieve a specific session or turn. Use session_id for full session metadata, session_id:N for a specific turn.",
+        description = "Retrieve a specific session or turn. Use session_id for full session metadata, session_id:N for a specific turn with its tool calls.",
         annotations(
             title = "Get session or turn",
             read_only_hint = true,
@@ -1802,5 +1805,71 @@ mod tests {
             })
             .unwrap();
         assert_eq!(got["content"].as_str(), Some(md));
+    }
+
+    #[test]
+    fn do_get_turn_returns_its_tool_calls() {
+        use super::super::tools::GetParams;
+        use crate::ingest::types::{Action, AgentKind, Role, Session, TokenUsage, Turn};
+        use crate::store::SessionRepo;
+        use chrono::{TimeZone, Utc};
+
+        let db = Database::open_memory().unwrap();
+        let session = Session {
+            id: "s-tool-turn".to_string(),
+            agent: AgentKind::Codex,
+            model: None,
+            project: None,
+            cwd: None,
+            git_branch: None,
+            host: None,
+            start_time: Utc.with_ymd_and_hms(2026, 4, 5, 0, 0, 0).unwrap(),
+            end_time: None,
+            session_type: "interactive".to_string(),
+            archived: false,
+            archived_at: None,
+            turns: vec![Turn {
+                index: 0,
+                role: Role::Assistant,
+                timestamp: None,
+                content: String::new(),
+                actions: vec![Action::ToolUse {
+                    name: "exec_command".to_string(),
+                    input_summary: "ls".to_string(),
+                    output_summary: "a.rs".to_string(),
+                    tool_use_id: None,
+                }],
+                tokens: None,
+                thinking: None,
+                is_sidechain: false,
+            }],
+            total_tokens: TokenUsage::default(),
+        };
+        db.insert_session(&session).unwrap();
+        db.insert_turn(&session.id, &session.turns[0]).unwrap();
+        let tok = LinderaKoTokenizer::new().unwrap();
+        let engine = SearchEngine::new(Bm25Indexer::new(Box::new(tok)), None);
+        let server = SeCallMcpServer::new(
+            Arc::new(Mutex::new(db)),
+            Arc::new(engine),
+            std::path::PathBuf::new(),
+        );
+
+        let got = server
+            .do_get(GetParams {
+                id: "s-tool-turn:0".to_string(),
+                full: Some(true),
+            })
+            .unwrap();
+        assert_eq!(got["content"].as_str(), Some(""));
+        let call = &got["actions"][0]["ToolUse"];
+        assert_eq!(
+            (
+                call["name"].as_str(),
+                call["input_summary"].as_str(),
+                call["output_summary"].as_str()
+            ),
+            (Some("exec_command"), Some("ls"), Some("a.rs"))
+        );
     }
 }
