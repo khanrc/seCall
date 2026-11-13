@@ -112,6 +112,57 @@ CREATE TABLE IF NOT EXISTS query_cache (
 );
 ";
 
+/// Sessions `secall embed` found with every chunk embedded, under the model
+/// and chunking recorded with them; later passes skip them instead of
+/// re-chunking every session. A row stays true until the session's turns
+/// change or one of its vectors is deleted, the only changes that can leave it
+/// with chunks to embed, so the triggers in [`EMBED_COMPLETE_TRIGGERS`] drop
+/// the row on those. Inserting vectors only completes a session and needs no
+/// trigger.
+pub const CREATE_EMBED_COMPLETE: &str = "
+CREATE TABLE IF NOT EXISTS embed_complete (
+    session_id  TEXT PRIMARY KEY,
+    model       TEXT NOT NULL,
+    chunking    TEXT NOT NULL
+);
+";
+
+/// The `embed_complete` triggers, keyed by the table each one watches. A
+/// trigger can only be created once its table exists, and `turn_vectors`
+/// appears with the first embed.
+pub const EMBED_COMPLETE_TRIGGERS: [(&str, &str); 3] = [
+    (
+        "turns",
+        "
+CREATE TRIGGER IF NOT EXISTS embed_complete_turn_insert AFTER INSERT ON turns BEGIN
+    DELETE FROM embed_complete WHERE session_id = NEW.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS embed_complete_turn_update AFTER UPDATE ON turns BEGIN
+    DELETE FROM embed_complete WHERE session_id IN (OLD.session_id, NEW.session_id);
+END;
+CREATE TRIGGER IF NOT EXISTS embed_complete_turn_delete AFTER DELETE ON turns BEGIN
+    DELETE FROM embed_complete WHERE session_id = OLD.session_id;
+END;
+",
+    ),
+    (
+        "sessions",
+        "
+CREATE TRIGGER IF NOT EXISTS embed_complete_session_delete AFTER DELETE ON sessions BEGIN
+    DELETE FROM embed_complete WHERE session_id = OLD.id;
+END;
+",
+    ),
+    (
+        "turn_vectors",
+        "
+CREATE TRIGGER IF NOT EXISTS embed_complete_vector_delete AFTER DELETE ON turn_vectors BEGIN
+    DELETE FROM embed_complete WHERE session_id = OLD.session_id;
+END;
+",
+    ),
+];
+
 pub const CREATE_GRAPH_NODES: &str = "
 CREATE TABLE IF NOT EXISTS graph_nodes (
     id    TEXT PRIMARY KEY,

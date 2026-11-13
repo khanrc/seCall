@@ -776,6 +776,9 @@ impl Database {
 
     /// session_id로 Session 구조체를 재구성 (벡터 임베딩용).
     /// turns 테이블에서 content를 읽어 Session.turns를 채운다.
+    ///
+    /// Changing how turns are rebuilt here can re-chunk stored turns: bump
+    /// the chunker's `CHUNKING_REVISION`.
     pub fn get_session_for_embedding(&self, session_id: &str) -> Result<crate::ingest::Session> {
         use crate::ingest::{AgentKind, Role, Session, TokenUsage, Turn};
         use chrono::DateTime;

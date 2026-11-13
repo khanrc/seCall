@@ -65,6 +65,7 @@ impl VectorRepo for Database {
                 ON turn_vectors(session_id, turn_index, chunk_seq, model);
         ",
         )?;
+        self.ensure_embed_complete()?;
         Ok(())
     }
 
@@ -351,6 +352,55 @@ impl Database {
         let mut stmt = self.conn().prepare(query)?;
         let rows = stmt.query_map([], |row| row.get(0))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Sessions an embed pass must check: those whose stored type is not in
+    /// `skipped_types` and that have no `embed_complete` row for `model` and
+    /// `chunking`.
+    pub fn sessions_to_check_for_embedding(
+        &self,
+        skipped_types: &[String],
+        model: &str,
+        chunking: &str,
+    ) -> Result<Vec<String>> {
+        // ?1 and ?2 are the model and chunking; the skipped types follow.
+        let type_filter = if skipped_types.is_empty() {
+            String::new()
+        } else {
+            let placeholders: Vec<String> = (0..skipped_types.len())
+                .map(|i| format!("?{}", i + 3))
+                .collect();
+            format!(
+                "AND COALESCE(s.session_type, '') NOT IN ({})",
+                placeholders.join(", ")
+            )
+        };
+        let mut stmt = self.conn().prepare(&format!(
+            "SELECT s.id FROM sessions AS s \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM embed_complete AS c \
+                 WHERE c.session_id = s.id AND c.model = ?1 AND c.chunking = ?2 \
+             ) {type_filter}"
+        ))?;
+        let params = [model, chunking]
+            .into_iter()
+            .chain(skipped_types.iter().map(String::as_str));
+        let ids = stmt
+            .query_map(rusqlite::params_from_iter(params), |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
+    }
+
+    /// Record that every chunk of the session is embedded under `model` and
+    /// `chunking`. Call it in the transaction that checked this, so a write
+    /// between the check and the record cannot go unseen.
+    pub fn mark_embed_complete(&self, session_id: &str, model: &str, chunking: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO embed_complete(session_id, model, chunking) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![session_id, model, chunking],
+        )?;
+        Ok(())
     }
 
     /// Existing `(turn_index, chunk_seq)` pairs already in `turn_vectors` for
