@@ -7,9 +7,10 @@ use crate::error::Result;
 use crate::error::SecallError;
 
 use super::schema::{
-    CREATE_CONFIG, CREATE_GRAPH_EDGES, CREATE_GRAPH_INDEXES, CREATE_GRAPH_NODES, CREATE_INDEXES,
-    CREATE_INGEST_LOG, CREATE_JOBS, CREATE_QUERY_CACHE, CREATE_SESSIONS, CREATE_TURNS,
-    CREATE_TURNS_FTS, CREATE_TURNS_FTS_ROWS, CREATE_WIKI_VECTORS, CURRENT_SCHEMA_VERSION,
+    CREATE_CONFIG, CREATE_EMBED_COMPLETE, CREATE_GRAPH_EDGES, CREATE_GRAPH_INDEXES,
+    CREATE_GRAPH_NODES, CREATE_INDEXES, CREATE_INGEST_LOG, CREATE_JOBS, CREATE_QUERY_CACHE,
+    CREATE_SESSIONS, CREATE_TURNS, CREATE_TURNS_FTS, CREATE_TURNS_FTS_ROWS, CREATE_WIKI_VECTORS,
+    CURRENT_SCHEMA_VERSION, EMBED_COMPLETE_TRIGGERS,
 };
 
 pub struct Database {
@@ -245,6 +246,9 @@ impl Database {
 
         // Non-versioned additions: always apply (CREATE IF NOT EXISTS)
         self.conn.execute_batch(CREATE_QUERY_CACHE)?;
+        // Every open rather than one version step: a binary that predates
+        // these triggers may have created `turn_vectors` without one.
+        self.ensure_embed_complete()?;
 
         Ok(())
     }
@@ -295,6 +299,27 @@ impl Database {
                 Err(e)
             }
         }
+    }
+
+    /// Run a closure in a deferred transaction. Its reads share one snapshot
+    /// and take no write lock; its first write takes the lock, and fails with
+    /// a busy error (`SQLITE_BUSY_SNAPSHOT`) when another connection committed
+    /// after the snapshot was taken. A closure that writes only what it derived
+    /// from its reads therefore never records a stale result. busy_timeout
+    /// does not retry that error; the caller decides what a refusal means.
+    pub fn with_snapshot_transaction<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        let result = f().and_then(|val| {
+            self.conn.execute_batch("COMMIT")?;
+            Ok(val)
+        });
+        if result.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        result
     }
 
     /// Execute a closure as one unit, inside or outside a transaction.
@@ -409,6 +434,18 @@ impl Database {
         )?;
         v.parse()
             .map_err(|e: std::num::ParseIntError| SecallError::Other(e.into()))
+    }
+
+    /// Create `embed_complete` and the triggers of each table that exists.
+    /// `init_vector_table` calls it again once `turn_vectors` exists.
+    pub(crate) fn ensure_embed_complete(&self) -> Result<()> {
+        self.conn.execute_batch(CREATE_EMBED_COMPLETE)?;
+        for (table, triggers) in EMBED_COMPLETE_TRIGGERS {
+            if self.table_exists(table)? {
+                self.conn.execute_batch(triggers)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn table_exists(&self, name: &str) -> Result<bool> {
@@ -1821,6 +1858,69 @@ mod tests {
         let stats = db.get_stats().unwrap();
         assert_eq!(stats.turn_count, 4);
         assert_eq!(stats.embeddable_turns, 2); // turns 0 and 1 only
+    }
+
+    #[test]
+    fn test_reopening_adds_the_vector_trigger_to_a_table_an_older_binary_made() {
+        // A binary from before `embed_complete` creates `turn_vectors` without
+        // the trigger; the next open by this one must add it, or a deleted
+        // vector would leave its session recorded as complete.
+        let db = Database::open_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TABLE turn_vectors (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                     turn_index INTEGER NOT NULL, chunk_seq INTEGER NOT NULL,
+                     model TEXT NOT NULL, embedded_at TEXT NOT NULL, embedding BLOB NOT NULL);
+                 INSERT INTO turn_vectors(session_id, turn_index, chunk_seq, model, embedded_at, embedding)
+                     VALUES ('s', 0, 0, 'm', 'now', x'00000000');",
+            )
+            .unwrap();
+        db.migrate().unwrap();
+        db.mark_embed_complete("s", "m", "c").unwrap();
+
+        db.conn.execute("DELETE FROM turn_vectors", []).unwrap();
+
+        let recorded: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM embed_complete", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(recorded, 0);
+    }
+
+    #[test]
+    fn test_snapshot_transaction_refuses_a_write_after_another_commit() {
+        // check_pending relies on this: a record derived from a snapshot that
+        // another connection has since changed must not commit.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        let reader = Database::open(&path).unwrap();
+        let writer = Database::open(&path).unwrap();
+
+        let result = reader.with_snapshot_transaction(|| {
+            let _: i64 = reader
+                .conn
+                .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+            // The snapshot must not block this commit: a write lock taken
+            // up front would make it time out here instead.
+            writer
+                .conn
+                .execute("INSERT INTO config(key, value) VALUES ('k', 'v')", [])
+                .unwrap();
+            reader.mark_embed_complete("s", "m", "c")
+        });
+
+        match result {
+            Err(SecallError::Database(rusqlite::Error::SqliteFailure(e, _))) => {
+                assert_eq!(e.code, rusqlite::ErrorCode::DatabaseBusy);
+            }
+            other => panic!("expected a busy refusal, got {other:?}"),
+        }
+        let recorded: i64 = writer
+            .conn
+            .query_row("SELECT COUNT(*) FROM embed_complete", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(recorded, 0);
     }
 
     // ─── P37 Task 00: semantic_extracted_at 컬럼 (v8) ────────────────────────

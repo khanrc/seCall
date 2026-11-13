@@ -1,5 +1,7 @@
 use std::sync::OnceLock;
 
+use sha2::{Digest, Sha256};
+
 use crate::ingest::Session;
 
 // We split on the model tokenizer so a chunk never overflows the model's
@@ -74,10 +76,42 @@ fn split_turn_text(text: &str) -> Vec<String> {
     split_into_chunks(text, FALLBACK_MAX_CHUNK_CHARS, FALLBACK_OVERLAP_CHARS)
 }
 
+/// Bump when `chunk_session` can split a stored turn differently without the
+/// turn changing: a change to `Turn::index_text`, to how
+/// `get_session_for_embedding` rebuilds turns from their rows, or to the
+/// splitting below. `embed_complete` rows record it, so a bump makes the next
+/// `secall embed` check every session again.
+const CHUNKING_REVISION: u32 = 1;
+
+/// Everything besides a turn's text that decides its chunk keys: the revision
+/// above, and the budget and overlap in model tokens, with the tokenizer
+/// file's digest, or without a tokenizer in chars. Recorded with
+/// `embed_complete` rows.
+pub(crate) fn chunking_signature() -> String {
+    let cfg = chunker_config();
+    match &cfg.tokenizer_sha256 {
+        Some(sha) => format!(
+            "r{CHUNKING_REVISION}:tokens:{}:{}:{}",
+            cfg.max_tokens,
+            cfg.overlap,
+            &sha[..16]
+        ),
+        None => {
+            format!(
+                "r{CHUNKING_REVISION}:chars:{FALLBACK_MAX_CHUNK_CHARS}:{FALLBACK_OVERLAP_CHARS}"
+            )
+        }
+    }
+}
+
 struct ChunkerConfig {
     /// The embedding model's tokenizer (`None` → char fallback: model not on
     /// disk, e.g. tests / fresh install).
     tokenizer: Option<tokenizers::Tokenizer>,
+    /// SHA-256 of the `tokenizer.json` bytes `tokenizer` was built from; set
+    /// exactly when `tokenizer` is. Re-downloading the model into the same
+    /// directory can change it while every other input stays the same.
+    tokenizer_sha256: Option<String>,
     max_tokens: usize,
     overlap: usize,
 }
@@ -98,12 +132,14 @@ fn chunker_config() -> &'static ChunkerConfig {
             .model_path
             .clone()
             .unwrap_or_else(crate::search::model_manager::default_model_path);
-        let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
+        let (tokenizer, tokenizer_sha256) = std::fs::read(model_dir.join("tokenizer.json"))
             .ok()
-            .map(|mut t| {
-                t.with_truncation(None).ok();
-                t
-            });
+            .and_then(|bytes| {
+                let mut tokenizer = tokenizers::Tokenizer::from_bytes(&bytes).ok()?;
+                tokenizer.with_truncation(None).ok();
+                Some((tokenizer, format!("{:x}", Sha256::digest(&bytes))))
+            })
+            .unzip();
         // Budget derives from the model's real limit; an explicit override is
         // still clamped to it (a chunk larger than the model can never help —
         // it would just get truncated). Everything stays ≥1. When the model
@@ -124,6 +160,7 @@ fn chunker_config() -> &'static ChunkerConfig {
             .min(max_tokens.saturating_sub(1));
         ChunkerConfig {
             tokenizer,
+            tokenizer_sha256,
             max_tokens,
             overlap,
         }

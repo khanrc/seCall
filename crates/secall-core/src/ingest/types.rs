@@ -75,6 +75,10 @@ impl Turn {
     /// far lower token cost). Sharing this between the chunker and BM25 keeps
     /// tool-only assistant turns — which have empty `content` — searchable
     /// instead of indexing as empty and being skipped (#1585).
+    ///
+    /// Changing the output can re-chunk stored turns: bump the chunker's
+    /// `CHUNKING_REVISION`, or `secall embed` keeps skipping sessions it
+    /// recorded as complete.
     pub fn index_text(&self) -> String {
         let mut parts = Vec::new();
         if !self.content.is_empty() {

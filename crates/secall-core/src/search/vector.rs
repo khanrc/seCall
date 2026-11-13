@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::{anyhow, Result};
 
 use super::bm25::{IndexStats, SearchFilters, SearchResult, SessionMeta};
-use super::chunker::chunk_session;
+use super::chunker::{chunk_session, chunking_signature};
 use super::embedding::{Embedder, OllamaEmbedder, OpenAIEmbedder, OrtEmbedder};
 use super::model_manager::{default_model_path, ModelManager};
 #[cfg(not(target_os = "windows"))]
@@ -133,6 +133,57 @@ impl VectorIndexer {
         self.embedder.dimensions()
     }
 
+    /// Sessions that [`Self::check_pending`] has to look at: every session
+    /// that takes vectors, except those it already found complete under this
+    /// model and chunking.
+    pub fn sessions_to_check(&self, db: &Database) -> Result<Vec<String>> {
+        Ok(db.sessions_to_check_for_embedding(
+            &self.skipped_session_types,
+            self.model_name(),
+            &chunking_signature(),
+        )?)
+    }
+
+    /// Whether the session has a chunk without a vector. `secall embed` asks
+    /// this before embedding, so its `[i/total]` progress counts real work.
+    ///
+    /// Answering means loading the session and re-chunking every turn, so a
+    /// session found complete is recorded in `embed_complete` and left out of
+    /// [`Self::sessions_to_check`] until a trigger drops the record.
+    ///
+    /// The check reads one snapshot without the write lock, which a large
+    /// session would hold for seconds while it is tokenized. If another
+    /// connection commits before the record is written, the record is refused
+    /// with a busy error. A caller that keeps such a session queued embeds
+    /// whatever changed, and the next scan checks it again; a write after the
+    /// record is caught by its trigger.
+    pub fn check_pending(
+        &self,
+        db: &Database,
+        session_id: &str,
+        tz: chrono_tz::Tz,
+    ) -> Result<bool> {
+        Ok(db.with_snapshot_transaction(|| {
+            // A skipped type takes no vectors, and a deleted session has none
+            // to take; neither is recorded.
+            if self.takes_vectors(db, session_id)? != Some(true) {
+                return Ok(false);
+            }
+            let session = db.get_session_for_embedding(session_id)?;
+            let existing_keys = db.get_session_chunk_keys(session_id)?;
+            let pending = chunk_session(&session, tz)
+                .iter()
+                .any(|c| !existing_keys.contains(&(c.turn_index, c.seq)));
+            if !pending {
+                // An older binary may have created `turn_vectors`, without its
+                // trigger, after this process opened the database.
+                db.ensure_embed_complete()?;
+                db.mark_embed_complete(session_id, self.model_name(), &chunking_signature())?;
+            }
+            Ok(pending)
+        })?)
+    }
+
     /// Index a session's vectors, turn-incrementally.
     ///
     /// Skips chunks whose `(turn_index, chunk_seq)` already exists in
@@ -143,32 +194,6 @@ impl VectorIndexer {
     ///
     /// Callers that need a wholesale rebuild (e.g. model change) should call
     /// `db.delete_session_vectors(session_id)` first.
-    /// Cheap dry-run check: does this session have any chunk that would need
-    /// to be embedded? Used by `secall embed` to pre-filter no-op sessions
-    /// (already fully embedded, or every turn is chunker-skip) so the actual
-    /// embed pass shows accurate `[i/total]` progress instead of iterating
-    /// over thousands of fast no-ops.
-    ///
-    /// No DB write, no network — just chunker + a single indexed SELECT.
-    pub fn has_pending_chunks(
-        &self,
-        db: &Database,
-        session: &Session,
-        tz: chrono_tz::Tz,
-    ) -> Result<bool> {
-        if self.takes_vectors(db, &session.id)? == Some(false) {
-            return Ok(false);
-        }
-        let all_chunks = chunk_session(session, tz);
-        if all_chunks.is_empty() {
-            return Ok(false);
-        }
-        let existing_keys = db.get_session_chunk_keys(&session.id)?;
-        Ok(all_chunks
-            .iter()
-            .any(|c| !existing_keys.contains(&(c.turn_index, c.seq))))
-    }
-
     pub async fn index_session(
         &self,
         db: &Database,
@@ -1121,8 +1146,10 @@ mod tests {
             .unwrap();
         assert_eq!(removed, 1);
         assert!(!skipping
-            .has_pending_chunks(&db, &automated, chrono_tz::UTC)
+            .check_pending(&db, "auto-sess", chrono_tz::UTC)
             .unwrap());
+        assert_eq!(embed_records(&db), 0);
+        assert_eq!(skipping.sessions_to_check(&db).unwrap(), vec!["chat-sess"]);
         let stats = skipping
             .index_session(&db, &automated, chrono_tz::UTC)
             .await
@@ -1131,6 +1158,134 @@ mod tests {
         assert_eq!(stats.chunks_embedded, 0);
         assert!(db.get_session_chunk_keys("auto-sess").unwrap().is_empty());
         assert_eq!(db.get_session_chunk_keys("chat-sess").unwrap().len(), 1);
+    }
+
+    /// Stores a one-turn interactive session with its turn rows, which
+    /// `check_pending` loads.
+    fn store_session(db: &Database, id: &str) {
+        let session = one_turn_session(id, "interactive");
+        db.insert_session(&session).unwrap();
+        for turn in &session.turns {
+            db.insert_turn(id, turn).unwrap();
+        }
+    }
+
+    async fn embed_stored(indexer: &VectorIndexer, db: &Database, id: &str) {
+        let session = db.get_session_for_embedding(id).unwrap();
+        indexer
+            .index_session(db, &session, chrono_tz::UTC)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_session_found_complete_is_skipped_until_it_changes() {
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+        store_session(&db, "s");
+        let indexer = VectorIndexer::new(Box::new(FakeEmbedder));
+        let tz = chrono_tz::UTC;
+
+        assert!(indexer.check_pending(&db, "s", tz).unwrap());
+        assert_eq!(indexer.sessions_to_check(&db).unwrap(), vec!["s"]);
+        embed_stored(&indexer, &db, "s").await;
+        assert!(!indexer.check_pending(&db, "s", tz).unwrap());
+        assert!(indexer.sessions_to_check(&db).unwrap().is_empty());
+
+        // An appended turn has no vector yet.
+        let mut next = one_turn_session("s", "interactive").turns.remove(0);
+        next.index = 1;
+        db.insert_turn("s", &next).unwrap();
+        assert_eq!(indexer.sessions_to_check(&db).unwrap(), vec!["s"]);
+        assert!(indexer.check_pending(&db, "s", tz).unwrap());
+        embed_stored(&indexer, &db, "s").await;
+        assert!(!indexer.check_pending(&db, "s", tz).unwrap());
+
+        // A lost vector, as a partial rebuild leaves it.
+        db.conn()
+            .execute(
+                "DELETE FROM turn_vectors WHERE session_id = 's' AND turn_index = 1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(indexer.sessions_to_check(&db).unwrap(), vec!["s"]);
+        assert!(indexer.check_pending(&db, "s", tz).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_every_change_that_can_unembed_a_chunk_drops_the_record() {
+        type Change = fn(&Database);
+        let indexer = VectorIndexer::new(Box::new(FakeEmbedder));
+        let changes: [(&str, Change); 3] = [
+            ("turn update", |db| {
+                db.conn()
+                    .execute("UPDATE turns SET content = 'edited'", [])
+                    .unwrap();
+            }),
+            ("turn delete", |db| {
+                db.conn().execute("DELETE FROM turns", []).unwrap();
+            }),
+            ("vector delete", |db| {
+                db.delete_session_vectors("s").unwrap();
+            }),
+        ];
+        for (change, apply) in changes {
+            let db = Database::open_memory().unwrap();
+            db.init_vector_table().unwrap();
+            store_session(&db, "s");
+            embed_stored(&indexer, &db, "s").await;
+            assert!(!indexer.check_pending(&db, "s", chrono_tz::UTC).unwrap());
+            assert_eq!(embed_records(&db), 1);
+
+            apply(&db);
+
+            assert_eq!(embed_records(&db), 0, "{change} left the record");
+        }
+    }
+
+    #[test]
+    fn test_deleting_a_session_drops_its_record() {
+        // `delete_session_full` deletes vectors and turns first, whose triggers
+        // drop the record already; a session without turns reaches only the
+        // sessions trigger, which keeps its record from outliving it.
+        let indexer = VectorIndexer::new(Box::new(FakeEmbedder));
+        let db = Database::open_memory().unwrap();
+        db.init_vector_table().unwrap();
+        let mut session = one_turn_session("s", "interactive");
+        session.turns.clear();
+        db.insert_session(&session).unwrap();
+        assert!(!indexer.check_pending(&db, "s", chrono_tz::UTC).unwrap());
+        assert_eq!(embed_records(&db), 1);
+
+        db.conn()
+            .execute("DELETE FROM sessions WHERE id = 's'", [])
+            .unwrap();
+
+        assert_eq!(embed_records(&db), 0);
+    }
+
+    fn embed_records(db: &Database) -> i64 {
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM embed_complete", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_a_completion_record_counts_only_for_its_model_and_chunking() {
+        let db = Database::open_memory().unwrap();
+        store_session(&db, "s");
+        let indexer = VectorIndexer::new(Box::new(FakeEmbedder));
+        let chunking = chunking_signature();
+
+        db.mark_embed_complete("s", "other-model", &chunking)
+            .unwrap();
+        assert_eq!(indexer.sessions_to_check(&db).unwrap(), vec!["s"]);
+        db.mark_embed_complete("s", indexer.model_name(), "r0:chars:1:0")
+            .unwrap();
+        assert_eq!(indexer.sessions_to_check(&db).unwrap(), vec!["s"]);
+        db.mark_embed_complete("s", indexer.model_name(), &chunking)
+            .unwrap();
+        assert!(indexer.sessions_to_check(&db).unwrap().is_empty());
     }
 
     #[tokio::test]

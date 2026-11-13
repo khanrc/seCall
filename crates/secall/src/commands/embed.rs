@@ -133,38 +133,33 @@ pub async fn run(
     let model = indexer.model_name().to_string();
     let dimensions = indexer.dimensions();
     let tz = config.timezone();
-    let candidate_ids: Vec<String> = db.list_all_session_ids()?;
 
     // Pre-filter pass — sessions whose chunks are all already embedded (or
     // whose every turn is chunker-skip) are dropped, so [i/N] progress reflects
-    // actual work. Only ids are kept: holding every pending Session until its
-    // turn in the embed pass grows with the backlog, and the worker reloads one
-    // session at a time instead.
+    // actual work. A session found complete is recorded and left out of later
+    // passes until its turns or vectors change. Only ids are kept: holding
+    // every pending Session until its turn in the embed pass grows with the
+    // backlog, and the worker reloads one session at a time instead.
     //
     // `--all` skips the pre-filter — the worker deletes each session's vectors
     // before re-embedding it.
     let work: Vec<String> = if all {
-        candidate_ids
+        db.list_all_session_ids()?
     } else {
         let scan_start = Instant::now();
+        let candidate_ids = indexer.sessions_to_check(&db)?;
         let total_candidates = candidate_ids.len();
-        eprintln!("Scanning {total_candidates} session(s) for pending chunks...");
+        eprintln!("Checking {total_candidates} session(s) not yet recorded as fully embedded...");
         let mut pending: Vec<String> = Vec::new();
         for sid in candidate_ids {
             // A session that fails to load or check stays queued, so the embed
             // pass reports the failure.
-            let needs_embedding = match db.get_session_for_embedding(&sid) {
-                Ok(session) => indexer
-                    .has_pending_chunks(&db, &session, tz)
-                    .unwrap_or(true),
-                Err(_) => true,
-            };
-            if needs_embedding {
+            if indexer.check_pending(&db, &sid, tz).unwrap_or(true) {
                 pending.push(sid);
             }
         }
         eprintln!(
-            "  Scan: {} session(s) need embedding, {} skipped no-op (in {:.2}s)",
+            "  Scan: {} session(s) need embedding, {} recorded complete (in {:.2}s)",
             pending.len(),
             total_candidates - pending.len(),
             scan_start.elapsed().as_secs_f64(),
