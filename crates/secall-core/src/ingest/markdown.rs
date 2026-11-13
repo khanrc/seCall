@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use super::types::{Action, Role, Session};
+use super::{truncate_str, TOOL_OUTPUT_MAX_CHARS};
 
 // ─── Vault reverse-parsing ────────────────────────────────────────────────────
 
@@ -83,8 +84,6 @@ pub fn extract_body_text(content: &str) -> String {
         .unwrap_or("")
         .to_string()
 }
-
-const TOOL_OUTPUT_MAX_CHARS: usize = 500;
 
 /// Render a Session to Obsidian-compatible Markdown string
 pub fn render_session(session: &Session, tz: chrono_tz::Tz) -> String {
@@ -390,16 +389,6 @@ pub fn extract_summary_from_body(content: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn truncate_str(s: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max_chars {
-        s.to_string()
-    } else {
-        let truncated: String = chars[..max_chars].iter().collect();
-        format!("{}...", truncated)
-    }
 }
 
 /// Dataview inline field 방지: fenced code block / inline code 밖의 `::` 사이에

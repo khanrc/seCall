@@ -69,7 +69,6 @@ fn default_branch() -> String {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct IngestConfig {
-    pub tool_output_max_chars: usize,
     pub thinking_included: bool,
     pub classification: ClassificationConfig,
 }
@@ -367,7 +366,6 @@ impl Default for Config {
 impl Default for IngestConfig {
     fn default() -> Self {
         IngestConfig {
-            tool_output_max_chars: 500,
             thinking_included: true,
             classification: ClassificationConfig::default(),
         }
@@ -709,6 +707,14 @@ mod tests {
         let including: Config =
             toml::from_str("[embedding]\nbackend = \"ort\"\ninclude_automated = true\n").unwrap();
         assert!(including.embedding.skipped_session_types().is_empty());
+    }
+
+    #[test]
+    fn test_config_still_loads_with_the_removed_tool_output_knob() {
+        // `[ingest] tool_output_max_chars` was never read and is gone; config
+        // files written while it existed still set it.
+        let config: Config = toml::from_str("[ingest]\ntool_output_max_chars = 500\n").unwrap();
+        assert!(config.ingest.thinking_included);
     }
 
     #[test]

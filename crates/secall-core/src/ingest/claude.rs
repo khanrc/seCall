@@ -7,9 +7,7 @@ use chrono::DateTime;
 use serde_json::Value;
 
 use super::types::{Action, AgentKind, Role, Session, TokenUsage, Turn};
-use super::SessionParser;
-
-const TOOL_OUTPUT_MAX_CHARS: usize = 1000;
+use super::{truncate_str, SessionParser, TOOL_OUTPUT_MAX_CHARS};
 
 pub struct ClaudeCodeParser;
 
@@ -408,16 +406,6 @@ fn summarize_tool_input(tool_name: &str, input: &Value) -> String {
             let s = input.to_string();
             truncate_str(&s, 200)
         }
-    }
-}
-
-fn truncate_str(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else {
-        let truncated: String = chars[..max].iter().collect();
-        format!("{}...", truncated)
     }
 }
 

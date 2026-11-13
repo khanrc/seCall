@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use super::types::{Action, AgentKind, Role, Session, Turn};
-use super::SessionParser;
+use super::{truncate_str, SessionParser, TOOL_OUTPUT_MAX_CHARS};
 
 pub struct CodexParser;
 
@@ -251,7 +251,7 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                         let action_idx = actions.len();
                         actions.push(Action::ToolUse {
                             name: rp.name.unwrap_or_else(|| "unknown".to_string()),
-                            input_summary: value_to_string(input),
+                            input_summary: drop_patch_bodies(value_to_string(input)),
                             output_summary: String::new(),
                             tool_use_id: Some(call_id.clone()),
                         });
@@ -266,7 +266,10 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                                 .get_mut(turn_pos)
                                 .and_then(|turn| turn.actions.get_mut(action_idx))
                             {
-                                *output_summary = tool_output_text(rp.output);
+                                *output_summary = truncate_str(
+                                    &tool_output_text(rp.output),
+                                    TOOL_OUTPUT_MAX_CHARS,
+                                );
                             }
                         }
                     }
@@ -371,6 +374,125 @@ fn tool_output_text(output: serde_json::Value) -> String {
     } else {
         value_to_string(output)
     }
+}
+
+const PATCH_BEGIN: &str = "*** Begin Patch";
+const PATCH_END: &str = "*** End Patch";
+const PATCH_FILE_HEADERS: [&str; 4] = [
+    "*** Add File: ",
+    "*** Update File: ",
+    "*** Delete File: ",
+    "*** Move to: ",
+];
+
+/// `input` with each `apply_patch` envelope reduced to its file header lines,
+/// as Claude Code's Edit and Write keep only the path: code a patch writes is
+/// not indexed. An envelope may sit anywhere in the input, such as a string
+/// literal in a code-mode `exec` script, where its line breaks can be `\n`
+/// escapes. It counts only when a line break follows `*** Begin Patch`, the
+/// next line is a file header, and a later line is `*** End Patch`, with no
+/// `*** Begin Patch` line between. When a quote opens the literal right before
+/// `*** Begin Patch`, the envelope must also end before that literal closes.
+/// So a mention of the markers, a patch quoted inside a patched file, or a
+/// patch built by concatenating literals is left alone.
+fn drop_patch_bodies(input: String) -> String {
+    if !input.contains(PATCH_BEGIN) {
+        return input;
+    }
+    let mut out = String::new();
+    let mut rest = input.as_str();
+    let mut from = 0;
+    while let Some(found) = rest[from..].find(PATCH_BEGIN) {
+        let begin = from + found;
+        let body_at = begin + PATCH_BEGIN.len();
+        let quote = rest[..begin]
+            .chars()
+            .next_back()
+            .filter(|c| matches!(c, '"' | '\'' | '`'));
+        let Some((headers, len)) = patch_envelope(&rest[body_at..], quote) else {
+            from = body_at;
+            continue;
+        };
+        out.push_str(&rest[..body_at]);
+        for header in headers {
+            out.push('\n');
+            out.push_str(header);
+        }
+        out.push('\n');
+        out.push_str(PATCH_END);
+        rest = &rest[body_at + len..];
+        from = 0;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// For the text right after a `*** Begin Patch`: the envelope's file headers
+/// and its length through `*** End Patch`, or `None` when it is no envelope.
+/// The break that opens the text decides whether the envelope's breaks are
+/// real or `\n` escapes. `quote` is the quote of the literal the envelope
+/// opens, if any; a line where it closes ends the search.
+fn patch_envelope(body: &str, quote: Option<char>) -> Option<(Vec<&str>, usize)> {
+    let escaped = if body.starts_with('\n') || body.starts_with("\r\n") {
+        false
+    } else if body.starts_with("\\n") || body.starts_with("\\r\\n") {
+        true
+    } else {
+        return None;
+    };
+    let mut headers = Vec::new();
+    for (i, (line_at, line)) in patch_lines(body, escaped).enumerate() {
+        if i > 0 && line.starts_with(PATCH_END) {
+            return Some((headers, line_at + PATCH_END.len()));
+        }
+        let closes =
+            quote.is_some_and(|q| line.match_indices(q).any(|(at, _)| !is_escaped(line, at)));
+        if closes || line.starts_with(PATCH_BEGIN) {
+            return None;
+        }
+        if is_patch_file_header(line) {
+            headers.push(line);
+        } else if i == 0 {
+            return None;
+        }
+    }
+    None
+}
+
+/// Each line of `text` that follows a line break, with where it starts.
+/// Breaks are real, or `\n` escapes when `escaped`, and take a `\r` right
+/// before them along; an escape whose backslash is itself escaped is none.
+fn patch_lines(text: &str, escaped: bool) -> impl Iterator<Item = (usize, &str)> {
+    let (newline, carriage) = if escaped {
+        ("\\n", "\\r")
+    } else {
+        ("\n", "\r")
+    };
+    let mut breaks = text
+        .match_indices(newline)
+        .map(|(at, _)| at)
+        .filter(move |&at| !escaped || !is_escaped(text, at))
+        .map(move |at| {
+            let carried = text[..at].ends_with(carriage)
+                && !(escaped && is_escaped(text, at - carriage.len()));
+            let start = if carried { at - carriage.len() } else { at };
+            (start, at + newline.len())
+        })
+        .peekable();
+    std::iter::from_fn(move || {
+        let (_, line_at) = breaks.next()?;
+        let line_end = breaks.peek().map_or(text.len(), |&(next, _)| next);
+        Some((line_at, &text[line_at..line_end]))
+    })
+}
+
+/// Whether the char at `at` is escaped: an odd run of backslashes precedes it.
+fn is_escaped(text: &str, at: usize) -> bool {
+    text[..at].bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1
+}
+
+fn is_patch_file_header(line: &str) -> bool {
+    PATCH_FILE_HEADERS.iter().any(|h| line.starts_with(h))
 }
 
 /// Convert a serde_json::Value to String — strings pass through, others serialize to JSON.
@@ -673,7 +795,7 @@ mod tests {
                 ),
                 (
                     "apply_patch",
-                    "*** Begin Patch\n*** Add File: b.md\n+B\n*** End Patch",
+                    "*** Begin Patch\n*** Add File: b.md\n*** End Patch",
                     "Success. Updated the following files:\nA b.md",
                 ),
             ]
@@ -682,6 +804,118 @@ mod tests {
         assert!(assistant
             .index_text()
             .contains("[Tool: exec] const r = await tools.exec_command"));
+    }
+
+    #[test]
+    fn test_drop_patch_bodies_keeps_only_file_headers() {
+        let cases = [
+            (
+                "apply_patch input",
+                "*** Begin Patch\n*** Update File: src/a.rs\n*** Move to: src/b.rs\n@@ fn a\n-old\n+new\n*** Delete File: c.md\n*** Add File: d.md\n+*** Add File: not-a-header.md\n*** End Patch",
+                "*** Begin Patch\n*** Update File: src/a.rs\n*** Move to: src/b.rs\n*** Delete File: c.md\n*** Add File: d.md\n*** End Patch",
+            ),
+            (
+                "exec script with an escaped patch literal",
+                "const patch = \"*** Begin Patch\\n*** Add File: e.json\\n+{\\\"k\\\": 1}\\n*** End Patch\\n\";\nawait tools.apply_patch(patch);",
+                "const patch = \"*** Begin Patch\n*** Add File: e.json\n*** End Patch\\n\";\nawait tools.apply_patch(patch);",
+            ),
+            (
+                "two envelopes",
+                "*** Begin Patch\n*** Add File: f\n+1\n*** End Patch\nthen\n*** Begin Patch\n*** Add File: g\n+2\n*** End Patch",
+                "*** Begin Patch\n*** Add File: f\n*** End Patch\nthen\n*** Begin Patch\n*** Add File: g\n*** End Patch",
+            ),
+            (
+                "no end marker",
+                "*** Begin Patch\n*** Add File: h\n+1",
+                "*** Begin Patch\n*** Add File: h\n+1",
+            ),
+            (
+                "a mention before a real patch",
+                "grep -c '*** Begin Patch' notes.md && apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: x\n+1\n*** End Patch\nEOF",
+                "grep -c '*** Begin Patch' notes.md && apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: x\n*** End Patch\nEOF",
+            ),
+            (
+                "patch markers inside the patched file",
+                "*** Begin Patch\n*** Add File: t.rs\n+const END: &str = \"*** End Patch\";\n+let p = \"*** Begin Patch\\n*** Update File: fake\\n*** End Patch\";\n*** End Patch",
+                "*** Begin Patch\n*** Add File: t.rs\n*** End Patch",
+            ),
+            (
+                "CRLF and a Windows path",
+                "*** Begin Patch\r\n*** Update File: C:\\work\\a.rs\r\n@@\r\n-a\r\n+b\r\n*** End of File\r\n*** End Patch\r\n",
+                "*** Begin Patch\n*** Update File: C:\\work\\a.rs\n*** End Patch\r\n",
+            ),
+            (
+                "an escaped backslash before n in a literal path",
+                "p = \"*** Begin Patch\\n*** Add File: C:\\\\new\\\\a.rs\\n+1\\n*** End Patch\"",
+                "p = \"*** Begin Patch\n*** Add File: C:\\\\new\\\\a.rs\n*** End Patch\"",
+            ),
+            (
+                "escaped CRLF in shell arguments",
+                "{\"command\":[\"apply_patch\",\"*** Begin Patch\\r\\n*** Update File: a.rs\\r\\n@@\\r\\n-a\\r\\n+b\\r\\n*** End Patch\\r\\n\"]}",
+                "{\"command\":[\"apply_patch\",\"*** Begin Patch\n*** Update File: a.rs\n*** End Patch\\r\\n\"]}",
+            ),
+            (
+                "a literal without its end marker before a complete one",
+                "a = \"*** Begin Patch\\n*** Add File: a\\n+1\"; b = \"*** Begin Patch\\n*** Add File: b\\n+2\\n*** End Patch\";",
+                "a = \"*** Begin Patch\\n*** Add File: a\\n+1\"; b = \"*** Begin Patch\n*** Add File: b\n*** End Patch\";",
+            ),
+            (
+                "text between the begin marker and the line break",
+                "echo '*** Begin Patch' x\n*** Add File: y\n+1\n*** End Patch",
+                "echo '*** Begin Patch' x\n*** Add File: y\n+1\n*** End Patch",
+            ),
+            (
+                "a line before the first file header",
+                "*** Begin Patch\nnot a header\n*** Add File: z\n+1\n*** End Patch",
+                "*** Begin Patch\nnot a header\n*** Add File: z\n+1\n*** End Patch",
+            ),
+            (
+                "a template literal without its end marker before a complete one",
+                "const a = `*** Begin Patch\n*** Add File: a\n${body}`;\nconst b = `*** Begin Patch\n*** Add File: b\n+x\n*** End Patch`;",
+                "const a = `*** Begin Patch\n*** Add File: a\n${body}`;\nconst b = `*** Begin Patch\n*** Add File: b\n*** End Patch`;",
+            ),
+            (
+                "a heredoc in a single-quoted literal with quotes in the body",
+                "run({cmd: 'apply_patch <<PATCH\\n*** Begin Patch\\n*** Add File: a.json\\n+{\"k\":1}\\n*** End Patch\\nPATCH'});",
+                "run({cmd: 'apply_patch <<PATCH\\n*** Begin Patch\n*** Add File: a.json\n*** End Patch\\nPATCH'});",
+            ),
+            (
+                "a begin line before the end line",
+                "*** Begin Patch\n*** Add File: a\n*** Begin Patch\n*** Add File: b\n+1\n*** End Patch",
+                "*** Begin Patch\n*** Add File: a\n*** Begin Patch\n*** Add File: b\n*** End Patch",
+            ),
+        ];
+        for (case, input, expected) in cases {
+            assert_eq!(drop_patch_bodies(input.to_string()), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn test_codex_tool_output_is_capped() {
+        let long = "x".repeat(TOOL_OUTPUT_MAX_CHARS + 100);
+        let output_line = format!(
+            r#"{{"timestamp":"2026-11-08T10:00:04Z","type":"response_item","payload":{{"type":"custom_tool_call_output","call_id":"call-1","output":"{long}"}}}}"#
+        );
+        let f = make_codex_file(&[
+            r#"{"type":"session_meta","payload":{"id":"long-output"}}"#,
+            r#"{"timestamp":"2026-11-08T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"dump it"}]}}"#,
+            r#"{"timestamp":"2026-11-08T10:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-1","name":"exec","input":"text(big)"}}"#,
+            output_line.as_str(),
+        ]);
+        let session = parse_codex_jsonl(f.path()).unwrap();
+        let outputs: Vec<_> = session
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.actions)
+            .map(|action| match action {
+                Action::ToolUse { output_summary, .. } => output_summary.clone(),
+                _ => panic!("expected ToolUse"),
+            })
+            .collect();
+        assert_eq!(
+            outputs,
+            vec![format!("{}...", &long[..TOOL_OUTPUT_MAX_CHARS])]
+        );
     }
 
     #[test]

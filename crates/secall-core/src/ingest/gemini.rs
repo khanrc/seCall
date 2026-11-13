@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use super::types::{Action, AgentKind, Role, Session, TokenUsage, Turn};
-use super::SessionParser;
+use super::{truncate_str, SessionParser, TOOL_OUTPUT_MAX_CHARS};
 
 pub struct GeminiParser;
 
@@ -201,8 +201,8 @@ pub fn parse_gemini_json(path: &Path) -> Result<Session> {
                                     .or_else(|| fr.response.get("error"))
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
-                                    .to_string()
                             })
+                            .map(|output| truncate_str(output, TOOL_OUTPUT_MAX_CHARS))
                             .unwrap_or_default();
 
                         actions.push(Action::ToolUse {
