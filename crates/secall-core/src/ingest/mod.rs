@@ -16,6 +16,22 @@ pub mod types;
 
 pub use types::{Action, AgentKind, Role, Session, TokenUsage, Turn, AUTOMATED_SESSION_TYPE};
 
+/// Most chars of a tool's output a parser keeps in `Action::ToolUse`. Output is
+/// not indexed, and the vault markdown shows only this much of it, so a parser
+/// stores no more than that.
+pub(crate) const TOOL_OUTPUT_MAX_CHARS: usize = 500;
+
+/// `s` cut to `max` chars, with `...` appended when anything was cut.
+pub(crate) fn truncate_str(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = chars[..max].iter().collect();
+        format!("{}...", truncated)
+    }
+}
+
 /// P49: secall 이 Claude Code 를 invoke 해 세션 요약을 생성할 때 던지는 프롬프트
 /// prefix. 변경 시 wiki 등 생성 코드와 함께 갱신할 것.
 const SECALL_SUMMARY_PROMPT_PREFIX: &str =

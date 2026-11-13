@@ -333,7 +333,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SECALL_CONFIG_PATH", "/nonexistent/path/config.toml");
         let config = Config::load_or_default();
-        assert!(config.ingest.tool_output_max_chars > 0);
+        assert!(config.ingest.thinking_included);
         std::env::remove_var("SECALL_CONFIG_PATH");
     }
 
