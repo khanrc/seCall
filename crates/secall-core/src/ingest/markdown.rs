@@ -249,22 +249,22 @@ pub fn render_session(session: &Session, tz: chrono_tz::Tz) -> String {
                     output_summary,
                     ..
                 } => {
-                    out.push_str(&format!("> [!tool]- {}\n", name));
+                    out.push_str(&format!("{TOOL_CALLOUT}{name}\n"));
                     if !input_summary.is_empty() {
-                        out.push_str("> ```\n");
+                        out.push_str(&format!("> {TOOL_FENCE}\n"));
                         for line in input_summary.lines() {
                             out.push_str(&format!("> {}\n", line));
                         }
-                        out.push_str("> ```\n");
+                        out.push_str(&format!("> {TOOL_FENCE}\n"));
                     }
                     if !output_summary.is_empty() {
                         let truncated = truncate_str(output_summary, TOOL_OUTPUT_MAX_CHARS);
-                        out.push_str("> **Output:**\n");
-                        out.push_str("> ```\n");
+                        out.push_str(&format!("> {TOOL_OUTPUT_LABEL}\n"));
+                        out.push_str(&format!("> {TOOL_FENCE}\n"));
                         for line in truncated.lines() {
                             out.push_str(&format!("> {}\n", line));
                         }
-                        out.push_str("> ```\n");
+                        out.push_str(&format!("> {TOOL_FENCE}\n"));
                     }
                     out.push('\n');
                 }
@@ -288,6 +288,16 @@ pub fn render_session(session: &Session, tz: chrono_tz::Tz) -> String {
 /// First line of the callout that holds a turn's thinking, right under the
 /// turn header; every line of the thinking follows it behind `> `.
 pub(crate) const THINKING_CALLOUT: &str = "> [!thinking]- Thinking";
+
+/// Start of the first line of a tool call's callout, followed by the tool name.
+/// The callouts follow the turn's content, a blank line after each.
+pub(crate) const TOOL_CALLOUT: &str = "> [!tool]- ";
+
+/// Fence around a tool call's input and output inside its callout.
+pub(crate) const TOOL_FENCE: &str = "```";
+
+/// The callout line that opens a tool call's output.
+pub(crate) const TOOL_OUTPUT_LABEL: &str = "**Output:**";
 
 /// Generate the vault-relative path for a session file
 pub fn session_vault_path(session: &Session, tz: chrono_tz::Tz) -> PathBuf {

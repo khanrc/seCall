@@ -33,6 +33,15 @@ pub trait SessionRepo {
     fn delete_session(&self, session_id: &str) -> Result<()>;
 }
 
+/// How `turns.actions_json` stores a turn's actions: NULL when it has none.
+fn actions_json(actions: &[crate::ingest::Action]) -> Option<String> {
+    if actions.is_empty() {
+        None
+    } else {
+        serde_json::to_string(actions).ok()
+    }
+}
+
 // SessionRepo impl for Database — session/turn CRUD
 impl SessionRepo for Database {
     fn insert_session(&self, session: &Session) -> crate::error::Result<()> {
@@ -127,12 +136,8 @@ impl SessionRepo for Database {
         let has_tool = !tool_names.is_empty();
 
         // Persist the full action list so the deferred embed path can fold tool
-        // text into the index (#1585). NULL when there are no actions.
-        let actions_json = if turn.actions.is_empty() {
-            None
-        } else {
-            serde_json::to_string(&turn.actions).ok()
-        };
+        // text into the index (#1585).
+        let actions_json = actions_json(&turn.actions);
 
         // Returns rows affected: 1 when the turn was newly inserted, 0 when the
         // UNIQUE(session_id, turn_index) row already existed and INSERT OR IGNORE
@@ -530,12 +535,11 @@ impl Database {
         Ok(migrated)
     }
 
-    /// vault 마크다운의 frontmatter로 sessions 테이블에 insert.
-    /// turns 테이블에는 본문 전체를 단일 FTS 청크로 저장.
+    /// vault 마크다운의 frontmatter로 sessions 테이블에 insert. The caller
+    /// stores the turns read from the Markdown body, each with its FTS row.
     pub fn insert_session_from_vault(
         &self,
         fm: &crate::ingest::markdown::SessionFrontmatter,
-        body_text: &str,
         vault_path: &str,
     ) -> Result<()> {
         let archived_int: i64 = fm.archived.unwrap_or(false) as i64;
@@ -586,11 +590,6 @@ impl Database {
                 fm.session_id
             ],
         )?;
-
-        // FTS 인덱싱 — 본문 전체를 하나의 청크로
-        if !body_text.trim().is_empty() {
-            self.insert_fts(body_text, &fm.session_id, 0)?;
-        }
 
         Ok(())
     }
@@ -655,19 +654,20 @@ impl Database {
 
     /// Bring a vault-built session up to date with its changed Markdown.
     ///
-    /// The session row, the whole-body FTS row, and the source snapshot always
-    /// follow the Markdown. Stored turns that still equal the leading turns of
-    /// `turns` keep their rows and vectors. From the first turn that differs
-    /// on, turns are replaced and their vectors dropped for the embed pass to
-    /// rebuild. A session that is still running then re-embeds only the turn
-    /// whose tool output arrived since the last render, while a re-render
-    /// that moved turn boundaries replaces everything after the first move.
+    /// The session row, the FTS rows (one per turn, `fts_text` of it), and the
+    /// source snapshot always follow the Markdown. Stored turns that still
+    /// equal the leading turns of `turns`, tool calls included, keep their rows
+    /// and vectors. From the first turn that differs on, turns are replaced and
+    /// their vectors dropped for the embed pass to rebuild. A session that is
+    /// still running then re-embeds only the turn whose tool output arrived
+    /// since the last render, while a re-render that moved turn boundaries
+    /// replaces everything after the first move.
     pub fn refresh_session_from_vault(
         &self,
         fm: &crate::ingest::markdown::SessionFrontmatter,
-        body_text: &str,
         vault_path: &str,
         turns: &[Turn],
+        fts_text: &dyn Fn(&Turn) -> String,
         snapshot: (i64, i64),
     ) -> Result<VaultRefresh> {
         let id = fm.session_id.as_str();
@@ -687,8 +687,8 @@ impl Database {
             };
 
             self.delete_session_fts(id)?;
-            if !body_text.trim().is_empty() {
-                self.insert_fts(body_text, id, 0)?;
+            for turn in turns {
+                self.insert_fts(&fts_text(turn), id, turn.index)?;
             }
 
             // Favorites, notes, tags, and classification belong to this host
@@ -731,7 +731,7 @@ impl Database {
     /// turns of `turns`.
     fn unchanged_turn_prefix(&self, session_id: &str, turns: &[Turn]) -> Result<usize> {
         let mut stmt = self.conn().prepare(
-            "SELECT turn_index, role, content FROM turns
+            "SELECT turn_index, role, content, actions_json FROM turns
              WHERE session_id = ?1 ORDER BY turn_index ASC",
         )?;
         let stored = stmt
@@ -740,16 +740,18 @@ impl Database {
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(stored
             .iter()
             .zip(turns)
-            .take_while(|((index, role, content), turn)| {
+            .take_while(|((index, role, content, actions), turn)| {
                 *index == i64::from(turn.index)
                     && role == turn.role.as_str()
                     && *content == turn.content
+                    && *actions == actions_json(&turn.actions)
             })
             .count())
     }
@@ -1690,6 +1692,7 @@ pub struct GraphRebuildFilter {
 #[cfg(test)]
 mod tests {
     use crate::ingest::markdown::SessionFrontmatter;
+    use crate::ingest::Turn;
     use crate::store::db::Database;
     use crate::store::session_repo::SessionListFilter;
 
@@ -1711,7 +1714,7 @@ mod tests {
     fn test_insert_session_from_vault_with_archived_sets_db() {
         let db = Database::open_memory().unwrap();
         let fm = make_fm("sess-archived", Some(true));
-        db.insert_session_from_vault(&fm, "body text", "raw/sessions/test.md")
+        db.insert_session_from_vault(&fm, "raw/sessions/test.md")
             .unwrap();
         let is_archived: i64 = db
             .conn()
@@ -1805,7 +1808,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("raw/sessions")).unwrap();
         std::fs::write(dir.path().join(rel), &md).unwrap();
 
-        db.insert_session_from_vault(&fm, "body", rel).unwrap();
+        db.insert_session_from_vault(&fm, rel).unwrap();
 
         db.archive_session("sess-arc-unit", &vault, chrono_tz::UTC)
             .unwrap();
@@ -1840,7 +1843,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("raw/sessions")).unwrap();
         std::fs::write(dir.path().join(rel), &md).unwrap();
 
-        db.insert_session_from_vault(&fm, "body", rel).unwrap();
+        db.insert_session_from_vault(&fm, rel).unwrap();
         db.archive_session("sess-rst-unit", &vault, chrono_tz::UTC)
             .unwrap();
         db.restore_session("sess-rst-unit", &vault, chrono_tz::UTC)
@@ -1880,10 +1883,10 @@ mod tests {
     fn test_list_sessions_filtered_excludes_archived() {
         let db = Database::open_memory().unwrap();
         let fm_normal = make_fm("sess-list-normal", None);
-        db.insert_session_from_vault(&fm_normal, "body", "raw/sessions/n.md")
+        db.insert_session_from_vault(&fm_normal, "raw/sessions/n.md")
             .unwrap();
         let fm_arc = make_fm("sess-list-arc", Some(true));
-        db.insert_session_from_vault(&fm_arc, "body", "raw/sessions/a.md")
+        db.insert_session_from_vault(&fm_arc, "raw/sessions/a.md")
             .unwrap();
 
         let filter = SessionListFilter {
@@ -1900,10 +1903,10 @@ mod tests {
     fn test_list_sessions_filtered_include_archived_returns_all() {
         let db = Database::open_memory().unwrap();
         let fm_normal = make_fm("sess-ia-normal", None);
-        db.insert_session_from_vault(&fm_normal, "body", "raw/sessions/n2.md")
+        db.insert_session_from_vault(&fm_normal, "raw/sessions/n2.md")
             .unwrap();
         let fm_arc = make_fm("sess-ia-arc", Some(true));
-        db.insert_session_from_vault(&fm_arc, "body", "raw/sessions/a2.md")
+        db.insert_session_from_vault(&fm_arc, "raw/sessions/a2.md")
             .unwrap();
 
         let filter = SessionListFilter {
@@ -1923,7 +1926,7 @@ mod tests {
 
         // 처음엔 archived=false 로 insert
         let fm_normal = make_fm("sess-reindex", None);
-        db.insert_session_from_vault(&fm_normal, "body", "raw/sessions/test2.md")
+        db.insert_session_from_vault(&fm_normal, "raw/sessions/test2.md")
             .unwrap();
 
         let is_archived_before: i64 = db
@@ -1938,7 +1941,7 @@ mod tests {
 
         // archived=true 로 re-ingest (다른 머신에서 archive 후 git pull 시나리오)
         let fm_archived = make_fm("sess-reindex", Some(true));
-        db.insert_session_from_vault(&fm_archived, "body", "raw/sessions/test2.md")
+        db.insert_session_from_vault(&fm_archived, "raw/sessions/test2.md")
             .unwrap();
 
         let is_archived_after: i64 = db
@@ -1968,14 +1971,14 @@ mod tests {
 
         let mut fm = make_fm("sess-tc", None);
         fm.turns = Some(2);
-        db.insert_session_from_vault(&fm, "body", "raw/.sessions/tc.md")
+        db.insert_session_from_vault(&fm, "raw/.sessions/tc.md")
             .unwrap();
         assert_eq!(read_turn_count("sess-tc"), 2);
 
         // 재인덱싱: turns 2 → 8
         let mut fm2 = make_fm("sess-tc", None);
         fm2.turns = Some(8);
-        db.insert_session_from_vault(&fm2, "body", "raw/.sessions/tc.md")
+        db.insert_session_from_vault(&fm2, "raw/.sessions/tc.md")
             .unwrap();
         assert_eq!(
             read_turn_count("sess-tc"),
@@ -2001,13 +2004,15 @@ mod tests {
     /// marked as a favorite with a note.
     fn indexed_foreign_session(db: &Database) -> SessionFrontmatter {
         use crate::ingest::Role;
-        use crate::store::{SessionRepo, VectorRepo};
+        use crate::store::{SearchRepo, SessionRepo, VectorRepo};
 
         let mut fm = make_fm("sess-mac", None);
         fm.host = Some("macbook".to_string());
         fm.turns = Some(2);
-        db.insert_session_from_vault(&fm, "old body", "raw/.sessions/mac.md")
+        db.insert_session_from_vault(&fm, "raw/.sessions/mac.md")
             .unwrap();
+        // The whole-body FTS row an earlier release stored.
+        db.insert_fts("old body", "sess-mac", 0).unwrap();
         db.insert_turn("sess-mac", &vault_turn(0, Role::User, "list files"))
             .unwrap();
         db.insert_turn("sess-mac", &vault_turn(1, Role::Assistant, "One file"))
@@ -2044,8 +2049,9 @@ mod tests {
             vault_turn(2, Role::User, "thanks"),
         ];
 
+        let fts_text = |turn: &Turn| format!("fts {}", turn.content);
         let refresh = db
-            .refresh_session_from_vault(&fm, "new body", "raw/.sessions/mac.md", &turns, (10, 20))
+            .refresh_session_from_vault(&fm, "raw/.sessions/mac.md", &turns, &fts_text, (10, 20))
             .unwrap();
 
         assert_eq!(refresh, VaultRefresh::TurnsKept);
@@ -2068,30 +2074,41 @@ mod tests {
             count(&db, "SELECT turn_count FROM sessions WHERE id = 'sess-mac'"),
             3
         );
-        let fts: Vec<String> = db
+        let fts: Vec<(i64, String)> = db
             .conn()
-            .prepare("SELECT content FROM turns_fts_v2 WHERE session_id = 'sess-mac'")
+            .prepare(
+                "SELECT turn_id, content FROM turns_fts_v2 WHERE session_id = 'sess-mac'
+                 ORDER BY turn_id",
+            )
             .unwrap()
-            .query_map([], |r| r.get(0))
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(fts, ["new body"]);
+        assert_eq!(
+            fts,
+            [
+                (0, "fts list files".to_string()),
+                (1, "fts One file".to_string()),
+                (2, "fts thanks".to_string())
+            ],
+            "one FTS row per turn, kept turns included, and no whole-body row"
+        );
         assert_eq!(
             count(
                 &db,
                 "SELECT COUNT(*) FROM turns_fts_rows r JOIN turns_fts_v2 f ON f.rowid = r.fts_rowid
-                 WHERE r.session_id = 'sess-mac' AND f.content = 'new body'"
+                 WHERE r.session_id = 'sess-mac' AND f.content LIKE 'fts %'"
             ),
-            1,
-            "turns_fts_rows lists the new body row and nothing else"
+            3,
+            "turns_fts_rows lists the new rows"
         );
         assert_eq!(
             count(
                 &db,
                 "SELECT COUNT(*) FROM turns_fts_rows WHERE session_id = 'sess-mac'"
             ),
-            1
+            3
         );
         assert_eq!(db.get_source_meta("sess-mac").unwrap(), Some((10, 20)));
     }
@@ -2111,8 +2128,9 @@ mod tests {
             vault_turn(2, Role::Assistant, "One file"),
         ];
 
+        let fts_text = |turn: &Turn| turn.content.clone();
         let refresh = db
-            .refresh_session_from_vault(&fm, "new body", "raw/.sessions/mac.md", &turns, (10, 20))
+            .refresh_session_from_vault(&fm, "raw/.sessions/mac.md", &turns, &fts_text, (10, 20))
             .unwrap();
 
         assert_eq!(refresh, VaultRefresh::TurnsReplaced);
@@ -2153,11 +2171,53 @@ mod tests {
     }
 
     #[test]
+    fn test_refresh_session_from_vault_replaces_a_turn_whose_tool_calls_changed() {
+        use crate::ingest::{Action, Role};
+        use crate::store::session_repo::VaultRefresh;
+
+        let db = Database::open_memory().unwrap();
+        let fm = indexed_foreign_session(&db);
+        let mut turns = [
+            vault_turn(0, Role::User, "list files"),
+            vault_turn(1, Role::Assistant, "One file"),
+        ];
+        turns[1].actions.push(Action::ToolUse {
+            name: "exec".to_string(),
+            input_summary: "ls".to_string(),
+            output_summary: "a.rs".to_string(),
+            tool_use_id: None,
+        });
+        let fts_text = |turn: &Turn| turn.content.clone();
+
+        let refresh = db
+            .refresh_session_from_vault(&fm, "raw/.sessions/mac.md", &turns, &fts_text, (10, 20))
+            .unwrap();
+        assert_eq!(refresh, VaultRefresh::TurnsReplaced);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM turn_vectors WHERE session_id = 'sess-mac'"
+            ),
+            1,
+            "the turn with a new tool call loses its vector"
+        );
+
+        let refresh = db
+            .refresh_session_from_vault(&fm, "raw/.sessions/mac.md", &turns, &fts_text, (11, 21))
+            .unwrap();
+        assert_eq!(
+            refresh,
+            VaultRefresh::TurnsKept,
+            "the same tool calls again"
+        );
+    }
+
+    #[test]
     fn test_foreign_vault_path_requires_vault_row_from_other_host() {
         let db = Database::open_memory().unwrap();
         let mut fm = make_fm("sess-mac", None);
         fm.host = Some("macbook".to_string());
-        db.insert_session_from_vault(&fm, "body", "raw/.sessions/mac.md")
+        db.insert_session_from_vault(&fm, "raw/.sessions/mac.md")
             .unwrap();
 
         assert_eq!(
@@ -2173,7 +2233,7 @@ mod tests {
         let db = Database::open_memory().unwrap();
         let mut fm = make_fm("sess-mac", None);
         fm.host = Some("macbook".to_string());
-        db.insert_session_from_vault(&fm, "body", "raw/.sessions/mac.md")
+        db.insert_session_from_vault(&fm, "raw/.sessions/mac.md")
             .unwrap();
 
         // The session's source file turned up on this host, e.g. after a

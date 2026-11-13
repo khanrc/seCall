@@ -1,6 +1,7 @@
 use anyhow::Result;
 use secall_core::{
     ingest::markdown::{extract_body_text, parse_session_frontmatter},
+    search::{tokenizer::create_tokenizer, Bm25Indexer},
     store::{get_default_db_path, Database, SessionRepo},
     vault::Config,
 };
@@ -12,6 +13,7 @@ pub fn run(from_vault: bool) -> Result<()> {
 
     let config = Config::load_or_default();
     let db = Database::open(&get_default_db_path())?;
+    let bm25 = Bm25Indexer::new(create_tokenizer(&config.search.tokenizer)?);
 
     let sessions_dir = config.vault.path.join(secall_core::vault::sessions_reldir());
     if !sessions_dir.exists() {
@@ -91,7 +93,7 @@ pub fn run(from_vault: bool) -> Result<()> {
             }
             // Falls through to the turns-insertion loop below (no session insert needed).
         } else {
-            match db.insert_session_from_vault(&fm, &body, &vault_path) {
+            match db.insert_session_from_vault(&fm, &vault_path) {
                 Ok(()) => indexed += 1,
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "reindex failed");
@@ -101,10 +103,9 @@ pub fn run(from_vault: bool) -> Result<()> {
             }
         }
 
-        // #1021: vault-pulled md only got `sessions` + `turns_fts` before this.
-        // Reverse-parse the body into turns so the session gains `turns` rows;
-        // the hourly `secall embed` pass then backfills `turn_vectors`.
-        // No inline embedding here.
+        // Reverse-parse the body into turns so the session gains `turns` rows
+        // and their FTS rows; the hourly `secall embed` pass then backfills
+        // `turn_vectors`. No inline embedding here.
         //
         // Re-entry is safe: INSERT OR IGNORE on UNIQUE(session_id, turn_index)
         // skips already-present turns, so a previously interrupted reindex or a
@@ -122,16 +123,9 @@ pub fn run(from_vault: bool) -> Result<()> {
                 );
             }
         }
-        for turn in &parsed_turns {
-            if let Err(e) = db.insert_turn(&fm.session_id, turn) {
-                // Warn and continue — re-entry heals partial state on the next
-                // reindex run, so a single failed insert does not corrupt the session.
-                tracing::warn!(
-                    session_id = %fm.session_id,
-                    error = %e,
-                    "insert_turn failed"
-                );
-            }
+        // A failed insert leaves the session's later turns to the next reindex.
+        if let Err(e) = bm25.index_turns(&db, &fm.session_id, &parsed_turns) {
+            tracing::warn!(session_id = %fm.session_id, error = %e, "insert_turn failed");
         }
     }
 
