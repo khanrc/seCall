@@ -928,8 +928,9 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_session_from_vault_and_fts() {
+    fn test_insert_session_from_vault_leaves_fts_to_the_turns() {
         use crate::ingest::markdown::SessionFrontmatter;
+        use crate::store::SearchRepo;
         let db = Database::open_memory().unwrap();
         let fm = SessionFrontmatter {
             session_id: "vault-001".to_string(),
@@ -937,23 +938,10 @@ mod tests {
             start_time: "2026-04-01T00:00:00+00:00".to_string(),
             ..Default::default()
         };
-        db.insert_session_from_vault(
-            &fm,
-            "some body text about Rust",
-            "raw/sessions/vault-001.md",
-        )
-        .unwrap();
-        assert!(db.session_exists("vault-001").unwrap());
-        // FTS row should be present
-        let fts_count: i64 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM turns_fts_v2 WHERE session_id = 'vault-001'",
-                [],
-                |r| r.get(0),
-            )
+        db.insert_session_from_vault(&fm, "raw/sessions/vault-001.md")
             .unwrap();
-        assert_eq!(fts_count, 1);
+        assert!(db.session_exists("vault-001").unwrap());
+        assert!(!db.has_fts_rows("vault-001").unwrap());
     }
 
     // ─── get_sessions_for_date / get_topics_for_sessions ────────────────

@@ -7,7 +7,7 @@
 //!   4. archive_excludes_from_bm25_search
 
 use secall_core::ingest::markdown::{extract_body_text, parse_session_frontmatter};
-use secall_core::ingest::{AgentKind, Role, Session, TokenUsage, Turn};
+use secall_core::ingest::{parse_turns_from_body, AgentKind, Role, Session, TokenUsage, Turn};
 use secall_core::search::bm25::{Bm25Indexer, SearchFilters};
 use secall_core::search::tokenizer::LinderaKoTokenizer;
 use secall_core::store::session_repo::SessionListFilter;
@@ -64,7 +64,8 @@ fn make_session(id: &str, body_word: &str) -> Session {
     }
 }
 
-/// vault.write_session + db.insert_session_from_vault.
+/// vault.write_session + db.insert_session_from_vault, then the turns read
+/// back from the Markdown with their FTS rows, as `secall sync` stores them.
 /// Returns vault-relative path string.
 fn ingest_session(h: &Harness, id: &str, body_word: &str) -> String {
     let session = make_session(id, body_word);
@@ -77,8 +78,11 @@ fn ingest_session(h: &Harness, id: &str, body_word: &str) -> String {
     let content = std::fs::read_to_string(&abs).unwrap();
     let fm = parse_session_frontmatter(&content).expect("parse fm");
     let body = extract_body_text(&content);
-    h.db.insert_session_from_vault(&fm, &body, &rel_str)
+    h.db.insert_session_from_vault(&fm, &rel_str)
         .expect("insert_session_from_vault");
+    Bm25Indexer::new(Box::new(LinderaKoTokenizer::new().unwrap()))
+        .index_turns(&h.db, id, &parse_turns_from_body(&body, &fm.date))
+        .expect("index_turns");
     rel_str
 }
 
@@ -201,8 +205,7 @@ fn cross_host_archive_via_re_ingest_syncs_db() {
     // re-ingest (insert_session_from_vault → UPDATE archive sync)
     let re_content = std::fs::read_to_string(&abs).unwrap();
     let fm = parse_session_frontmatter(&re_content).expect("parse re-ingested fm");
-    let body = extract_body_text(&re_content);
-    h.db.insert_session_from_vault(&fm, &body, &vault_rel)
+    h.db.insert_session_from_vault(&fm, &vault_rel)
         .expect("re-ingest");
 
     let is_archived: i64 =
@@ -225,8 +228,8 @@ fn archive_excludes_from_bm25_search() {
     h.db.archive_session("sess-bm25-arc", &h.vault, chrono_tz::UTC)
         .unwrap();
 
-    // BM25 인덱싱 (ingest 때 insert_session_from_vault 가 FTS 에도 넣지만
-    // DB 직접 archive 후 BM25Indexer.search 를 통해 filter 검증)
+    // ingest_session 이 FTS 에도 넣었으므로, DB 직접 archive 후
+    // BM25Indexer.search 를 통해 filter 검증
     let tok = LinderaKoTokenizer::new().unwrap();
     let indexer = Bm25Indexer::new(Box::new(tok));
 

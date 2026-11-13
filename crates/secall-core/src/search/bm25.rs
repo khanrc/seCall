@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::tokenizer::Tokenizer;
-use crate::ingest::Session;
+use crate::ingest::{Session, Turn};
 use crate::store::db::Database;
 use crate::store::{SearchRepo, SessionRepo};
 
@@ -90,29 +90,44 @@ impl Bm25Indexer {
 
     /// Index all turns of a session into the FTS5 table
     pub fn index_session(&self, db: &Database, session: &Session) -> Result<IndexStats> {
-        let mut stats = IndexStats::default();
-
         // Insert session metadata first
         db.insert_session(session)?;
+        let turns_indexed = self.index_turns(db, &session.id, &session.turns)?;
+        Ok(IndexStats {
+            turns_indexed,
+            ..IndexStats::default()
+        })
+    }
 
-        for turn in &session.turns {
-            // Turn-incremental: the FTS table is a plain FTS5 insert with no dedup,
-            // so we may only insert it for turns `insert_turn` reports as newly
-            // added (rows affected == 1). Re-indexing an append-grown session
-            // then adds FTS rows for the new turns only, never duplicating the
-            // ones already indexed. `turns` itself is INSERT OR IGNORE.
-            let newly_inserted = db.insert_turn(&session.id, turn)? > 0;
-            if newly_inserted {
-                // Index the same text the vector chunker embeds: content + folded
-                // tool-call summaries, thinking excluded (#1585). Keeps tool-only
-                // turns searchable via BM25 and keeps the two channels aligned.
-                let full_text = self.tokenizer.tokenize_for_fts(&turn.index_text());
-                db.insert_fts(&full_text, &session.id, turn.index)?;
-                stats.turns_indexed += 1;
+    /// Store the turns of the stored session `session_id` that it does not
+    /// have yet, each with its FTS row, and return how many.
+    pub fn index_turns(&self, db: &Database, session_id: &str, turns: &[Turn]) -> Result<usize> {
+        // One unit: a turn stored without its FTS row would stay without it,
+        // since a later call finds the turn present and skips it.
+        let indexed = db.with_nested_transaction(|| {
+            let mut indexed = 0;
+            for turn in turns {
+                // Turn-incremental: the FTS table is a plain FTS5 insert with no
+                // dedup, so we may only insert it for turns `insert_turn` reports
+                // as newly added (rows affected == 1). Re-indexing an
+                // append-grown session then adds FTS rows for the new turns only,
+                // never duplicating the ones already indexed. `turns` itself is
+                // INSERT OR IGNORE.
+                if db.insert_turn(session_id, turn)? > 0 {
+                    db.insert_fts(&self.fts_text(turn), session_id, turn.index)?;
+                    indexed += 1;
+                }
             }
-        }
+            Ok(indexed)
+        })?;
+        Ok(indexed)
+    }
 
-        Ok(stats)
+    /// The FTS text of `turn`: the same text the vector chunker embeds, content
+    /// and folded tool-call summaries without thinking (#1585), so tool-only
+    /// turns are searchable via BM25 and the two channels stay aligned.
+    pub fn fts_text(&self, turn: &Turn) -> String {
+        self.tokenizer.tokenize_for_fts(&turn.index_text())
     }
 
     /// BM25 search via FTS5
@@ -265,6 +280,21 @@ mod tests {
             .search(&db, "아키텍처", 10, &SearchFilters::default())
             .unwrap();
         assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn index_turns_keeps_no_turn_whose_fts_row_failed() {
+        let db = Database::open_memory().unwrap();
+        let indexer = Bm25Indexer::new(Box::new(LinderaKoTokenizer::new().unwrap()));
+        let session = make_session("s-fts-fail", "proj", "hello world");
+        db.insert_session(&session).unwrap();
+        db.conn().execute_batch("DROP TABLE turns_fts_v2").unwrap();
+
+        let error = indexer
+            .index_turns(&db, &session.id, &session.turns)
+            .unwrap_err();
+        assert!(error.to_string().contains("turns_fts_v2"), "{error}");
+        assert_eq!(db.count_turns_for_session(&session.id).unwrap(), 0);
     }
 
     #[test]

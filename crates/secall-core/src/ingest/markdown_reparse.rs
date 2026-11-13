@@ -8,8 +8,8 @@
 //! Used by `reindex_vault` so vault-pulled sessions gain `turns` rows
 //! (and therefore vector embeddings via the `secall embed` backfill).
 
-use crate::ingest::markdown::THINKING_CALLOUT;
-use crate::ingest::types::{Role, Turn};
+use crate::ingest::markdown::{THINKING_CALLOUT, TOOL_CALLOUT, TOOL_FENCE, TOOL_OUTPUT_LABEL};
+use crate::ingest::types::{Action, Role, Turn};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 
 /// Revision of the turns [`parse_turns_from_body`] reads from Markdown. Bump it
@@ -17,7 +17,8 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 /// then refreshes every other host's session from its Markdown once.
 ///
 /// 1: thinking callouts leave turn content.
-pub const REPARSE_REVISION: u32 = 1;
+/// 2: tool callouts leave turn content and become the turn's tool calls.
+pub const REPARSE_REVISION: u32 = 2;
 
 fn role_from_str(s: &str) -> Option<Role> {
     match s {
@@ -91,6 +92,76 @@ fn split_thinking(lines: &[String]) -> (Option<String>, String) {
     (Some(thinking), content)
 }
 
+/// `content` without the tool callouts the renderer puts after it, and the
+/// tool calls they hold, in order. Only callouts that end the turn count, each
+/// a paragraph that reads back whole, so a callout quoted earlier stays
+/// content. Ingest indexes a tool call's input but not its output.
+fn split_tool_calls(content: &str) -> (String, Vec<Action>) {
+    let lines: Vec<&str> = content.lines().collect();
+    let blank = |line: &&str| line.trim().is_empty();
+    let mut end = lines.len();
+    let mut actions = Vec::new();
+    loop {
+        let stop = lines[..end]
+            .iter()
+            .rposition(|l| !blank(l))
+            .map_or(0, |i| i + 1);
+        let start = lines[..stop].iter().rposition(blank).map_or(0, |i| i + 1);
+        let Some(action) = (start < stop)
+            .then(|| parse_tool_callout(&lines[start..stop]))
+            .flatten()
+        else {
+            break;
+        };
+        actions.push(action);
+        end = start;
+    }
+    if actions.is_empty() {
+        return (content.to_string(), actions);
+    }
+    actions.reverse();
+    (lines[..end].join("\n").trim().to_string(), actions)
+}
+
+/// The tool call a rendered callout holds: a `TOOL_CALLOUT` line naming the
+/// tool, then behind `> ` the fenced input and, after `TOOL_OUTPUT_LABEL`, the
+/// fenced output, each left out when empty.
+fn parse_tool_callout(lines: &[&str]) -> Option<Action> {
+    let name = lines[0].strip_prefix(TOOL_CALLOUT)?;
+    let body = lines[1..]
+        .iter()
+        .map(|line| line.strip_prefix("> ").or((*line == ">").then_some("")))
+        .collect::<Option<Vec<_>>>()?;
+    // An input line can read as the label too; the first label line that
+    // follows the input's closing fence and opens a fence is taken.
+    let label = (0..body.len()).find(|&i| {
+        body[i] == TOOL_OUTPUT_LABEL
+            && (i == 0 || body[i - 1] == TOOL_FENCE)
+            && body.get(i + 1) == Some(&TOOL_FENCE)
+    });
+    let (input, output) = match label {
+        Some(i) => (fenced(&body[..i])?, fenced(&body[i + 1..])?),
+        None => (fenced(&body)?, String::new()),
+    };
+    Some(Action::ToolUse {
+        name: name.to_string(),
+        input_summary: input,
+        output_summary: output,
+        tool_use_id: None,
+    })
+}
+
+/// The lines between an opening and a closing fence, or "" for no lines.
+fn fenced(lines: &[&str]) -> Option<String> {
+    match lines {
+        [] => Some(String::new()),
+        [open, inner @ .., close] if *open == TOOL_FENCE && *close == TOOL_FENCE => {
+            Some(inner.join("\n"))
+        }
+        _ => None,
+    }
+}
+
 /// Parse the markdown body (everything after frontmatter) into turns.
 /// `date` is the frontmatter `date` (YYYY-MM-DD); pass "" to skip timestamps.
 pub fn parse_turns_from_body(body: &str, date: &str) -> Vec<Turn> {
@@ -102,12 +173,13 @@ pub fn parse_turns_from_body(body: &str, date: &str) -> Vec<Turn> {
                  cur: Option<(u32, Role, Option<String>, Vec<String>)>| {
         if let Some((num, role, time, lines)) = cur {
             let (thinking, content) = split_thinking(&lines);
+            let (content, actions) = split_tool_calls(&content);
             turns.push(Turn {
                 index: num.saturating_sub(1),
                 role,
                 timestamp: build_timestamp(date, &time),
                 content,
-                actions: Vec::new(),
+                actions,
                 tokens: None,
                 thinking,
                 is_sidechain: false,
@@ -183,8 +255,122 @@ Continued assistant turn.
         assert!(turns[0].content.contains("How do I do X?"));
         // turn 1 content must NOT contain turn 2's header text
         assert!(!turns[0].content.contains("Turn 2"));
-        // assistant body content is captured (callout lines may be folded into content)
-        assert!(turns[1].content.contains("Here is how."));
+        assert_eq!(turns[1].content, "Here is how.");
+        assert_eq!(tool_calls(&turns[1]), [("Bash", "ls", "")]);
+    }
+
+    /// `(name, input, output)` of each of the turn's tool calls.
+    fn tool_calls(turn: &Turn) -> Vec<(&str, &str, &str)> {
+        turn.actions
+            .iter()
+            .map(|action| match action {
+                Action::ToolUse {
+                    name,
+                    input_summary,
+                    output_summary,
+                    tool_use_id: None,
+                } => (
+                    name.as_str(),
+                    input_summary.as_str(),
+                    output_summary.as_str(),
+                ),
+                other => panic!("not a tool call read back: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rendered_tool_calls_read_back_as_tool_calls() {
+        use crate::ingest::markdown::{extract_body_text, render_session};
+        use crate::ingest::{AgentKind, Session, TokenUsage, TOOL_OUTPUT_MAX_CHARS};
+
+        let call = |name: &str, input: &str, output: &str| Action::ToolUse {
+            name: name.to_string(),
+            input_summary: input.to_string(),
+            output_summary: output.to_string(),
+            tool_use_id: Some("call_1".to_string()),
+        };
+        let turn = |index, role, content: &str, actions| Turn {
+            index,
+            role,
+            timestamp: None,
+            content: content.to_string(),
+            actions,
+            tokens: None,
+            thinking: Some("Plan.".to_string()),
+            is_sidechain: false,
+        };
+        let heredoc = "cat > a.md <<'EOF'\n```\n> [!tool]- Bash\n```\nEOF";
+        let long = "x".repeat(TOOL_OUTPUT_MAX_CHARS + 100);
+        let session = Session {
+            id: "s".to_string(),
+            agent: AgentKind::Codex,
+            model: None,
+            project: None,
+            cwd: None,
+            git_branch: None,
+            host: None,
+            start_time: Utc::now(),
+            end_time: None,
+            turns: vec![
+                turn(0, Role::User, "go", vec![call("shell", "ls", "a.rs")]),
+                turn(
+                    1,
+                    Role::Assistant,
+                    "Writing it.\n\n> quoted\n\n> [!tool]- Bash\n> pasted",
+                    vec![
+                        call("exec_command", heredoc, "**Output:**\n```\nok\n```"),
+                        call("exec", "", &long),
+                        call("write_stdin", "y", ""),
+                        call("wait", "", ""),
+                    ],
+                ),
+                turn(2, Role::Assistant, "", vec![call("exec", "pwd", "/w")]),
+            ],
+            total_tokens: TokenUsage::default(),
+            session_type: "interactive".to_string(),
+            archived: false,
+            archived_at: None,
+        };
+        let md = render_session(&session, chrono_tz::Tz::UTC);
+        let turns = parse_turns_from_body(&extract_body_text(&md), "");
+
+        assert_eq!(turns[0].content, "go");
+        assert_eq!(tool_calls(&turns[0]), [("shell", "ls", "a.rs")]);
+        assert_eq!(
+            turns[1].content,
+            "Writing it.\n\n> quoted\n\n> [!tool]- Bash\n> pasted"
+        );
+        let cut = format!("{}...", &long[..TOOL_OUTPUT_MAX_CHARS]);
+        assert_eq!(
+            tool_calls(&turns[1]),
+            [
+                ("exec_command", heredoc, "**Output:**\n```\nok\n```"),
+                ("exec", "", cut.as_str()),
+                ("write_stdin", "y", ""),
+                ("wait", "", ""),
+            ]
+        );
+        assert_eq!(turns[2].content, "");
+        assert_eq!(turns[2].thinking.as_deref(), Some("Plan."));
+        assert_eq!(tool_calls(&turns[2]), [("exec", "pwd", "/w")]);
+    }
+
+    #[test]
+    fn a_callout_that_does_not_read_back_whole_stays_content() {
+        for content in [
+            // Content after the callout.
+            "> [!tool]- Bash\n> ```\n> ls\n> ```\n\nThat was it.",
+            // An unclosed fence.
+            "Run:\n\n> [!tool]- Bash\n> ```\n> ls",
+            // A line outside the quote.
+            "> [!tool]- Bash\n> ```\nls\n> ```",
+        ] {
+            let body = format!("## Turn 1 — Assistant (05:30)\n\n{content}\n");
+            let turns = parse_turns_from_body(&body, "");
+            assert_eq!(turns[0].content, content);
+            assert!(turns[0].actions.is_empty(), "{content}");
+        }
     }
 
     #[test]

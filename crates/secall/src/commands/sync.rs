@@ -4,6 +4,7 @@ use anyhow::Result;
 use secall_core::{
     ingest::markdown::{extract_body_text, parse_session_frontmatter, SessionFrontmatter},
     ingest::markdown_reparse::{parse_turns_from_body, REPARSE_REVISION},
+    ingest::Turn,
     jobs::ProgressSink,
     search::{tokenizer::create_tokenizer, Bm25Indexer, SearchEngine},
     store::{get_default_db_path, session_repo::VaultRefresh, Database, SearchRepo, SessionRepo},
@@ -504,6 +505,7 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
     }
 
     let local_host = gethostname::gethostname().to_string_lossy().to_string();
+    let bm25 = Bm25Indexer::new(create_tokenizer(&config.search.tokenizer)?);
     // Turns stored by an older Markdown parser: read every other host's
     // session from its Markdown again, once.
     let reparse = db.markdown_reparse_revision()? < REPARSE_REVISION;
@@ -569,6 +571,7 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
         if session_already_exists {
             match sync_foreign_markdown(
                 db,
+                &bm25,
                 &config.vault.path,
                 &fm,
                 &body,
@@ -615,7 +618,7 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
             }
             // Falls through to the turns-insertion loop below (no session insert needed).
         } else {
-            match db.insert_session_from_vault(&fm, &body, &vault_path) {
+            match db.insert_session_from_vault(&fm, &vault_path) {
                 Ok(()) => indexed += 1,
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "reindex failed");
@@ -625,6 +628,7 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
             // Records the snapshot that the next sync compares against.
             if let Err(e) = sync_foreign_markdown(
                 db,
+                &bm25,
                 &config.vault.path,
                 &fm,
                 &body,
@@ -636,10 +640,10 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
             }
         }
 
-        // #1021: vault-pulled md only got `sessions` + `turns_fts` before this.
-        // Reverse-parse the body into turns so the session gains `turns` rows;
-        // the hourly `secall embed` pass then backfills `turn_vectors`.
-        // No inline embedding here — the pod runs `secall sync --no-embed`.
+        // Reverse-parse the body into turns so the session gains `turns` rows
+        // and their FTS rows; the hourly `secall embed` pass then backfills
+        // `turn_vectors`. No inline embedding here — the pod runs
+        // `secall sync --no-embed`.
         //
         // Re-entry is safe: INSERT OR IGNORE on UNIQUE(session_id, turn_index)
         // skips already-present turns, so a previously interrupted sync or a
@@ -656,16 +660,9 @@ fn reindex_vault(config: &Config, db: &Database) -> Result<ReindexResult> {
                 );
             }
         }
-        for turn in &parsed_turns {
-            if let Err(e) = db.insert_turn(&fm.session_id, turn) {
-                // Warn and continue — re-entry heals partial state on the next
-                // sync run, so a single failed insert does not corrupt the session.
-                tracing::warn!(
-                    session_id = %fm.session_id,
-                    error = %e,
-                    "insert_turn failed"
-                );
-            }
+        // A failed insert leaves the session's missing turns to the next sync.
+        if let Err(e) = bm25.index_turns(db, &fm.session_id, &parsed_turns) {
+            tracing::warn!(session_id = %fm.session_id, error = %e, "insert_turn failed");
         }
     }
 
@@ -702,8 +699,10 @@ enum MarkdownAction {
 /// for instance after a parser change moved turn boundaries
 /// (khanrc/seCall#43). The missing-turn backfill alone would keep the stale
 /// turns and mix them with the new ones.
+#[allow(clippy::too_many_arguments)]
 fn sync_foreign_markdown(
     db: &Database,
+    bm25: &Bm25Indexer,
     vault_root: &Path,
     fm: &SessionFrontmatter,
     body: &str,
@@ -726,13 +725,15 @@ fn sync_foreign_markdown(
         return Ok(MarkdownAction::Backfill);
     };
     let stored = db.get_source_meta(&fm.session_id)?;
-    // An import that stopped after the session row leaves it out of keyword
+    // An import that stopped after storing turns leaves them out of keyword
     // search: a binary from before schema v15 fails there once another
     // process has renamed the FTS table.
-    let fts_missing = !body.trim().is_empty() && !db.has_fts_rows(&fm.session_id)?;
+    let fts_missing =
+        db.count_turns_for_session(&fm.session_id)? > 0 && !db.has_fts_rows(&fm.session_id)?;
     if reparse || fts_missing || stored.is_some_and(|stored| stored != current) {
         let turns = parse_turns_from_body(body, &fm.date);
-        let refresh = db.refresh_session_from_vault(fm, body, vault_path, &turns, current)?;
+        let fts_text = |turn: &Turn| bm25.fts_text(turn);
+        let refresh = db.refresh_session_from_vault(fm, vault_path, &turns, &fts_text, current)?;
         return Ok(MarkdownAction::Refreshed(refresh));
     }
     // Indexed before snapshots were recorded: start from the current
@@ -861,7 +862,26 @@ mod tests {
                 .map(|t| t.content)
                 .collect()
         }
+
+        /// `(turn index, text)` of the session's FTS rows.
+        fn fts(&self, id: &str) -> Vec<(i64, String)> {
+            self.db
+                .conn()
+                .prepare(
+                    "SELECT turn_id, content FROM turns_fts_v2 WHERE session_id = ?1
+                     ORDER BY turn_id",
+                )
+                .unwrap()
+                .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
     }
+
+    /// A turn that ran a tool, as the renderer writes it.
+    const TOOL_TURN: &str = "Listing.\n\n> [!tool]- exec_command\n> ```\n> ls -la src\n> ```\n\
+                             > **Output:**\n> ```\n> zebraoutput.rs\n> ```";
 
     const V1: [(&str, &str); 2] = [("User", "list files"), ("Assistant", "One file: a.rs")];
     const V2: [(&str, &str); 2] = [
@@ -987,6 +1007,77 @@ mod tests {
         assert_eq!(f.reindex(), (0, 1, 1, 0));
         assert_eq!(f.turns("sess-mac"), ["why?", "Because."]);
         assert_eq!(f.reindex(), (0, 0, 0, 1), "only once");
+    }
+
+    #[test]
+    fn reindex_vault_indexes_each_turn_of_other_hosts_with_its_tool_calls() {
+        let f = Fixture::new();
+        f.write(
+            "2026-11-09",
+            "sess-mac",
+            "macbook",
+            &[("User", "list files"), ("Assistant", TOOL_TURN)],
+        );
+        assert_eq!(f.reindex(), (1, 0, 0, 0));
+        assert_eq!(f.turns("sess-mac"), ["list files", "Listing."]);
+        let tools = f.db.get_session_for_embedding("sess-mac").unwrap().turns[1]
+            .actions
+            .len();
+        assert_eq!(tools, 1);
+
+        let fts = f.fts("sess-mac");
+        assert_eq!(
+            fts.iter().map(|(turn, _)| *turn).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(
+            fts[1].1, "listing tool exec command ls la src",
+            "tokenized text and input"
+        );
+        assert!(
+            !fts.iter().any(|(_, text)| text.contains("zebraoutput")),
+            "tool output is not indexed: {fts:?}"
+        );
+    }
+
+    #[test]
+    fn reindex_vault_rebuilds_sessions_read_before_tool_calls_were() {
+        let f = Fixture::new();
+        f.write(
+            "2026-11-09",
+            "sess-mac",
+            "macbook",
+            &[("User", "list files"), ("Assistant", TOOL_TURN)],
+        );
+        f.reindex();
+        // What an earlier release stored: the callout in the turn's content,
+        // and the whole Markdown body as the session's only FTS row.
+        f.db.conn()
+            .execute(
+                "UPDATE turns SET content = ?1, actions_json = NULL, has_tool = 0
+                 WHERE session_id = 'sess-mac' AND turn_index = 1",
+                [TOOL_TURN],
+            )
+            .unwrap();
+        f.db.delete_session_fts("sess-mac").unwrap();
+        f.db.insert_fts(
+            &format!("## Turn 1 — User\n\nlist files\n\n{TOOL_TURN}"),
+            "sess-mac",
+            0,
+        )
+        .unwrap();
+        f.db.set_markdown_reparse_revision(REPARSE_REVISION - 1)
+            .unwrap();
+
+        assert_eq!(f.reindex(), (0, 1, 1, 0));
+        assert_eq!(f.turns("sess-mac"), ["list files", "Listing."]);
+        let fts = f.fts("sess-mac");
+        assert_eq!(
+            fts.iter().map(|(turn, _)| *turn).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert!(!fts.iter().any(|(_, text)| text.contains("zebraoutput")));
+        assert_eq!(f.db.markdown_reparse_revision().unwrap(), REPARSE_REVISION);
     }
 
     #[test]

@@ -7,8 +7,7 @@ pub(crate) const DELETE_SESSION_FTS: &str = "DELETE FROM turns_fts_v2
      WHERE rowid IN (SELECT fts_rowid FROM turns_fts_rows WHERE session_id = ?1)";
 
 pub trait SearchRepo {
-    /// Add one FTS row to `session_id`. A vault-built session's whole-body
-    /// row uses `turn_index` 0.
+    /// Add one FTS row to `session_id`.
     fn insert_fts(&self, tokenized_content: &str, session_id: &str, turn_index: u32) -> Result<()>;
     /// Remove every FTS row of `session_id`.
     fn delete_session_fts(&self, session_id: &str) -> Result<()>;

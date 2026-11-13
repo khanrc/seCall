@@ -85,7 +85,7 @@ fn test_reindex_backfill_reentry_idempotent() {
     let db = Database::open_memory().expect("in-memory db");
 
     // First pass: insert the session row (no turns — pre-fix state).
-    db.insert_session_from_vault(&fm, &body, "raw/sessions/sess-1.md")
+    db.insert_session_from_vault(&fm, "raw/sessions/sess-1.md")
         .expect("insert_session_from_vault");
     assert_eq!(
         db.count_turns_for_session(&session.id).unwrap(),
