@@ -261,10 +261,9 @@ impl Database {
     }
 
     /// The tool calls of a turn, which its content leaves out; none for a
-    /// turn that is not stored.
-    /// A turn's tool calls, each output cut to the length its session Markdown
-    /// shows. Turns stored before the parsers capped tool output still hold it
-    /// whole, sometimes hundreds of KB per turn.
+    /// turn that is not stored. Each output is cut to the length its session
+    /// Markdown shows: turns stored before the parsers capped tool output
+    /// still hold it whole, sometimes hundreds of KB per turn.
     pub fn get_turn_actions(
         &self,
         session_id: &str,
