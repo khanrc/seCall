@@ -261,12 +261,15 @@ impl Database {
     }
 
     /// The tool calls of a turn, which its content leaves out; none for a
-    /// turn that is not stored.
+    /// turn that is not stored. Each output is cut to the length its session
+    /// Markdown shows: turns stored before the parsers capped tool output
+    /// still hold it whole, sometimes hundreds of KB per turn.
     pub fn get_turn_actions(
         &self,
         session_id: &str,
         turn_index: u32,
     ) -> Result<Vec<crate::ingest::Action>> {
+        use crate::ingest::{truncate_str, Action, TOOL_OUTPUT_MAX_CHARS};
         let json: Option<Option<String>> = self
             .conn()
             .query_row(
@@ -275,7 +278,13 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(actions_from_json(json.flatten()))
+        let mut actions = actions_from_json(json.flatten());
+        for action in &mut actions {
+            if let Action::ToolUse { output_summary, .. } = action {
+                *output_summary = truncate_str(output_summary, TOOL_OUTPUT_MAX_CHARS);
+            }
+        }
+        Ok(actions)
     }
 
     /// P89 (#100, Gemini PR #101): `(session_id, turn_index)` 다건의 content 를
