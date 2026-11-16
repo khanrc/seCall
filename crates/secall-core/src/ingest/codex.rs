@@ -153,7 +153,7 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                 continue;
             }
         };
-        conversation_free &= is_conversation_free(&jl.line_type, &jl.payload);
+        conversation_free = conversation_free && is_conversation_free(&jl.line_type, &jl.payload);
 
         // Fold every record's wrapper timestamp into the last-activity high-water
         // mark, regardless of record type (message / function_call / output).
@@ -194,6 +194,7 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                         .map(|dt| dt.with_timezone(&Utc));
                 } else {
                     review_events_only = false;
+                    conversation_free = false;
                 }
             }
             "response_item" => {
@@ -309,11 +310,8 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                 }
                 // A task that ended without an answer.
                 Some("task_complete")
-                    if jl
-                        .payload
-                        .get("last_agent_message")
-                        .and_then(|v| v.as_str())
-                        .map_or(true, str::is_empty) => {}
+                    if jl.payload["last_agent_message"].is_null()
+                        || jl.payload["last_agent_message"] == "" => {}
                 _ => review_events_only = false,
             },
             // Unknown records may contain an answer we cannot parse. Do not
@@ -382,17 +380,16 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
 /// Whether a record holds no conversation, so that a rollout without turns made
 /// only of such records is empty rather than unparsed. Anything unrecognized
 /// counts as conversation: an error keeps it visible until the parser learns it.
-///
-/// User messages pass because the parser opens a turn for every user message it
-/// keeps; in a rollout without turns, each one was blank or injected context.
 fn is_conversation_free(line_type: &str, payload: &serde_json::Value) -> bool {
     let kind = payload.get("type").and_then(|v| v.as_str());
     match (line_type, kind) {
+        // The parser clears this when a header fails to deserialize.
         ("session_meta", _) => true,
-        ("response_item", Some("message")) => matches!(
-            payload.get("role").and_then(|v| v.as_str()),
-            Some("developer" | "user")
-        ),
+        ("response_item", Some("message")) => match payload.get("role").and_then(|v| v.as_str()) {
+            Some("developer") => true,
+            Some("user") => is_blank_or_injected(&payload["content"]),
+            _ => false,
+        },
         // Compacted context is stored encrypted.
         ("response_item", Some("compaction" | "compaction_summary")) => true,
         ("event_msg", Some("thread_settings_applied" | "task_started" | "turn_aborted")) => true,
@@ -400,6 +397,28 @@ fn is_conversation_free(line_type: &str, payload: &serde_json::Value) -> bool {
         ("realtime_item", Some("realtime_session_started" | "realtime_session_closed")) => true,
         _ => false,
     }
+}
+
+/// Whether the parser drops this user message for holding no words of its own:
+/// blank text, or the AGENTS.md context Codex injects. An image or an unknown
+/// content part is conversation the parser cannot read yet.
+fn is_blank_or_injected(content: &serde_json::Value) -> bool {
+    let blank_text = |part: &serde_json::Value| {
+        matches!(
+            part.get("type").and_then(|t| t.as_str()),
+            Some("input_text" | "output_text")
+        ) && part["text"] == ""
+    };
+    let blank = match content {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(text) => text.is_empty(),
+        serde_json::Value::Array(parts) => parts.iter().all(blank_text),
+        _ => false,
+    };
+    blank
+        || extract_content(content)
+            .trim_start()
+            .starts_with(super::AGENTS_MD_TURN_PREFIX)
 }
 
 /// IDs encoded in a Codex rollout filename.
@@ -787,6 +806,8 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Real answer"}}"#,
             r#"{"type":"realtime_item","payload":{"type":"transcript","text":"spoken words"}}"#,
             r#"{"type":"unknown_record","payload":{}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}}"#,
+            r#"{"type":"session_meta","payload":{"id":42}}"#,
         ] {
             assert_eq!(deferral(&[META, extra]), None, "{extra}");
         }
@@ -812,6 +833,8 @@ mod tests {
         assert_eq!(review(NO_ANSWER, &[]), Some("incomplete_codex_review"));
         let answered = r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"LGTM"}}"#;
         assert_eq!(review(answered, &[]), None);
+        let unknown_answer = r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":{"text":"LGTM"}}}"#;
+        assert_eq!(review(unknown_answer, &[]), None);
         let agent_item = r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"a1","text":"LGTM"}}}"#;
         assert_eq!(review(NO_ANSWER, &[agent_item]), None);
     }
