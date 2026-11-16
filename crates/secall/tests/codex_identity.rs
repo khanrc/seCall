@@ -9,6 +9,21 @@ const PARENT: &str = "33333333-3333-4333-8333-333333333333";
 
 fn rollout(root: &Path, id: &str, inherited: bool, messages: usize) -> std::path::PathBuf {
     let path = root.join(format!("rollout-2026-09-13T00-00-00-{id}.jsonl"));
+    write_rollout(&path, id, inherited, messages);
+    path
+}
+
+/// `thread/revert` names the replacement rollout after the thread and a new
+/// rollout ID; its header still names the thread.
+fn reverted_rollout(root: &Path, thread: &str, rollout_id: &str) -> std::path::PathBuf {
+    let path = root.join(format!(
+        "rollout-2026-09-14T00-00-00-{thread}_{rollout_id}.jsonl"
+    ));
+    write_rollout(&path, thread, false, 1);
+    path
+}
+
+fn write_rollout(path: &Path, id: &str, inherited: bool, messages: usize) {
     let mut records = vec![
         json!({"type":"session_meta","payload":{"id":id,"cwd":"/workspace/app","timestamp":"2026-09-13T00:00:00Z"}}),
     ];
@@ -19,7 +34,7 @@ fn rollout(root: &Path, id: &str, inherited: bool, messages: usize) -> std::path
         records.push(json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("Evidence {id} turn {n}")}]}}));
     }
     fs::write(
-        &path,
+        path,
         records
             .iter()
             .map(ToString::to_string)
@@ -27,7 +42,18 @@ fn rollout(root: &Path, id: &str, inherited: bool, messages: usize) -> std::path
             .join("\n"),
     )
     .unwrap();
-    path
+}
+
+fn turn_count(root: &Path, id: &str) -> i64 {
+    Database::open(&root.join("index.sqlite"))
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM turns WHERE session_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
 }
 
 fn ingest(root: &Path, path: &Path) -> std::process::Output {
@@ -116,16 +142,48 @@ fn codex_rollout_identity_survives_inherited_metadata_and_ingest_order() {
 }
 
 #[test]
+fn reverted_codex_rollout_is_its_own_session() {
+    for reverse in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let original = rollout(root, A, false, 3);
+        let reverted = reverted_rollout(root, A, B);
+        let paths = if reverse {
+            [&reverted, &original]
+        } else {
+            [&original, &reverted]
+        };
+        for path in paths.into_iter().chain([&original, &reverted]) {
+            let output = ingest(root, path);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(turn_count(root, A), 3, "reverse={reverse}");
+        assert_eq!(turn_count(root, B), 1, "reverse={reverse}");
+    }
+}
+
+#[test]
 fn codex_rollout_filename_conflict_cannot_write_another_session() {
     let tmp = tempfile::tempdir().unwrap();
-    let path = rollout(tmp.path(), A, false, 1);
-    let text = fs::read_to_string(&path).unwrap().replace(A, B);
-    fs::write(&path, text).unwrap();
-    let output = ingest(tmp.path(), &path);
-    assert!(
-        !output.status.success(),
-        "conflicting identity must fail before writes"
-    );
+    let ordinary = rollout(tmp.path(), A, false, 1);
+    let text = fs::read_to_string(&ordinary).unwrap().replace(A, B);
+    fs::write(&ordinary, text).unwrap();
+    // A replacement rollout must still name its thread in the header.
+    let reverted = reverted_rollout(tmp.path(), PARENT, B);
+    let text = fs::read_to_string(&reverted).unwrap().replace(PARENT, A);
+    fs::write(&reverted, text).unwrap();
+    for path in [ordinary, reverted] {
+        let output = ingest(tmp.path(), &path);
+        assert!(
+            !output.status.success(),
+            "conflicting identity must fail before writes: {}",
+            path.display()
+        );
+    }
     let db = Database::open(&tmp.path().join("index.sqlite")).unwrap();
     let count: i64 = db
         .conn()

@@ -11,9 +11,24 @@ use super::{truncate_str, SessionParser, TOOL_OUTPUT_MAX_CHARS};
 
 pub struct CodexParser;
 
+/// A rollout with nothing to index yet. Ingest records its fingerprint and
+/// skips it until the file or this parser changes.
 #[derive(Debug, thiserror::Error)]
-#[error("incomplete Codex review: event records preserved, no response items yet")]
-pub struct DeferredReview;
+pub enum DeferredRollout {
+    #[error("incomplete Codex review: event records preserved, no response items yet")]
+    IncompleteReview,
+    #[error("empty Codex rollout: no conversation records")]
+    Empty,
+}
+
+impl DeferredRollout {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::IncompleteReview => "incomplete_codex_review",
+            Self::Empty => "empty_codex_rollout",
+        }
+    }
+}
 
 /// Content-derived revision invalidates receipts whenever this parser changes.
 pub fn parser_revision() -> &'static str {
@@ -88,7 +103,7 @@ struct ResponsePayload {
 }
 
 pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
-    let filename_id = rollout_filename_id(path);
+    let file_ids = rollout_file_ids(path);
     // Extract session ID from filename: rollout-<uuid>.jsonl → uuid
     let session_id = path
         .file_stem()
@@ -121,6 +136,7 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
     let mut meta_cwd: Option<String> = None;
     let mut review_started = false;
     let mut review_events_only = true;
+    let mut conversation_free = true;
 
     for line_result in reader.lines() {
         let line = line_result?;
@@ -133,9 +149,11 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
             Ok(v) => v,
             Err(_) => {
                 review_events_only = false;
+                conversation_free = false;
                 continue;
             }
         };
+        conversation_free &= is_conversation_free(&jl.line_type, &jl.payload);
 
         // Fold every record's wrapper timestamp into the last-activity high-water
         // mark, regardless of record type (message / function_call / output).
@@ -159,10 +177,11 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
                     if meta.id.trim().is_empty() {
                         return Err(anyhow!("empty Codex session identity: {}", path.display()));
                     }
-                    if let Some(expected) = filename_id {
-                        if uuid::Uuid::parse_str(&meta.id).ok() != Some(expected) {
+                    if let Some(ids) = file_ids {
+                        if uuid::Uuid::parse_str(&meta.id).ok() != Some(ids.thread_id) {
                             return Err(anyhow!(
-                                "Codex rollout identity conflict: filename={expected}, header={}",
+                                "Codex rollout identity conflict: filename={}, header={}",
+                                ids.thread_id,
                                 meta.id
                             ));
                         }
@@ -280,6 +299,21 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
             "event_msg" => match jl.payload.get("type").and_then(|v| v.as_str()) {
                 Some("entered_review_mode") => review_started = true,
                 Some("task_started" | "user_message" | "mcp_tool_call_end") => {}
+                // Older CLIs record the review request as completed items.
+                Some("item_completed") => {
+                    match jl.payload.pointer("/item/type").and_then(|v| v.as_str()) {
+                        Some("EnteredReviewMode") => review_started = true,
+                        Some("UserMessage") => {}
+                        _ => review_events_only = false,
+                    }
+                }
+                // A task that ended without an answer.
+                Some("task_complete")
+                    if jl
+                        .payload
+                        .get("last_agent_message")
+                        .and_then(|v| v.as_str())
+                        .map_or(true, str::is_empty) => {}
                 _ => review_events_only = false,
             },
             // Unknown records may contain an answer we cannot parse. Do not
@@ -290,7 +324,10 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
 
     if turns.is_empty() {
         if review_started && review_events_only && meta_id.is_some() {
-            return Err(DeferredReview.into());
+            return Err(DeferredRollout::IncompleteReview.into());
+        }
+        if conversation_free {
+            return Err(DeferredRollout::Empty.into());
         }
         return Err(anyhow!(
             "codex session has no parseable turns: {}",
@@ -298,9 +335,17 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
         ));
     }
 
-    // session_meta의 id가 있으면 우선 사용 (filename fallback)
-    let final_id =
-        meta_id.unwrap_or_else(|| filename_id.map(|id| id.to_string()).unwrap_or(session_id));
+    // A reverted thread's replacement rollout carries the thread's header ID,
+    // but its turns are not the original rollout's: indexing it under the
+    // header ID would overwrite that session.
+    let final_id = match file_ids {
+        Some(ids) if ids.is_revert() => ids.rollout_id.to_string(),
+        _ => meta_id.unwrap_or_else(|| {
+            file_ids
+                .map(|ids| ids.rollout_id.to_string())
+                .unwrap_or(session_id)
+        }),
+    };
 
     // cwd에서 프로젝트명 추출: "/Users/d9ng/proj/seCall" → "seCall"
     let project = meta_cwd
@@ -334,13 +379,67 @@ pub fn parse_codex_jsonl(path: &Path) -> Result<Session> {
     })
 }
 
-/// Recognize both rollout-UUID and rollout-TIMESTAMP-UUID names. Other names
-/// (copied exports, custom homes) continue to use the opening metadata. The
-/// parser rejects a rollout whose header names another session, so a parsed
-/// rollout is always the session this UUID names.
-pub fn rollout_filename_id(path: &Path) -> Option<uuid::Uuid> {
+/// Whether a record holds no conversation, so that a rollout without turns made
+/// only of such records is empty rather than unparsed. Anything unrecognized
+/// counts as conversation: an error keeps it visible until the parser learns it.
+///
+/// User messages pass because the parser opens a turn for every user message it
+/// keeps; in a rollout without turns, each one was blank or injected context.
+fn is_conversation_free(line_type: &str, payload: &serde_json::Value) -> bool {
+    let kind = payload.get("type").and_then(|v| v.as_str());
+    match (line_type, kind) {
+        ("session_meta", _) => true,
+        ("response_item", Some("message")) => matches!(
+            payload.get("role").and_then(|v| v.as_str()),
+            Some("developer" | "user")
+        ),
+        // Compacted context is stored encrypted.
+        ("response_item", Some("compaction" | "compaction_summary")) => true,
+        ("event_msg", Some("thread_settings_applied" | "task_started" | "turn_aborted")) => true,
+        // A voice chat opened and closed without a transcript.
+        ("realtime_item", Some("realtime_session_started" | "realtime_session_closed")) => true,
+        _ => false,
+    }
+}
+
+/// IDs encoded in a Codex rollout filename.
+///
+/// An ordinary rollout is `rollout-[TIMESTAMP-]THREAD.jsonl`, and its thread
+/// and rollout share one ID. `thread/revert` keeps the thread ID and writes a
+/// replacement `rollout-TIMESTAMP-THREAD_ROLLOUT.jsonl`, which references the
+/// retained prefix in the older rollout instead of copying it and holds only
+/// the turns written after the revert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RolloutFileIds {
+    /// The thread named by the rollout's opening `session_meta` header.
+    pub thread_id: uuid::Uuid,
+    /// The session this file is indexed as.
+    pub rollout_id: uuid::Uuid,
+}
+
+impl RolloutFileIds {
+    fn is_revert(self) -> bool {
+        self.thread_id != self.rollout_id
+    }
+}
+
+/// Other names (copied exports, custom homes) continue to use the opening
+/// metadata. The parser rejects a rollout whose header names another thread,
+/// so a parsed rollout is always the session its rollout ID names.
+pub fn rollout_file_ids(path: &Path) -> Option<RolloutFileIds> {
     let name = path.file_stem()?.to_str()?.strip_prefix("rollout-")?;
-    uuid::Uuid::parse_str(name.get(name.len().checked_sub(36)?..)?).ok()
+    let split = name.len().checked_sub(36)?;
+    let rollout_id = uuid::Uuid::parse_str(name.get(split..)?).ok()?;
+    let thread_id = name
+        .get(..split)
+        .and_then(|head| head.strip_suffix('_'))
+        .and_then(|head| head.get(head.len().checked_sub(36)?..))
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .unwrap_or(rollout_id);
+    Some(RolloutFileIds {
+        thread_id,
+        rollout_id,
+    })
 }
 
 /// Position of the assistant turn a tool call belongs to. Codex can call a tool
@@ -642,6 +741,106 @@ mod tests {
         // non-jsonl extension should not match
         let p3 = Path::new("/Users/user/.codex/sessions/2026/04/06/rollout-abc.json");
         assert!(!parser.can_parse(p3));
+    }
+
+    fn deferral(lines: &[&str]) -> Option<&'static str> {
+        let f = make_codex_file(lines);
+        let err = parse_codex_jsonl(f.path()).expect_err("no turns");
+        err.downcast_ref::<DeferredRollout>()
+            .map(DeferredRollout::reason)
+    }
+
+    #[test]
+    fn test_codex_rollout_without_conversation_is_empty() {
+        const META: &str = r#"{"type":"session_meta","payload":{"id":"test-uuid"}}"#;
+        for extra in [
+            &[][..],
+            &[r#"{"type":"event_msg","payload":{"type":"thread_settings_applied"}}"#],
+            &[
+                r#"{"type":"response_item","payload":{"type":"compaction","encrypted_content":"gAAAA"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"thread_settings_applied"}}"#,
+            ],
+            &[
+                r#"{"type":"realtime_item","payload":{"type":"realtime_session_started"}}"#,
+                r#"{"type":"realtime_item","payload":{"type":"realtime_session_closed"}}"#,
+            ],
+            &[
+                r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"system prompt"}]}}"#,
+                r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#,
+            ],
+            &[
+                r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /proj"}]}}"##,
+            ],
+        ] {
+            let lines: Vec<&str> = [META].iter().chain(extra).copied().collect();
+            assert_eq!(deferral(&lines), Some("empty_codex_rollout"), "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn test_codex_rollout_with_unparsed_content_is_not_empty() {
+        const META: &str = r#"{"type":"session_meta","payload":{"id":"test-uuid"}}"#;
+        for extra in [
+            "{broken",
+            r#"{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"plan"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"agent_message","content":"hello from a peer"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Real answer"}}"#,
+            r#"{"type":"realtime_item","payload":{"type":"transcript","text":"spoken words"}}"#,
+            r#"{"type":"unknown_record","payload":{}}"#,
+        ] {
+            assert_eq!(deferral(&[META, extra]), None, "{extra}");
+        }
+    }
+
+    #[test]
+    fn test_codex_review_recorded_as_items_without_answer_is_deferred() {
+        // The record order older `codex exec` reviews leave behind.
+        let review = |complete: &str, extra: &[&str]| {
+            let mut lines = vec![
+                r#"{"type":"session_meta","payload":{"id":"test-uuid"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"EnteredReviewMode","id":"r1"}}}"#,
+                complete,
+                r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"u1","content":[{"type":"text","text":"Review the code changes"}]}}}"#,
+            ];
+            lines.extend_from_slice(extra);
+            deferral(&lines)
+        };
+        const NO_ANSWER: &str =
+            r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":null}}"#;
+        assert_eq!(review(NO_ANSWER, &[]), Some("incomplete_codex_review"));
+        let answered = r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"LGTM"}}"#;
+        assert_eq!(review(answered, &[]), None);
+        let agent_item = r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"a1","text":"LGTM"}}}"#;
+        assert_eq!(review(NO_ANSWER, &[agent_item]), None);
+    }
+
+    #[test]
+    fn test_rollout_file_ids() {
+        const THREAD: &str = "01a11b1e-a266-77d2-8b52-e0ccbc77acee";
+        const ROLLOUT: &str = "01a12c3d-0000-7000-8000-000000000001";
+        let ids = |name: &str| rollout_file_ids(Path::new(name));
+        let id = |s: &str| uuid::Uuid::parse_str(s).unwrap();
+        let ordinary = RolloutFileIds {
+            thread_id: id(THREAD),
+            rollout_id: id(THREAD),
+        };
+        assert_eq!(
+            ids(&format!("rollout-2026-10-08T19-45-54-{THREAD}.jsonl")),
+            Some(ordinary)
+        );
+        assert_eq!(ids(&format!("rollout-{THREAD}.jsonl")), Some(ordinary));
+        assert_eq!(
+            ids(&format!(
+                "rollout-2026-10-08T19-45-54-{THREAD}_{ROLLOUT}.jsonl"
+            )),
+            Some(RolloutFileIds {
+                thread_id: id(THREAD),
+                rollout_id: id(ROLLOUT),
+            })
+        );
+        assert_eq!(ids("rollout-test-uuid-abc.jsonl"), None);
     }
 
     #[test]

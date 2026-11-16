@@ -110,6 +110,39 @@ fn codex_deferred_review_rechecks_changes_and_parser_revision_across_processes()
 }
 
 #[test]
+fn empty_codex_rollout_is_deferred_until_it_gains_a_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let path = root.join(format!("rollout-{ID}.jsonl"));
+    let empty = [
+        json!({"type":"session_meta","payload":{"id":ID,"cwd":"/workspace/app"}}),
+        json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join("\n");
+    fs::write(&path, &empty).unwrap();
+    let (ok, result) = run(root, &path);
+    assert!(ok, "{result}");
+    assert_eq!(result["summary"]["deferred"], 1);
+    assert_eq!(result["summary"]["errors"], 0);
+    let db = Database::open(&root.join("index.sqlite")).unwrap();
+    let reason: String = db
+        .conn()
+        .query_row("SELECT reason FROM deferred_sources", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(reason, "empty_codex_rollout");
+
+    let message = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Start the task"}]}});
+    fs::write(&path, format!("{empty}\n{message}\n")).unwrap();
+    let (ok, result) = run(root, &path);
+    assert!(ok, "{result}");
+    assert_eq!(result["summary"]["ingested"], 1);
+    assert_eq!(result["summary"]["deferred"], 0);
+}
+
+#[test]
 fn codex_deferred_does_not_hide_malformed_or_unknown_input() {
     for suffix in [
         "{broken",

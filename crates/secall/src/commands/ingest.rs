@@ -777,33 +777,42 @@ fn ingest_path(
                 }
             }
         }
-        Err(secall_core::error::SecallError::Parse { ref source, .. })
-            if source.is::<secall_core::ingest::codex::DeferredReview>() =>
-        {
-            let result = (|| -> Result<()> {
-                let fingerprint = fingerprint.as_ref().expect("Codex source fingerprint");
-                // A concurrent append must not seal content the parser never saw.
-                if fingerprint.still_matches(session_path)? {
-                    db.defer_source(fingerprint, "incomplete_codex_review")?;
+        Err(e) => match deferral_reason(&e) {
+            Some(reason) => {
+                let result = (|| -> Result<()> {
+                    let fingerprint = fingerprint.as_ref().expect("Codex source fingerprint");
+                    // A concurrent append must not seal content the parser never saw.
+                    if fingerprint.still_matches(session_path)? {
+                        db.defer_source(fingerprint, reason)?;
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => *deferred += 1,
+                    Err(e) => record_source_failure(session_path, e, errors, error_details),
                 }
-                Ok(())
-            })();
-            match result {
-                Ok(()) => *deferred += 1,
-                Err(e) => record_source_failure(session_path, e, errors, error_details),
             }
-        }
-        Err(e) => {
-            tracing::warn!(path = %session_path.display(), error = %e, "failed to parse session file");
-            error_details.push(IngestError {
-                path: session_path.display().to_string(),
-                session_id: None,
-                phase: IngestPhase::Parsing,
-                message: e.to_string(),
-            });
-            *errors += 1;
-        }
+            None => {
+                tracing::warn!(path = %session_path.display(), error = %e, "failed to parse session file");
+                error_details.push(IngestError {
+                    path: session_path.display().to_string(),
+                    session_id: None,
+                    phase: IngestPhase::Parsing,
+                    message: e.to_string(),
+                });
+                *errors += 1;
+            }
+        },
     }
+}
+
+fn deferral_reason(error: &secall_core::error::SecallError) -> Option<&'static str> {
+    let secall_core::error::SecallError::Parse { source, .. } = error else {
+        return None;
+    };
+    source
+        .downcast_ref::<secall_core::ingest::codex::DeferredRollout>()
+        .map(|deferral| deferral.reason())
 }
 
 /// The session a file is named after, for the duplicate check that runs before
@@ -811,8 +820,8 @@ fn ingest_path(
 /// name (`rollout-<time>-<uuid>`); any other file is checked under its stem.
 fn session_id_hint(agent: AgentKind, path: &Path) -> Option<String> {
     if agent == AgentKind::Codex {
-        if let Some(id) = secall_core::ingest::codex::rollout_filename_id(path) {
-            return Some(id.to_string());
+        if let Some(ids) = secall_core::ingest::codex::rollout_file_ids(path) {
+            return Some(ids.rollout_id.to_string());
         }
     }
     path.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
