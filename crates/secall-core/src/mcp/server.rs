@@ -1811,6 +1811,7 @@ mod tests {
     fn do_get_turn_returns_its_tool_calls() {
         use super::super::tools::GetParams;
         use crate::ingest::types::{Action, AgentKind, Role, Session, TokenUsage, Turn};
+        use crate::ingest::TOOL_OUTPUT_MAX_CHARS;
         use crate::store::SessionRepo;
         use chrono::{TimeZone, Utc};
 
@@ -1833,12 +1834,21 @@ mod tests {
                 role: Role::Assistant,
                 timestamp: None,
                 content: String::new(),
-                actions: vec![Action::ToolUse {
-                    name: "exec_command".to_string(),
-                    input_summary: "ls".to_string(),
-                    output_summary: "a.rs".to_string(),
-                    tool_use_id: None,
-                }],
+                actions: vec![
+                    Action::ToolUse {
+                        name: "exec_command".to_string(),
+                        input_summary: "ls".to_string(),
+                        output_summary: "a.rs".to_string(),
+                        tool_use_id: None,
+                    },
+                    // Stored before the parsers capped tool output.
+                    Action::ToolUse {
+                        name: "exec_command".to_string(),
+                        input_summary: "cat log".to_string(),
+                        output_summary: "y".repeat(TOOL_OUTPUT_MAX_CHARS + 100),
+                        tool_use_id: None,
+                    },
+                ],
                 tokens: None,
                 thinking: None,
                 is_sidechain: false,
@@ -1870,6 +1880,11 @@ mod tests {
                 call["output_summary"].as_str()
             ),
             (Some("exec_command"), Some("ls"), Some("a.rs"))
+        );
+        let capped = format!("{}...", "y".repeat(TOOL_OUTPUT_MAX_CHARS));
+        assert_eq!(
+            got["actions"][1]["ToolUse"]["output_summary"].as_str(),
+            Some(capped.as_str())
         );
     }
 }
